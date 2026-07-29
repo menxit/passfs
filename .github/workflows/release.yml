@@ -1,0 +1,254 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: passfs-release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Calculate semantic version
+        id: version
+        run: echo "value=$(./scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify (${{ matrix.os }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check
+        run: make check
+
+  race:
+    name: Release race detector
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Release check
+        run: make release-check
+
+  linux:
+    name: Linux binaries
+    needs:
+      - version
+      - verify
+      - race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: make linux-release RELEASE_VERSION="${{ needs.version.outputs.value }}"
+      - name: Smoke-test installer
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          ./scripts/checksums.sh "release/v${VERSION}"
+          if [[ ! -e /dev/fuse ]]; then
+            sudo mknod -m 0666 /dev/fuse c 10 229
+          fi
+          PASSFS_RELEASE_BASE="file://${GITHUB_WORKSPACE}/release" \
+          PASSFS_VERSION="${VERSION}" \
+          PASSFS_INSTALL_DIR="${RUNNER_TEMP}/passfs-bin" \
+          PASSFS_NO_MODIFY_PATH=1 \
+            ./install.sh
+          "${RUNNER_TEMP}/passfs-bin/passfs" version | grep -Fx "passfs ${VERSION}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: passfs-linux-${{ needs.version.outputs.value }}
+          path: release/v${{ needs.version.outputs.value }}/*
+          if-no-files-found: error
+
+  macos:
+    name: Signed and notarized macOS installer
+    needs:
+      - version
+      - verify
+      - race
+    runs-on: macos-latest
+    environment:
+      name: release
+    env:
+      SIGNING_CERTIFICATES: ${{ secrets.MACOS_SIGNING_CERTIFICATES_P12_BASE64 }}
+      SIGNING_CERTIFICATES_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATES_PASSWORD }}
+      PROVISIONING_PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE_BASE64 }}
+      NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+      NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Import Apple release credentials
+        shell: bash
+        run: |
+          umask 077
+          : "${SIGNING_CERTIFICATES:?missing signing certificates}"
+          : "${SIGNING_CERTIFICATES_PASSWORD:?missing signing certificates password}"
+          : "${PROVISIONING_PROFILE:?missing provisioning profile}"
+          : "${NOTARY_KEY:?missing notarization key}"
+          : "${NOTARY_KEY_ID:?missing notarization key ID}"
+          : "${NOTARY_ISSUER_ID:?missing notarization issuer ID}"
+
+          keychain_path="$RUNNER_TEMP/passfs-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          signing_certificates_path="$RUNNER_TEMP/signing-certificates.p12"
+          profile_path="$RUNNER_TEMP/passfs.provisionprofile"
+          notary_key_path="$RUNNER_TEMP/AuthKey.p8"
+
+          printf '%s' "$SIGNING_CERTIFICATES" | base64 -D > "$signing_certificates_path"
+          printf '%s' "$PROVISIONING_PROFILE" | base64 -D > "$profile_path"
+          printf '%s' "$NOTARY_KEY" | base64 -D > "$notary_key_path"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$signing_certificates_path" \
+            -P "$SIGNING_CERTIFICATES_PASSWORD" -A -t cert -f pkcs12 \
+            -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+
+          echo "PASSFS_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+          echo "PASSFS_PROFILE=$profile_path" >> "$GITHUB_ENV"
+          echo "PASSFS_NOTARY_KEY=$notary_key_path" >> "$GITHUB_ENV"
+      - name: Build, sign, and notarize
+        run: |
+          make macos-release \
+            RELEASE_VERSION="${{ needs.version.outputs.value }}" \
+            RELEASE_BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
+            MACOS_ARCHES="amd64 arm64" \
+            MACOS_PROVISIONING_PROFILE="$PASSFS_PROFILE" \
+            MACOS_APPLICATION_SIGN_IDENTITY=auto \
+            MACOS_INSTALLER_SIGN_IDENTITY=auto \
+            MACOS_NOTARY_KEY="$PASSFS_NOTARY_KEY" \
+            MACOS_NOTARY_KEY_ID="$NOTARY_KEY_ID" \
+            MACOS_NOTARY_ISSUER_ID="$NOTARY_ISSUER_ID"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: passfs-macos-${{ needs.version.outputs.value }}
+          path: release/v${{ needs.version.outputs.value }}/PassFS-macos-universal.pkg
+          if-no-files-found: error
+      - name: Remove temporary Keychain
+        if: always()
+        run: |
+          if [[ -n "${PASSFS_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$PASSFS_KEYCHAIN" || true
+          fi
+          rm -f \
+            "$RUNNER_TEMP/signing-certificates.p12" \
+            "$RUNNER_TEMP/passfs.provisionprofile" \
+            "$RUNNER_TEMP/AuthKey.p8"
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - version
+      - linux
+      - macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: passfs-*-${{ needs.version.outputs.value }}
+          path: release/v${{ needs.version.outputs.value }}
+          merge-multiple: true
+      - name: Create checksums
+        run: ./scripts/checksums.sh "release/v${{ needs.version.outputs.value }}"
+      - name: Publish assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "release/$tag"/* --clobber
+          else
+            gh release create "$tag" "release/$tag"/* \
+              --title "passfs $tag" \
+              --target "$GITHUB_SHA" \
+              --generate-notes
+          fi
+
+  pages:
+    name: Build GitHub Pages
+    needs:
+      - version
+      - publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download current release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          mkdir -p "release/v${VERSION}"
+          gh release download "v${VERSION}" --dir "release/v${VERSION}"
+      - name: Prepare Pages artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PASSFS_FETCH_GITHUB_RELEASES: "1"
+          PASSFS_VERSION: ${{ needs.version.outputs.value }}
+        run: ./scripts/prepare-pages.sh
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: .pages
+
+  deploy:
+    name: Deploy GitHub Pages
+    needs: pages
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

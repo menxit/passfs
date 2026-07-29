@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# Reload an existing per-user service after an upgrade. A first installation
+# has no configuration yet, so there is nothing to start.
+console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)
+case "$console_user" in
+	"" | root | loginwindow | _mbsetupuser)
+		exit 0
+		;;
+esac
+
+user_id=$(/usr/bin/id -u "$console_user" 2>/dev/null || true)
+user_home=$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null |
+	/usr/bin/awk '{ print $2 }')
+if [ -z "$user_id" ] || [ -z "$user_home" ] ||
+	[ ! -f "$user_home/.config/passfs/config.json" ]; then
+	exit 0
+fi
+
+/bin/launchctl asuser "$user_id" \
+	/usr/bin/sudo -H -u "$console_user" \
+	/Applications/PassFS.app/Contents/MacOS/passfs reload \
+	>/dev/null 2>&1 || true
+
+exit 0

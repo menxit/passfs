@@ -1,0 +1,99 @@
+# Go build and test artifacts
+/passfs
+/bin/
+/dist/
+/release/
+/.pages/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+*.trace
+*.dSYM/
+*.iconset/
+coverage.*
+profile.*
+/go.work
+/go.work.sum
+
+# Local encrypted volumes and mount points
+/cipher/
+/mnt/
+/mount/
+/.passfs/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.p12
+*.pfx
+*.p8
+*.pem
+*.key
+*.csr
+*.cer
+*.der
+*.provisionprofile
+*.mobileprovision
+*.keychain
+*.keychain-db
+passfs.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.DocumentRevisions-V100
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.fseventsd
+
+# Linux
+*~
+.directory
+.Trash-*
+.nfs*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Visual Studio Code and IDEs
+.vscode/
+.idea/
+.fleet/
+.vs/
+.history/
+*.code-workspace
+*.iml
+
+# Editor swap, backup, and temporary files
+*.swp
+*.swo
+*.swn
+*.swx
+*.bak
+*.tmp
+*.temp
+.#*
+\#*#
+
+# Tool caches
+.cache/
+.coverage/
+__pycache__/
+.pytest_cache/
+.direnv/

@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="PassFS keeps .env files, API keys, credentials, and local configuration encrypted at their original paths.">
+  <meta name="theme-color" content="#0b0c0d">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="PassFS — secure your .env files and secrets">
+  <meta property="og:description" content="Keep sensitive files encrypted while applications continue using their original paths.">
+  <meta property="og:image" content="https://menxit.github.io/passfs/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="PassFS — secure your .env files and secrets">
+  <meta name="twitter:description" content="Keep sensitive files encrypted while applications continue using their original paths.">
+  <meta name="twitter:image" content="https://menxit.github.io/passfs/og.png">
+  <link rel="icon" href="icon.png">
+  <title>PassFS — secure your .env files and secrets</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0c0d;
+      --surface: #111214;
+      --ink: #f3f4f2;
+      --muted: #989b96;
+      --signal: #ff9900;
+      --line: #27292b;
+      --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Segoe UI", sans-serif;
+      --display: "SF Pro Display", "Helvetica Neue", -apple-system, BlinkMacSystemFont, sans-serif;
+      --mono: "SFMono-Regular", "Cascadia Code", Consolas, "Liberation Mono", monospace;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--ink);
+      font-synthesis: none;
+      font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+      text-rendering: optimizeLegibility;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-width: 320px;
+      min-height: 100vh;
+      min-height: 100svh;
+      margin: 0;
+      border-top: .3rem solid var(--signal);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      background: var(--bg);
+    }
+
+    a { color: inherit; }
+
+    a,
+    button { -webkit-tap-highlight-color: transparent; }
+
+    a:focus-visible,
+    button:focus-visible {
+      outline: 2px solid var(--signal);
+      outline-offset: 3px;
+    }
+
+    .shell {
+      width: min(56rem, calc(100% - 2rem));
+      margin: 0 auto;
+    }
+
+    header {
+      background: var(--bg);
+    }
+
+    nav {
+      min-height: 3.25rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: .6rem;
+      color: var(--ink);
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: -.02em;
+      text-decoration: none;
+    }
+
+    .app-logo {
+      width: 1.85rem;
+      height: 1.85rem;
+      border-radius: 22%;
+      object-fit: cover;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      font-size: .8125rem;
+      font-weight: 500;
+      letter-spacing: -.005em;
+    }
+
+    .nav-links a {
+      display: inline-flex;
+      align-items: center;
+      gap: .35rem;
+      color: var(--muted);
+      text-decoration: none;
+    }
+
+    .nav-links a:hover { color: var(--signal); }
+
+    .github-icon {
+      width: .9rem;
+      height: .9rem;
+      filter: invert(1);
+      opacity: .76;
+    }
+
+    a:hover .github-icon { opacity: 1; }
+
+    main {
+      padding: clamp(4.5rem, 9vw, 7rem) 0 clamp(5rem, 10vw, 8rem);
+    }
+
+    .intro {
+      max-width: 46rem;
+    }
+
+    .intro-copy {
+      max-width: 46rem;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 45rem;
+      font-family: var(--display);
+      font-size: clamp(2.8rem, 6.4vw, 4.75rem);
+      font-weight: 600;
+      line-height: .98;
+      letter-spacing: -.058em;
+      text-wrap: balance;
+    }
+
+    .filename {
+      color: var(--signal);
+      font-family: var(--mono);
+      font-size: .86em;
+      font-weight: 600;
+      letter-spacing: -.07em;
+    }
+
+    .lead {
+      max-width: 39rem;
+      margin: 1.55rem 0 0;
+      color: #a8aba6;
+      font-size: 1.05rem;
+      font-weight: 400;
+      line-height: 1.62;
+      letter-spacing: -.012em;
+      text-wrap: pretty;
+    }
+
+    .install {
+      display: grid;
+      grid-template-columns: .65fr 1.35fr;
+      gap: clamp(2.5rem, 7vw, 5.5rem);
+      margin-top: clamp(3.5rem, 7vw, 5.25rem);
+      padding-top: 2rem;
+      border-top: 1px solid var(--line);
+    }
+
+    .platform {
+      min-width: 0;
+    }
+
+    h2 {
+      display: flex;
+      align-items: center;
+      gap: .55rem;
+      margin: 0;
+      color: var(--ink);
+      font-size: .9375rem;
+      font-weight: 600;
+      letter-spacing: -.018em;
+    }
+
+    h2::before {
+      width: .45rem;
+      height: .45rem;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--signal);
+      content: "";
+    }
+
+    .platform p {
+      margin: .75rem 0 1.1rem;
+      color: var(--muted);
+      font-size: .8125rem;
+      line-height: 1.55;
+      letter-spacing: -.005em;
+    }
+
+    .button {
+      min-height: 2.75rem;
+      padding: 0 .75rem 0 1rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: .7rem;
+      border: 1px solid var(--signal);
+      border-radius: .65rem;
+      background: var(--signal);
+      box-shadow: 0 .5rem 1.5rem rgba(255, 153, 0, .12);
+      color: #171006;
+      font: 650 .8125rem/1 var(--sans);
+      letter-spacing: -.012em;
+      text-decoration: none;
+      transition: transform .15s ease, background .15s ease, box-shadow .15s ease;
+    }
+
+    .button:hover {
+      background: #ffaa22;
+      box-shadow: 0 .7rem 1.8rem rgba(255, 153, 0, .18);
+      color: #171006;
+      transform: translateY(-1px);
+    }
+
+    .button:active { transform: translateY(0); }
+
+    .download-icon {
+      width: 1.55rem;
+      height: 1.55rem;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: rgba(23, 16, 6, .12);
+      font-size: .95rem;
+      line-height: 1;
+    }
+
+    .terminal {
+      min-height: 5rem;
+      padding: .85rem 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 1rem;
+      align-items: center;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    pre {
+      min-width: 0;
+      margin: 0;
+      overflow-x: auto;
+      color: var(--ink);
+      white-space: nowrap;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line) transparent;
+      font: 500 .725rem/1.55 var(--mono);
+    }
+
+    .prompt { color: var(--signal); }
+
+    .copy {
+      padding: .42rem .55rem;
+      border: 1px solid var(--line);
+      border-radius: .35rem;
+      background: var(--surface);
+      color: var(--muted);
+      font: 600 .625rem/1 var(--mono);
+      letter-spacing: .025em;
+      cursor: pointer;
+      text-transform: uppercase;
+    }
+
+    .copy:hover {
+      border-color: var(--signal);
+      color: var(--signal);
+    }
+
+    footer {
+      min-height: 4rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: .75rem;
+      letter-spacing: -.005em;
+    }
+
+    footer div {
+      display: flex;
+      gap: 1rem;
+    }
+
+    footer a {
+      display: inline-flex;
+      align-items: center;
+      gap: .35rem;
+      color: var(--ink);
+      text-decoration: none;
+    }
+
+    footer a:hover { color: var(--signal); }
+
+    @media (max-width: 680px) {
+      .install { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 480px) {
+      main { padding: 3.5rem 0; }
+
+      h1 { font-size: clamp(2.35rem, 13vw, 3.25rem); }
+
+      .button { width: 100%; }
+
+      footer {
+        padding: 1.1rem 0;
+        display: block;
+        line-height: 2;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <nav class="shell" aria-label="Primary navigation">
+      <a class="brand" href="#">
+        <img class="app-logo" src="icon.png" alt="">
+        <span>PassFS</span>
+      </a>
+      <div class="nav-links">
+        <a href="https://github.com/menxit/passfs#readme">Docs ↗</a>
+        <a href="https://github.com/menxit/passfs">
+          <img class="github-icon" src="github.svg" alt="">
+          GitHub
+        </a>
+      </div>
+    </nav>
+  </header>
+
+  <main class="shell">
+    <div class="intro">
+      <div class="intro-copy">
+        <h1>Secure your <span class="filename">.env</span> files and secrets.</h1>
+        <p class="lead">PassFS keeps sensitive files encrypted on disk while applications continue using their original paths. Use it for environment files, API keys, credentials, and local configuration.</p>
+      </div>
+    </div>
+
+    <div class="install">
+      <section class="platform">
+        <h2>macOS</h2>
+        <p>macOS 13 or later. Intel and Apple silicon.</p>
+        <a class="button" href="releases/latest/PassFS-macos-universal.pkg">
+          Download for macOS
+          <span class="download-icon" aria-hidden="true">↓</span>
+        </a>
+      </section>
+
+      <section class="platform">
+        <h2>Linux</h2>
+        <p>Run the installer:</p>
+        <div class="terminal">
+          <pre><span class="prompt">$</span> <span id="install-command">curl -fsSL https://menxit.github.io/passfs/passfs | bash</span></pre>
+          <button class="copy" type="button" data-copy="install-command" aria-label="Copy Linux installation command">Copy</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="shell">
+    <span>PassFS v__PASSFS_VERSION__</span>
+    <div>
+      <a href="https://github.com/menxit/passfs#readme">Documentation</a>
+      <a href="https://github.com/menxit/passfs">
+        <img class="github-icon" src="github.svg" alt="">
+        GitHub
+      </a>
+    </div>
+  </footer>
+
+  <script>
+    document.querySelectorAll("[data-copy]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const target = document.getElementById(button.dataset.copy);
+        if (!target) return;
+
+        try {
+          await navigator.clipboard.writeText(target.textContent);
+          button.textContent = "Copied";
+          setTimeout(() => { button.textContent = "Copy"; }, 1600);
+        } catch {
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(target);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+      });
+    });
+  </script>
+</body>
+</html>

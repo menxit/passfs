@@ -1,0 +1,110 @@
+//go:build linux
+
+package passfs
+
+import (
+	"bufio"
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+
+	"golang.org/x/sys/unix"
+)
+
+func MountStatus(mountPoint string) (mounted bool, passfsMount bool, err error) {
+	file, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return false, false, err
+	}
+	defer file.Close()
+
+	target, err := canonicalMountPoint(mountPoint)
+	if err != nil {
+		return false, false, err
+	}
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		separator := -1
+		for index, field := range fields {
+			if field == "-" {
+				separator = index
+				break
+			}
+		}
+		if separator < 0 || separator+2 >= len(fields) || len(fields) < 5 {
+			continue
+		}
+		current, decodeErr := decodeMountInfoPath(fields[4])
+		if decodeErr != nil {
+			return false, false, decodeErr
+		}
+		current, decodeErr = canonicalMountPoint(current)
+		if decodeErr != nil {
+			return false, false, decodeErr
+		}
+		if current != target {
+			continue
+		}
+		fsType := fields[separator+1]
+		source := fields[separator+2]
+		return true, fsType == "fuse.passfs" && source == "passfs", nil
+	}
+	if err := scanner.Err(); err != nil {
+		return false, false, err
+	}
+	return false, false, nil
+}
+
+func UnmountPath(mountPoint string) error {
+	var unmountErrors []error
+	for _, name := range []string{"fusermount3", "fusermount"} {
+		helper, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		for _, arguments := range [][]string{
+			{"-u", mountPoint},
+			{"-u", "-z", mountPoint},
+		} {
+			output, err := exec.Command(helper, arguments...).CombinedOutput()
+			if err == nil {
+				return nil
+			}
+			unmountErrors = append(
+				unmountErrors,
+				fmt.Errorf("%s %v: %w: %s", name, arguments, err, bytes.TrimSpace(output)),
+			)
+		}
+	}
+	if err := unix.Unmount(mountPoint, unix.MNT_DETACH); err != nil {
+		unmountErrors = append(unmountErrors, err)
+		return errors.Join(unmountErrors...)
+	}
+	return nil
+}
+
+func decodeMountInfoPath(value string) (string, error) {
+	var result strings.Builder
+	for index := 0; index < len(value); {
+		if value[index] != '\\' {
+			result.WriteByte(value[index])
+			index++
+			continue
+		}
+		if index+3 >= len(value) {
+			return "", errors.New("invalid escape in /proc/self/mountinfo")
+		}
+		decoded, err := strconv.ParseUint(value[index+1:index+4], 8, 8)
+		if err != nil {
+			return "", err
+		}
+		result.WriteByte(byte(decoded))
+		index += 4
+	}
+	return result.String(), nil
+}
