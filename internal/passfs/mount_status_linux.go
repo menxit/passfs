@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -39,15 +40,11 @@ func MountStatus(mountPoint string) (mounted bool, passfsMount bool, err error) 
 		if separator < 0 || separator+2 >= len(fields) || len(fields) < 5 {
 			continue
 		}
-		current, decodeErr := decodeMountInfoPath(fields[4])
+		matches, decodeErr := mountInfoPathMatches(fields[4], target)
 		if decodeErr != nil {
 			return false, false, decodeErr
 		}
-		current, decodeErr = canonicalMountPoint(current)
-		if decodeErr != nil {
-			return false, false, decodeErr
-		}
-		if current != target {
+		if !matches {
 			continue
 		}
 		fsType := fields[separator+1]
@@ -58,6 +55,18 @@ func MountStatus(mountPoint string) (mounted bool, passfsMount bool, err error) 
 		return false, false, err
 	}
 	return false, false, nil
+}
+
+// Mount points in /proc/self/mountinfo are kernel-resolved paths. Comparing
+// them lexically avoids traversing unrelated mounts, some of which are
+// intentionally inaccessible to unprivileged users (for example Docker
+// network namespaces under /run/docker/netns).
+func mountInfoPathMatches(encodedPath, target string) (bool, error) {
+	current, err := decodeMountInfoPath(encodedPath)
+	if err != nil {
+		return false, err
+	}
+	return filepath.Clean(current) == target, nil
 }
 
 func UnmountPath(mountPoint string) error {

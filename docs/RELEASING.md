@@ -76,7 +76,7 @@ For example, changes after `v0.4.2` produce `0.5.0` when at least one commit is
 The release workflow:
 
 1. calculates the next semantic version;
-2. runs the normal checks on macOS and Linux and the race detector on Linux;
+2. runs the normal checks on macOS and Linux;
 3. builds checksum-verifiable Linux `x64` and `arm64` executables;
 4. builds a universal macOS app, signs it with Developer ID Application, and
    notarizes and staples it;

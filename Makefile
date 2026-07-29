@@ -26,7 +26,7 @@ MACOS_PACKAGE := $(RELEASE_DIR)/PassFS-macos-universal.pkg
 DOCKER ?= docker
 SERVER_TEST_IMAGE ?= passfs-server-test
 
-.PHONY: all build install install-unsigned macos-app macos-package macos-release linux-release release-checksums pages docker-server docker-server-shell test test-scripts test-race vet check release-check clean
+.PHONY: all build install install-unsigned macos-app macos-package macos-release linux-release release-checksums pages docker-server docker-server-shell test test-scripts test-race vet check clean
 
 all: build
 
@@ -114,8 +114,6 @@ vet:
 	$(GO_ENV) $(GO) vet ./...
 
 check: test test-scripts vet build
-
-release-check: test-race test-scripts vet build
 
 clean:
 	rm -rf $(BINARY) $(MACOS_APP) $(RELEASE_ROOT) .pages

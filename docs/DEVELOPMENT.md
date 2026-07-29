@@ -52,9 +52,9 @@ Run the normal verification suite:
 make check
 ```
 
-`make check` runs the tests, `go vet`, and a build. The race detector is
-reserved for actual releases and is run by `make release-check` after a push to
-`main`.
+`make check` runs the tests, `go vet`, and a build. Use `make test-race`
+manually when investigating concurrency changes; it is not part of the release
+workflow.
 
 On macOS, `make install` is a maintainer-oriented target because a Touch
 ID-capable app must be signed with the passfs Developer ID identity and

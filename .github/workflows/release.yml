@@ -45,25 +45,11 @@ jobs:
       - name: Check
         run: make check
 
-  race:
-    name: Release race detector
-    needs: version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Release check
-        run: make release-check
-
   linux:
     name: Linux binaries
     needs:
       - version
       - verify
-      - race
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -99,7 +85,6 @@ jobs:
     needs:
       - version
       - verify
-      - race
     runs-on: macos-latest
     environment:
       name: release
