@@ -54,6 +54,7 @@ output_parent=$(dirname "$output")
 mkdir -p "$output_parent"
 build_directory=$(mktemp -d "$output_parent/.passfs-package-build.XXXXXX")
 payload="$build_directory/payload"
+component_plist="$build_directory/components.plist"
 staged_package="$build_directory/PassFS-macos-universal.pkg"
 previous_package="$build_directory/PreviousPassFS.pkg"
 
@@ -69,8 +70,15 @@ ln -s /Applications/PassFS.app/Contents/MacOS/passfs \
 	"$payload/usr/local/bin/passfs"
 
 package_version=${release_version%%-*}
+pkgbuild --analyze \
+	--root "$payload" \
+	"$component_plist"
+plutil -replace 0.BundleIsRelocatable -bool false "$component_plist"
+plutil -replace 0.BundleHasStrictIdentifier -bool true "$component_plist"
+
 pkgbuild \
 	--root "$payload" \
+	--component-plist "$component_plist" \
 	--identifier "com.menxit.passfs.pkg" \
 	--version "$package_version" \
 	--install-location / \

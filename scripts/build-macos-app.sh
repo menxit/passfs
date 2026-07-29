@@ -103,6 +103,7 @@ cp "$project_root/packaging/macos/Info.plist" \
 cp "$project_root/packaging/macos/PassFS.icns" \
 	"$staged_app/Contents/Resources/PassFS.icns"
 cp "$profile" "$staged_app/Contents/embedded.provisionprofile"
+chmod 0644 "$staged_app/Contents/embedded.provisionprofile"
 
 plist_version=${release_version%%-*}
 /usr/libexec/PlistBuddy \

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"filippo.io/age"
-	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
@@ -861,7 +860,12 @@ func errnoFromError(err error) syscall.Errno {
 		return syscall.EACCES
 	case errors.Is(err, ErrFileTooLarge):
 		return syscall.EFBIG
-	default:
-		return fs.ToErrno(err)
 	}
+
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno
+	}
+
+	return syscall.EIO
 }
