@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,19 @@ import (
 
 	"passfs/internal/passfs"
 )
+
+func TestUsageAdvertisesSingleFileUnprotectAndLLMDocs(t *testing.T) {
+	var usage bytes.Buffer
+	printUsage(&usage)
+	for _, expected := range []string{
+		"passfs unprotect [options] [FILE]",
+		"https://getpassfs.com/llms.txt",
+	} {
+		if !strings.Contains(usage.String(), expected) {
+			t.Fatalf("usage %q does not contain %q", usage.String(), expected)
+		}
+	}
+}
 
 func TestEncryptWithoutMountExplainsHowToRecover(t *testing.T) {
 	root := t.TempDir()
@@ -101,15 +115,52 @@ func TestUnprotectConfirmationRequiresExactToken(t *testing.T) {
 
 func TestUnprotectWarningExplainsPlaintextAndDeletion(t *testing.T) {
 	var warning bytes.Buffer
-	printUnprotectWarning(&warning)
+	printUnprotectWarning(&warning, "")
 	for _, expected := range []string{
 		"WARNING",
+		"All protected links",
 		"plaintext",
 		"permanently deleted",
 		"UNPROTECT",
 	} {
 		if !strings.Contains(warning.String(), expected) {
 			t.Fatalf("warning %q does not contain %q", warning.String(), expected)
+		}
+	}
+}
+
+func TestSingleFileUnprotectWarningNamesFile(t *testing.T) {
+	var warning bytes.Buffer
+	printUnprotectWarning(&warning, "/tmp/project/.env")
+	for _, expected := range []string{
+		"/tmp/project/.env",
+		"regular plaintext file",
+		"permanently deleted",
+		"UNPROTECT",
+	} {
+		if !strings.Contains(warning.String(), expected) {
+			t.Fatalf("warning %q does not contain %q", warning.String(), expected)
+		}
+	}
+	if strings.Contains(warning.String(), "All protected links") {
+		t.Fatalf("single-file warning describes a global operation: %q", warning.String())
+	}
+}
+
+func TestUnprotectHelpDistinguishesSingleFileAndAll(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := runUnprotect([]string{"-h"}, &stdout, &stderr)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("runUnprotect(-h) error = %v, want flag.ErrHelp", err)
+	}
+	for _, expected := range []string{
+		"passfs unprotect [options] [FILE]",
+		"only from that file",
+		"every passfs file",
+	} {
+		if !strings.Contains(stderr.String(), expected) {
+			t.Fatalf("help %q does not contain %q", stderr.String(), expected)
 		}
 	}
 }

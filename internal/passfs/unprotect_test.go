@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +98,72 @@ func TestUnprotectAllReplacesLinkAndDeletesCiphertext(t *testing.T) {
 	}
 	if got := fixture.prompter.requestCount() - promptsBefore; got != 1 {
 		t.Fatalf("batch authorization prompts = %d, want 1", got)
+	}
+}
+
+func TestUnprotectFileOnlyMaterializesRequestedFile(t *testing.T) {
+	fixture := newUnprotectFixture(t, ".env", true)
+	secondSource := filepath.Join(filepath.Dir(fixture.sourcePath), "config.json")
+	secondStorage := testStoragePath(t, secondSource)
+	secondPlaintext := []byte(`{"token":"second"}`)
+	createTestFile(t, fixture.volume, secondStorage, secondPlaintext)
+	secondCipherPath, err := fixture.volume.encryptedPath(secondStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTarget, err := MountedPath(t.TempDir(), secondSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureProtectedLink(secondSource, secondTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.volume.setLinkTarget(secondStorage, secondTarget); err != nil {
+		t.Fatal(err)
+	}
+
+	report := fixture.volume.UnprotectFile(
+		t.Context(),
+		fixture.sourcePath,
+		nil,
+	)
+	if len(report.Unprotected) != 1 ||
+		report.Unprotected[0] != fixture.sourcePath ||
+		len(report.Failed) != 0 {
+		t.Fatalf("unprotect report = %#v", report)
+	}
+	if _, err := os.Stat(fixture.cipherPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("requested ciphertext remains: %v", err)
+	}
+	if _, err := os.Stat(secondCipherPath); err != nil {
+		t.Fatalf("unrelated ciphertext was removed: %v", err)
+	}
+	info, err := os.Lstat(secondSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("unrelated protected link mode = %v, want symlink", info.Mode())
+	}
+}
+
+func TestUnprotectFileRejectsUnprotectedPathWithoutAuthorization(t *testing.T) {
+	fixture := newUnprotectFixture(t, ".env", true)
+	promptsBefore := fixture.prompter.requestCount()
+	unprotectedPath := filepath.Join(filepath.Dir(fixture.sourcePath), "plain.env")
+
+	report := fixture.volume.UnprotectFile(t.Context(), unprotectedPath, nil)
+	if len(report.Unprotected) != 0 ||
+		len(report.Failed) != 1 ||
+		report.Failed[0].Path != unprotectedPath ||
+		!strings.Contains(report.Failed[0].Err.Error(), "not protected") {
+		t.Fatalf("unprotect report = %#v", report)
+	}
+	if got := fixture.prompter.requestCount() - promptsBefore; got != 0 {
+		t.Fatalf("authorization prompts = %d, want 0", got)
+	}
+	if _, err := os.Stat(fixture.cipherPath); err != nil {
+		t.Fatalf("ciphertext was not preserved: %v", err)
 	}
 }
 

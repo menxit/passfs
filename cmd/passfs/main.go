@@ -102,7 +102,7 @@ Usage:
   passfs init [options]
   passfs mount [options]
   passfs encrypt [options] FILE...
-  passfs unprotect [options]
+  passfs unprotect [options] [FILE]
   passfs edit [options] FILE
   passfs status [options]
   passfs unmount [options]
@@ -115,7 +115,8 @@ Usage:
   passfs touchid enable|disable|status|verify [options]
   passfs version
 
-Run "passfs COMMAND -h" for command-specific options.`)
+Run "passfs COMMAND -h" for command-specific options.
+Machine-readable documentation: https://getpassfs.com/llms.txt`)
 }
 
 type commonFlags struct {
@@ -340,6 +341,15 @@ func runEncrypt(args []string, stdout, stderr io.Writer) error {
 func runUnprotect(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("unprotect", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: passfs unprotect [options] [FILE]")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "With FILE, remove protection only from that file.")
+		fmt.Fprintln(stderr, "Without FILE, remove protection from every passfs file.")
+		fmt.Fprintln(stderr)
+		fmt.Fprintln(stderr, "Options:")
+		flags.PrintDefaults()
+	}
 	var common commonFlags
 	var maxFileSize int64
 	var promptMode string
@@ -363,8 +373,8 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
-		return errors.New("usage: passfs unprotect [options]")
+	if flags.NArg() > 1 {
+		return errors.New("usage: passfs unprotect [options] [FILE]")
 	}
 	if err := validateMaxFileSize(maxFileSize); err != nil {
 		return err
@@ -374,7 +384,15 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := confirmUnprotect(stderr); err != nil {
+	var sourcePath string
+	if flags.NArg() == 1 {
+		sourcePath, err = filepath.Abs(flags.Arg(0))
+		if err != nil {
+			return err
+		}
+		sourcePath = filepath.Clean(sourcePath)
+	}
+	if err := confirmUnprotect(stderr, sourcePath); err != nil {
 		return err
 	}
 
@@ -388,34 +406,78 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	restoreService := false
+	if sourcePath != "" {
+		status, err := queryService()
+		if err != nil {
+			return err
+		}
+		mount, err := inspectMount(settings.MountPoint)
+		if err != nil {
+			return err
+		}
+		if mount.mounted && !mount.passfs {
+			return fmt.Errorf(
+				"%s is mounted by another filesystem",
+				settings.MountPoint,
+			)
+		}
+		restoreService = status.Installed || mount.mounted
+	}
+
 	if err := runUnmount(
 		[]string{"--config", settings.Path()},
 		stdout,
 		stderr,
 	); err != nil {
+		if restoreService {
+			restoreErr := runReload(
+				[]string{"--config", settings.Path()},
+				stdout,
+				stderr,
+			)
+			return errors.Join(err, restoreErr)
+		}
 		return err
 	}
-	instanceLock, err := passfs.AcquireInstanceLock()
+	report, err := unprotectFiles(
+		settings,
+		prompter,
+		maxFileSize,
+		sourcePath,
+	)
 	if err != nil {
-		return err
+		if !restoreService {
+			return err
+		}
+		restoreErr := runReload(
+			[]string{"--config", settings.Path()},
+			stdout,
+			stderr,
+		)
+		return errors.Join(err, restoreErr)
 	}
-	defer instanceLock.Close()
+	var restoreErr error
+	if restoreService {
+		restoreErr = runReload(
+			[]string{"--config", settings.Path()},
+			stdout,
+			stderr,
+		)
+	}
 
-	volume, err := passfs.LoadVolume(settings.Vault, prompter, maxFileSize, 0)
-	if err != nil {
-		return err
-	}
-	defer volume.Lock()
-	report := volume.UnprotectAll(context.Background(), []string{
-		filepath.Dir(settings.Path()),
-		settings.Vault,
-		settings.MountPoint,
-	})
 	if report.Err != nil {
-		return fmt.Errorf(
-			"authorize unprotect: %w\nall encrypted data was preserved; remount it with:\n  passfs mount",
+		operationErr := fmt.Errorf(
+			"authorize unprotect: %w\nencrypted data was preserved",
 			report.Err,
 		)
+		if !restoreService {
+			operationErr = fmt.Errorf(
+				"%w; remount it with:\n  passfs mount",
+				operationErr,
+			)
+		}
+		return errors.Join(operationErr, restoreErr)
 	}
 	for _, path := range report.Unprotected {
 		fmt.Fprintf(stdout, "Unprotected %s\n", path)
@@ -432,16 +494,43 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "Could not unprotect %s: %v\n", issue.Path, issue.Err)
 	}
 	if len(report.Failed) != 0 {
-		return actionableError{
-			fmt.Sprintf(
-				"%d protected file(s) could not be unprotected; their encrypted data was preserved",
-				len(report.Failed),
-			),
-			"resolve the reported conflicts and run:",
-			"  passfs unprotect",
-			"or remount the remaining protected files with:",
-			"  passfs mount",
+		var operationErr error
+		if sourcePath != "" {
+			operationErr = actionableError{
+				fmt.Sprintf(
+					"%s could not be unprotected; its encrypted data was preserved",
+					sourcePath,
+				),
+			}
+		} else {
+			operationErr = actionableError{
+				fmt.Sprintf(
+					"%d protected file(s) could not be unprotected; their encrypted data was preserved",
+					len(report.Failed),
+				),
+				"resolve the reported conflicts and run:",
+				"  passfs unprotect",
+				"or remount the remaining protected files with:",
+				"  passfs mount",
+			}
 		}
+		return errors.Join(operationErr, restoreErr)
+	}
+	if restoreErr != nil {
+		return actionableError{
+			"the file was unprotected, but the passfs service could not be restored: " +
+				restoreErr.Error(),
+			"recover the remaining protected files with:",
+			"  passfs reload",
+		}
+	}
+	if sourcePath != "" {
+		fmt.Fprintf(
+			stdout,
+			"%s is now a regular plaintext file; its encrypted copy was permanently deleted.\n",
+			sourcePath,
+		)
+		return nil
 	}
 	if len(report.Unprotected) == 0 {
 		fmt.Fprintln(stdout, "No protected files found")
@@ -453,8 +542,44 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func confirmUnprotect(writer io.Writer) error {
-	printUnprotectWarning(writer)
+func unprotectFiles(
+	settings *passfs.Settings,
+	prompter passfs.Prompter,
+	maxFileSize int64,
+	sourcePath string,
+) (passfs.UnprotectReport, error) {
+	instanceLock, err := passfs.AcquireInstanceLock()
+	if err != nil {
+		return passfs.UnprotectReport{}, err
+	}
+	defer instanceLock.Close()
+
+	volume, err := passfs.LoadVolume(settings.Vault, prompter, maxFileSize, 0)
+	if err != nil {
+		return passfs.UnprotectReport{}, err
+	}
+	defer volume.Lock()
+
+	forbiddenRoots := []string{
+		filepath.Dir(settings.Path()),
+		settings.Vault,
+		settings.MountPoint,
+	}
+	if sourcePath != "" {
+		return volume.UnprotectFile(
+			context.Background(),
+			sourcePath,
+			forbiddenRoots,
+		), nil
+	}
+	return volume.UnprotectAll(
+		context.Background(),
+		forbiddenRoots,
+	), nil
+}
+
+func confirmUnprotect(writer io.Writer, sourcePath string) error {
+	printUnprotectWarning(writer, sourcePath)
 
 	terminal, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
@@ -464,9 +589,13 @@ func confirmUnprotect(writer io.Writer) error {
 	return readUnprotectConfirmation(terminal)
 }
 
-func printUnprotectWarning(writer io.Writer) {
+func printUnprotectWarning(writer io.Writer, sourcePath string) {
 	fmt.Fprintln(writer, "WARNING: passfs protection will be permanently removed.")
-	fmt.Fprintln(writer, "Protected links will become regular plaintext files on disk.")
+	if sourcePath == "" {
+		fmt.Fprintln(writer, "All protected links will become regular plaintext files on disk.")
+	} else {
+		fmt.Fprintf(writer, "%s will become a regular plaintext file on disk.\n", sourcePath)
+	}
 	fmt.Fprintln(writer, "After each plaintext is safely written, its encrypted copy will be permanently deleted.")
 	fmt.Fprintln(writer, "The plaintext may remain in backups, snapshots, caches, and free disk space.")
 	fmt.Fprint(writer, "Type UNPROTECT to continue: ")

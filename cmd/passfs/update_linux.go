@@ -55,7 +55,7 @@ func installPlatformUpdate(
 			return platformUpdateResult{}, actionableError{
 				"the current passfs installation is not writable: " + executable,
 				"update it with the installation method originally used, or run:",
-				"  curl -fsSL https://menxit.github.io/passfs/passfs | bash",
+				"  curl -fsSL https://getpassfs.com/passfs | bash",
 			}
 		}
 		return platformUpdateResult{}, err

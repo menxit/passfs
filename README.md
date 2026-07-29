@@ -26,7 +26,7 @@ stay in memory and every file open requires authorization by default.
 
 Download and open the signed and notarized installer:
 
-[Download passfs for macOS](https://menxit.github.io/passfs/)
+[Download passfs for macOS](https://getpassfs.com/)
 
 The package installs `PassFS.app` in `/Applications` and the `passfs` command
 in `/usr/local/bin`. The application is already signed by the passfs
@@ -48,7 +48,7 @@ Installing a newer package also reloads an existing passfs service.
 ### Linux
 
 ```sh
-curl -fsSL https://menxit.github.io/passfs/passfs | bash
+curl -fsSL https://getpassfs.com/passfs | bash
 ```
 
 The installer selects the `x64` or `arm64` binary, verifies its SHA-256
@@ -153,6 +153,17 @@ passfs reload
 ```
 
 ## Remove protection
+
+To convert one protected link back into a regular plaintext file while leaving
+every other file protected:
+
+```sh
+passfs unprotect /absolute/path/to/.env
+```
+
+The service is stopped briefly and restored automatically if it was active.
+The command requires typing `UNPROTECT`, writes the plaintext atomically, and
+permanently deletes that file's encrypted copy only after the write succeeds.
 
 To convert every protected link back into a regular plaintext file:
 
@@ -342,3 +353,6 @@ MIT. See [LICENSE.md](LICENSE.md).
 Development and release procedures are documented in
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) and
 [docs/RELEASING.md](docs/RELEASING.md).
+
+Machine-readable installation, usage, and safety guidance is available at
+[getpassfs.com/llms.txt](https://getpassfs.com/llms.txt).

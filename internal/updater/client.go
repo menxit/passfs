@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	DefaultReleaseBaseURL = "https://menxit.github.io/passfs/releases"
+	DefaultReleaseBaseURL = "https://getpassfs.com/releases"
 	maxMetadataBytes      = 1024 * 1024
 	maxAssetBytes         = 512 * 1024 * 1024
 )

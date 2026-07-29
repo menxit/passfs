@@ -90,15 +90,16 @@ Release runs are serialized, and rerunning a workflow for an already tagged
 commit reuses that version. The public layout follows:
 
 ```text
-https://menxit.github.io/passfs/
-https://menxit.github.io/passfs/passfs
-https://menxit.github.io/passfs/releases/latest.txt
-https://menxit.github.io/passfs/releases/latest/PassFS-macos-universal.pkg
-https://menxit.github.io/passfs/releases/latest/passfs-linux-x64.gz
-https://menxit.github.io/passfs/releases/latest/passfs-linux-arm64.gz
-https://menxit.github.io/passfs/releases/latest/SHA256SUMS
-https://menxit.github.io/passfs/releases/vX.Y.Z/SHA256SUMS
-https://menxit.github.io/passfs/releases/vX.Y.Z/passfs-linux-x64.gz
-https://menxit.github.io/passfs/releases/vX.Y.Z/passfs-linux-arm64.gz
-https://menxit.github.io/passfs/releases/vX.Y.Z/PassFS-macos-universal.pkg
+https://getpassfs.com/
+https://getpassfs.com/llms.txt
+https://getpassfs.com/passfs
+https://getpassfs.com/releases/latest.txt
+https://getpassfs.com/releases/latest/PassFS-macos-universal.pkg
+https://getpassfs.com/releases/latest/passfs-linux-x64.gz
+https://getpassfs.com/releases/latest/passfs-linux-arm64.gz
+https://getpassfs.com/releases/latest/SHA256SUMS
+https://getpassfs.com/releases/vX.Y.Z/SHA256SUMS
+https://getpassfs.com/releases/vX.Y.Z/passfs-linux-x64.gz
+https://getpassfs.com/releases/vX.Y.Z/passfs-linux-arm64.gz
+https://getpassfs.com/releases/vX.Y.Z/PassFS-macos-universal.pkg
 ```

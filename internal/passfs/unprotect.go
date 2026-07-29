@@ -37,7 +37,6 @@ func (v *Volume) UnprotectAll(
 	ctx context.Context,
 	forbiddenRoots []string,
 ) UnprotectReport {
-	var report UnprotectReport
 	v.namespaceMu.Lock()
 	defer v.namespaceMu.Unlock()
 
@@ -48,14 +47,77 @@ func (v *Volume) UnprotectAll(
 			protected = append(protected, record)
 		}
 	}
+	return v.unprotectRecords(
+		ctx,
+		protected,
+		forbiddenRoots,
+		v.root,
+		"Authorize converting all passfs files to plaintext",
+	)
+}
+
+// UnprotectFile materializes one protected file at its original absolute path.
+// A ciphertext is removed only after its plaintext has been durably installed.
+// Callers must stop the FUSE service before invoking this method.
+func (v *Volume) UnprotectFile(
+	ctx context.Context,
+	sourcePath string,
+	forbiddenRoots []string,
+) UnprotectReport {
+	var report UnprotectReport
+	absolute, err := filepath.Abs(sourcePath)
+	if err != nil {
+		report.Failed = append(report.Failed, UnprotectIssue{
+			Path: sourcePath,
+			Err:  err,
+		})
+		return report
+	}
+	absolute = filepath.Clean(absolute)
+
+	v.namespaceMu.Lock()
+	defer v.namespaceMu.Unlock()
+
+	for _, record := range v.linkRecords() {
+		if !record.protected {
+			continue
+		}
+		original, err := OriginalPath(record.relative)
+		if err != nil || filepath.Clean(original) != absolute {
+			continue
+		}
+		return v.unprotectRecords(
+			ctx,
+			[]linkRecord{record},
+			forbiddenRoots,
+			absolute,
+			"Authorize converting this passfs file to plaintext",
+		)
+	}
+
+	report.Failed = append(report.Failed, UnprotectIssue{
+		Path: absolute,
+		Err:  errors.New("file is not protected by passfs"),
+	})
+	return report
+}
+
+func (v *Volume) unprotectRecords(
+	ctx context.Context,
+	protected []linkRecord,
+	forbiddenRoots []string,
+	promptPath string,
+	promptDescription string,
+) UnprotectReport {
+	var report UnprotectReport
 	if len(protected) == 0 {
 		return report
 	}
 
 	identity, err := v.requestIdentity(ctx, PromptRequest{
-		Path:        v.root,
+		Path:        promptPath,
 		Operation:   "unprotect",
-		Description: "Authorize converting all passfs files to plaintext",
+		Description: promptDescription,
 	})
 	if err != nil {
 		report.Err = err

@@ -1,0 +1,261 @@
+# PassFS
+
+> PassFS keeps selected local files encrypted at rest while applications
+> continue opening them at their original paths. It uses age encryption, one
+> local FUSE filesystem, and symbolic links. Supported platforms are macOS and
+> Linux.
+
+This document is the canonical machine-readable guide for installing and using
+PassFS. Prefer the commands shown here over inventing configuration files or
+calling internal commands.
+
+## Safety rules
+
+- Never ask a user to paste a passphrase, age identity, `.env` contents, API
+  key, or other secret into a chat.
+- Never read or print a protected file merely to verify that PassFS works. Use
+  `passfs status`, `passfs doctor`, and filesystem metadata instead.
+- `passfs unprotect FILE` writes that file as plaintext and permanently deletes
+  its encrypted copy after a successful atomic write.
+- `passfs unprotect` without a file applies that destructive operation to every
+  protected file.
+- Both unprotect forms display a warning and require the exact confirmation
+  token `UNPROTECT` from a real terminal. Do not bypass this confirmation.
+- Do not edit `~/.config/passfs/config.json`, the vault metadata, ciphertext, or
+  protected symbolic links directly.
+- Never replace a protected symbolic link with a regular file. Prefer
+  `passfs edit FILE` for editors that use atomic replacement.
+
+## Install
+
+### macOS
+
+Download the signed and notarized universal installer:
+
+https://getpassfs.com/releases/latest/PassFS-macos-universal.pkg
+
+The package installs `/Applications/PassFS.app` and `/usr/local/bin/passfs`.
+Then run:
+
+```sh
+passfs setup
+```
+
+`passfs setup` checks macFUSE and gives the required installation instructions.
+PassFS never installs a macOS system extension silently.
+
+### Linux
+
+Run:
+
+```sh
+curl -fsSL https://getpassfs.com/passfs | bash
+```
+
+The installer selects `x64` or `arm64`, verifies the SHA-256 checksum, installs
+PassFS in `~/.local/bin`, and installs FUSE with the detected package manager
+when necessary. System package installation may request `sudo`.
+
+## Initialize and mount
+
+Run these commands once after installation:
+
+```sh
+passfs setup
+passfs init
+passfs mount
+passfs status
+```
+
+`passfs init` is interactive. It creates one passphrase-protected age identity
+and one vault shared by all protected files on the computer. On supported Macs,
+Touch ID is enabled by default.
+
+Default paths:
+
+```text
+Settings:    ~/.config/passfs/config.json
+Vault:       ~/.config/passfs/vault
+Mount point: ~/.config/passfs/mnt
+Backup key:  ~/.config/passfs/vault/.passfs/identity.age
+```
+
+`passfs mount` starts a supervised background service and returns. Only one
+PassFS filesystem is used for all files.
+
+## Protect files
+
+Protect one or more regular files:
+
+```sh
+passfs encrypt /absolute/path/to/.env
+passfs encrypt /absolute/path/to/.env /absolute/path/to/config.json
+```
+
+Relative paths are accepted, but absolute paths are preferred in automated
+instructions. PassFS encrypts each file and replaces its original pathname with
+a symbolic link into the mounted filesystem. Applications continue using the
+original pathname without modification.
+
+Opening a protected file requests authorization. By default every open requires
+Touch ID on macOS when configured, or the PassFS passphrase otherwise.
+
+Do not inspect secret contents to test the result. Safe checks:
+
+```sh
+passfs status
+passfs doctor
+test -L /absolute/path/to/.env
+```
+
+## Edit a protected file
+
+Use:
+
+```sh
+passfs edit /absolute/path/to/.env
+```
+
+PassFS authorizes once for the edit session and opens Vim while preserving the
+protected link correctly.
+
+## Remove protection from one file
+
+Use the original protected pathname:
+
+```sh
+passfs unprotect /absolute/path/to/.env
+```
+
+PassFS displays the plaintext warning and requires typing `UNPROTECT`. It stops
+the filesystem briefly, atomically replaces that one protected link with a
+regular plaintext file, permanently deletes only that file's encrypted copy,
+and restores the service if it was previously active. Other protected files
+remain encrypted.
+
+If the pathname is missing, changed, or contains different plaintext, PassFS
+preserves the ciphertext and reports the conflict.
+
+## Remove protection from every file
+
+Use with no file argument:
+
+```sh
+passfs unprotect
+```
+
+After the `UNPROTECT` confirmation, PassFS converts every protected link to a
+regular plaintext file and permanently deletes each corresponding ciphertext
+only after the plaintext is safely written. On success PassFS remains unmounted
+and automatic startup is disabled.
+
+## Authorization duration
+
+Require authorization for every file open:
+
+```sh
+passfs config --unlock-for 0
+passfs reload
+```
+
+Cache authorization for each file for five minutes in PassFS process memory:
+
+```sh
+passfs config --unlock-for 5m
+passfs reload
+```
+
+The cache is per file and never stored on disk.
+
+## Service and diagnostics
+
+```sh
+passfs status
+passfs doctor
+passfs doctor --test-prompt
+passfs reload
+passfs unmount
+passfs mount
+```
+
+Use `passfs reload` after configuration changes or when the mount is
+unavailable. `passfs unmount` stops the filesystem and disables automatic
+startup; `passfs mount` enables it again.
+
+## Passphrase and Touch ID
+
+Change the global passphrase:
+
+```sh
+passfs passwd
+```
+
+Inspect Touch ID state on macOS:
+
+```sh
+passfs touchid status
+passfs touchid verify
+```
+
+Touch ID is device-local and is not a recovery key.
+
+## Backup
+
+Back up this file to secure offline storage:
+
+```text
+~/.config/passfs/vault/.passfs/identity.age
+```
+
+It is the single age private identity needed to recover every protected file.
+It is encrypted with the PassFS passphrase. Store that passphrase separately in
+a password manager. Do not treat the Touch ID copy as a backup.
+
+## Updates
+
+Check without installing:
+
+```sh
+passfs update --check
+```
+
+Install an available update:
+
+```sh
+passfs update
+```
+
+Updates are never installed silently. Release metadata and checksums are
+published under:
+
+https://getpassfs.com/releases/
+
+## Command discovery and automation
+
+```sh
+passfs help
+passfs COMMAND -h
+passfs version
+```
+
+- Use only documented public commands. `serve` and commands beginning with
+  `__` are internal.
+- Use argument arrays instead of constructing shell command strings. Insert
+  `--` before a pathname beginning with `-`.
+- Interactive authorization is intentional. PassFS does not accept a
+  passphrase through command-line arguments or environment variables.
+- A successful command exits with status 0. Errors exit nonzero and are
+  prefixed with `passfs:`.
+- Before remediation, prefer `passfs doctor`; when it recommends a command,
+  execute that exact public command after user approval when required.
+- Never run `passfs unprotect`, delete a protected link, change the passphrase,
+  install system packages, or install an update without explicit user intent.
+
+## Canonical links
+
+- Homepage: https://getpassfs.com/
+- Human documentation: https://github.com/menxit/passfs#readme
+- Source repository: https://github.com/menxit/passfs
+- Linux installer: https://getpassfs.com/passfs
+- Latest version: https://getpassfs.com/releases/latest.txt
+- Latest checksums: https://getpassfs.com/releases/latest/SHA256SUMS

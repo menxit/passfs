@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-BASE_URL="${PASSFS_RELEASE_BASE:-https://menxit.github.io/passfs/releases}"
+BASE_URL="${PASSFS_RELEASE_BASE:-https://getpassfs.com/releases}"
 INSTALL_DIRECTORY="${PASSFS_INSTALL_DIR:-${HOME}/.local/bin}"
 VERSION="${PASSFS_VERSION:-}"
 APT_UPDATED=0
@@ -101,7 +101,7 @@ install_graphical_prompt() {
 }
 
 [[ "$(uname -s)" == "Linux" ]] ||
-	fail "this installer is for Linux; download the signed macOS package from https://menxit.github.io/passfs/"
+	fail "this installer is for Linux; download the signed macOS package from https://getpassfs.com/"
 command -v curl >/dev/null 2>&1 || fail "curl is required."
 command -v gzip >/dev/null 2>&1 || fail "gzip is required."
 command -v systemctl >/dev/null 2>&1 ||

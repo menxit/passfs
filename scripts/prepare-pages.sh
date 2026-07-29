@@ -52,6 +52,8 @@ mkdir -p \
 sed "s/__PASSFS_VERSION__/${VERSION}/g" \
 	"${ROOT}/site/index.html" > "${STAGED_OUTPUT}/site/index.html"
 cp "${ROOT}/site/robots.txt" "${STAGED_OUTPUT}/site/robots.txt"
+cp "${ROOT}/site/CNAME" "${STAGED_OUTPUT}/site/CNAME"
+cp "${ROOT}/site/llms.txt" "${STAGED_OUTPUT}/site/llms.txt"
 cp "${ROOT}/site/og.png" "${STAGED_OUTPUT}/site/og.png"
 cp "${ROOT}/site/github.svg" "${STAGED_OUTPUT}/site/github.svg"
 cp "${ROOT}/packaging/macos/AppIcon-1024.png" \
@@ -68,6 +70,16 @@ cp "${RELEASE}"/*.gz "${RELEASE}"/*.pkg \
 grep -Fq 'href="releases/latest/PassFS-macos-universal.pkg"' \
 	"${STAGED_OUTPUT}/site/index.html" || {
 	echo "The macOS download does not use the stable latest URL." >&2
+	exit 1
+}
+grep -Fq 'curl -fsSL https://getpassfs.com/passfs | bash' \
+	"${STAGED_OUTPUT}/site/llms.txt" || {
+	echo "llms.txt does not contain the canonical Linux installer." >&2
+	exit 1
+}
+grep -Fq 'passfs unprotect /absolute/path/to/.env' \
+	"${STAGED_OUTPUT}/site/llms.txt" || {
+	echo "llms.txt does not document single-file unprotect." >&2
 	exit 1
 }
 printf '%s\n' "${VERSION}" \
