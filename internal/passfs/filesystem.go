@@ -438,6 +438,13 @@ func (n *Node) Setattr(
 		return n.Getattr(ctx, nil, out)
 	}
 
+	if openHandle := n.volume.writableOpenHandle(
+		storage,
+		callerPID(ctx),
+	); openHandle != nil {
+		return openHandle.Setattr(ctx, input, out)
+	}
+
 	if _, resize := input.GetSize(); resize {
 		handle, err := n.volume.openFile(ctx, storage, syscall.O_RDWR)
 		if err != nil {
@@ -487,13 +494,21 @@ func (n *Node) Setxattr(
 	data []byte,
 	flags uint32,
 ) syscall.Errno {
-	if n.isDir {
-		return syscall.EINVAL
-	}
 	switch name {
+	case encryptSessionMarkerName:
+		if !n.isDir || !n.IsRoot() {
+			return syscall.EPERM
+		}
+		return n.setEncryptSession(ctx, data)
 	case linkMarkerName:
+		if n.isDir {
+			return syscall.EINVAL
+		}
 		return n.setLinkMarker(data)
 	case editSessionMarkerName:
+		if n.isDir {
+			return syscall.EINVAL
+		}
 		return n.setEditSession(ctx, data)
 	default:
 		return syscall.ENOTSUP
@@ -518,11 +533,11 @@ func (n *Node) setLinkMarker(data []byte) syscall.Errno {
 	if !link.isSymlink || link.target != targetPath {
 		return syscall.EINVAL
 	}
-	return errnoFromError(n.volume.setLinkTarget(storage, targetPath))
+	return errnoFromError(n.volume.registerProtectedLink(storage, targetPath))
 }
 
 func (n *Node) setEditSession(ctx context.Context, data []byte) syscall.Errno {
-	operation, token, err := parseEditSessionCommand(data)
+	operation, token, err := parseSessionCommand(data)
 	if err != nil {
 		return syscall.EINVAL
 	}
@@ -530,15 +545,46 @@ func (n *Node) setEditSession(ctx context.Context, data []byte) syscall.Errno {
 	if !ok || caller.Pid == 0 {
 		return syscall.EPERM
 	}
+	ownerPID := callerPID(ctx)
+	if ownerPID == 0 {
+		return syscall.EPERM
+	}
 	storage := storagePath(n.relativePath())
 	switch operation {
 	case "begin":
 		return errnoFromError(
-			n.volume.beginEditSession(ctx, storage, token, caller.Pid),
+			n.volume.beginEditSession(ctx, storage, token, ownerPID),
 		)
 	case "end":
 		return errnoFromError(
-			n.volume.endEditSession(storage, token, caller.Pid),
+			n.volume.endEditSession(storage, token, ownerPID),
+		)
+	default:
+		return syscall.EINVAL
+	}
+}
+
+func (n *Node) setEncryptSession(ctx context.Context, data []byte) syscall.Errno {
+	operation, token, err := parseSessionCommand(data)
+	if err != nil {
+		return syscall.EINVAL
+	}
+	caller, ok := fuse.FromContext(ctx)
+	if !ok || caller.Pid == 0 {
+		return syscall.EPERM
+	}
+	ownerPID := callerPID(ctx)
+	if ownerPID == 0 {
+		return syscall.EPERM
+	}
+	switch operation {
+	case "begin":
+		return errnoFromError(
+			n.volume.beginEncryptSession(ctx, token, ownerPID),
+		)
+	case "end":
+		return errnoFromError(
+			n.volume.endEncryptSession(token, ownerPID),
 		)
 	default:
 		return syscall.EINVAL

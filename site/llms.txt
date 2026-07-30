@@ -95,7 +95,9 @@ passfs encrypt /absolute/path/to/.env /absolute/path/to/config.json
 Relative paths are accepted, but absolute paths are preferred in automated
 instructions. PassFS encrypts each file and replaces its original pathname with
 a symbolic link into the mounted filesystem. Applications continue using the
-original pathname without modification.
+original pathname without modification. When several files are passed, PassFS
+requests authorization once, scopes the in-memory identity to that CLI process,
+and discards it when the command exits.
 
 Opening a protected file requests authorization. By default every open requires
 Touch ID on macOS when configured, or the PassFS passphrase otherwise.
@@ -108,6 +110,23 @@ passfs doctor
 test -L /absolute/path/to/.env
 ```
 
+### Repository secret audit
+
+When asked to find and protect likely secret files in a repository:
+
+1. Do not read, print, copy, or transmit file contents or secret values.
+2. Find candidates from filenames, file types, `.gitignore`, and Git metadata.
+3. Consider `.env` and `.env.*`, credentials, secrets, private keys, and local
+   configuration. Exclude examples, templates, tests, dependencies, build
+   output, `.git`, symbolic links, and files already protected by PassFS.
+4. Do not modify tracked candidates. Report them separately because Git history
+   may already contain their contents.
+5. Run `passfs doctor`. If it succeeds, call `passfs encrypt` exactly once with
+   every untracked or ignored regular-file candidate as a separate argument.
+   Insert `--` before the paths.
+6. Verify only that every original pathname is now a symbolic link, then report
+   paths and results without contents.
+
 ## Edit a protected file
 
 Use:
@@ -118,6 +137,17 @@ passfs edit /absolute/path/to/.env
 
 PassFS authorizes once for the edit session and opens Vim while preserving the
 protected link correctly.
+
+## Move or delete a protected link
+
+While PassFS is running, a rename or move to another directory on the same
+filesystem is tracked automatically, including a renamed parent directory.
+Deleting the link deletes its ciphertext shortly afterward.
+
+If the link is already missing when PassFS starts, the ciphertext is preserved:
+an offline move and deletion cannot be distinguished safely. Recover an offline
+move by returning the link to its original pathname, starting PassFS, and then
+repeating the move while the service is running.
 
 ## Remove protection from one file
 

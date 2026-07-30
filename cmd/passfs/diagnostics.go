@@ -40,7 +40,12 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 	settings, settingsErr := passfs.LoadSettings(common.configPath)
 	switch {
 	case settingsErr == nil:
-		fmt.Fprintf(stdout, "%-14s %s\n", "Configuration:", "ready — "+settings.Path())
+		fmt.Fprintf(
+			stdout,
+			"%-14s %s\n",
+			"Configuration:",
+			"ready — "+terminalPath(settings.Path()),
+		)
 	case errors.Is(settingsErr, os.ErrNotExist):
 		fmt.Fprintf(
 			stdout,
@@ -109,7 +114,7 @@ func printMountDiagnosis(writer io.Writer, settings *passfs.Settings) {
 	description := "not mounted"
 	switch {
 	case mount.mounted && mount.passfs && mount.healthy:
-		description = "mounted — " + settings.MountPoint
+		description = "mounted — " + terminalPath(settings.MountPoint)
 	case mount.mounted && mount.passfs:
 		description = "mounted but unavailable — run \"passfs reload\""
 	case mount.mounted:

@@ -17,6 +17,9 @@ import (
 const systemdUnitName = "passfs.service"
 
 func installAndStartService(executable, configPath string) error {
+	if _, err := systemctlExecutable(); err != nil {
+		return err
+	}
 	unitPath, err := serviceDefinitionPath()
 	if err != nil {
 		return err
@@ -76,13 +79,34 @@ func queryService() (serviceStatus, error) {
 		return serviceStatus{}, statErr
 	}
 
-	command := exec.Command("systemctl", "--user", "is-active", "--quiet", systemdUnitName)
-	if err := command.Run(); err != nil {
+	systemctl, err := systemctlExecutable()
+	if err != nil {
+		return serviceStatus{Installed: installed}, err
+	}
+	output, commandErr := runServiceCommand(
+		systemctl,
+		"--user",
+		"is-active",
+		"--quiet",
+		systemdUnitName,
+	)
+	if commandErr != nil {
 		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
+		if errors.As(commandErr, &exitError) &&
+			(exitError.ExitCode() == 3 || exitError.ExitCode() == 4) {
 			return serviceStatus{Installed: installed}, nil
 		}
-		return serviceStatus{}, err
+		detail := strings.TrimSpace(string(output))
+		if detail == "" {
+			detail = commandErr.Error()
+		}
+		return serviceStatus{Installed: installed}, actionableError{
+			"the systemd user session is unavailable: " + detail,
+			"log in through a systemd-managed session or enable lingering with:",
+			"  sudo loginctl enable-linger $USER",
+			"then log out and in before running:",
+			"  passfs mount",
+		}
 	}
 	return serviceStatus{Installed: installed, Running: true}, nil
 }
@@ -100,13 +124,31 @@ func serviceLogHint(configPath string) string {
 }
 
 func runSystemctl(arguments ...string) error {
+	systemctl, err := systemctlExecutable()
+	if err != nil {
+		return err
+	}
 	commandArguments := append([]string{"--user"}, arguments...)
-	command := exec.Command("systemctl", commandArguments...)
-	output, err := command.CombinedOutput()
+	output, err := runServiceCommand(systemctl, commandArguments...)
 	if err != nil {
 		return fmt.Errorf("systemctl %v: %w: %s", arguments, err, bytes.TrimSpace(output))
 	}
 	return nil
+}
+
+func systemctlExecutable() (string, error) {
+	path, err := exec.LookPath("systemctl")
+	if err == nil {
+		return path, nil
+	}
+	if !errors.Is(err, exec.ErrNotFound) {
+		return "", err
+	}
+	return "", actionableError{
+		"passfs requires a systemd user session to keep its filesystem mounted",
+		"systemctl is unavailable in this Linux environment",
+		"use a systemd-based host or virtual machine",
+	}
 }
 
 func importGraphicalEnvironment() error {
@@ -147,6 +189,7 @@ Type=simple
 ExecStart=` + execStart + ` serve --config ` + config + `
 Restart=always
 RestartSec=2
+TimeoutStopSec=8
 
 [Install]
 WantedBy=default.target

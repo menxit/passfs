@@ -80,17 +80,17 @@ func queryService() (serviceStatus, error) {
 		return serviceStatus{}, statErr
 	}
 
-	command := exec.Command(
+	_, commandErr := runServiceCommand(
 		"/bin/launchctl",
 		"print",
 		launchAgentDomain()+"/"+launchAgentLabel,
 	)
-	if err := command.Run(); err != nil {
+	if commandErr != nil {
 		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
+		if errors.As(commandErr, &exitError) {
 			return serviceStatus{Installed: installed}, nil
 		}
-		return serviceStatus{}, err
+		return serviceStatus{}, commandErr
 	}
 	return serviceStatus{Installed: installed, Running: true}, nil
 }
@@ -112,8 +112,7 @@ func launchAgentDomain() string {
 }
 
 func runLaunchctl(arguments ...string) error {
-	command := exec.Command("/bin/launchctl", arguments...)
-	output, err := command.CombinedOutput()
+	output, err := runServiceCommand("/bin/launchctl", arguments...)
 	if err != nil {
 		return fmt.Errorf("launchctl %v: %w: %s", arguments, err, bytes.TrimSpace(output))
 	}

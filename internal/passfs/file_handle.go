@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -13,16 +14,19 @@ import (
 )
 
 type OpenFile struct {
-	mu       sync.Mutex
-	volume   *Volume
-	relative string
-	data     []byte
-	meta     FileMeta
-	writable bool
-	append   bool
-	dirty    bool
-	released bool
-	unlock   func()
+	mu                    sync.Mutex
+	pendingWrites         atomic.Int32
+	appendCandidateOffset int64
+	volume                *Volume
+	relative              string
+	data                  []byte
+	meta                  FileMeta
+	writable              bool
+	append                bool
+	dirty                 bool
+	released              bool
+	unlock                func()
+	unlockPath            func()
 }
 
 func (v *Volume) openFile(ctx context.Context, relative string, flags uint32) (*OpenFile, error) {
@@ -31,11 +35,18 @@ func (v *Volume) openFile(ctx context.Context, relative string, flags uint32) (*
 	}
 	accessMode := flags & syscall.O_ACCMODE
 	writable := accessMode == syscall.O_WRONLY || accessMode == syscall.O_RDWR
-	unlock := v.acquireOpenLock(relative, writable)
+	v.namespaceMu.RLock()
 	success := false
 	defer func() {
 		if !success {
-			unlock()
+			v.namespaceMu.RUnlock()
+		}
+	}()
+	unlockPath := v.acquirePathLock(relative, writable)
+	pathLockHeld := true
+	defer func() {
+		if pathLockHeld {
+			unlockPath()
 		}
 	}()
 
@@ -69,15 +80,23 @@ func (v *Volume) openFile(ctx context.Context, relative string, flags uint32) (*
 	}
 
 	handle := &OpenFile{
-		volume:   v,
-		relative: relative,
-		data:     data,
-		meta:     meta,
-		writable: writable,
-		append:   flags&syscall.O_APPEND != 0,
-		dirty:    writable && flags&syscall.O_TRUNC != 0,
-		unlock:   unlock,
+		volume:                v,
+		relative:              relative,
+		data:                  data,
+		meta:                  meta,
+		writable:              writable,
+		append:                flags&syscall.O_APPEND != 0,
+		dirty:                 writable && flags&syscall.O_TRUNC != 0,
+		appendCandidateOffset: -1,
+		unlockPath:            unlockPath,
 	}
+	pathLockHeld = false
+	if writable {
+		handle.unlock = v.namespaceMu.RUnlock
+	} else {
+		v.namespaceMu.RUnlock()
+	}
+	v.registerOpenHandle(handle, callerPID(ctx))
 	success = true
 	return handle, nil
 }
@@ -91,11 +110,18 @@ func (v *Volume) createFile(
 	if err := validateRelativePath(relative); err != nil {
 		return nil, err
 	}
-	unlock := v.acquireOpenLock(relative, true)
+	v.namespaceMu.RLock()
 	success := false
 	defer func() {
 		if !success {
-			unlock()
+			v.namespaceMu.RUnlock()
+		}
+	}()
+	unlockPath := v.acquirePathLock(relative, true)
+	pathLockHeld := true
+	defer func() {
+		if pathLockHeld {
+			unlockPath()
 		}
 	}()
 
@@ -156,15 +182,23 @@ func (v *Volume) createFile(
 	}
 
 	handle := &OpenFile{
-		volume:   v,
-		relative: relative,
-		data:     data,
-		meta:     meta,
-		writable: writable,
-		append:   flags&syscall.O_APPEND != 0,
-		dirty:    dirty,
-		unlock:   unlock,
+		volume:                v,
+		relative:              relative,
+		data:                  data,
+		meta:                  meta,
+		writable:              writable,
+		append:                flags&syscall.O_APPEND != 0,
+		dirty:                 dirty,
+		appendCandidateOffset: -1,
+		unlockPath:            unlockPath,
 	}
+	pathLockHeld = false
+	if writable {
+		handle.unlock = v.namespaceMu.RUnlock
+	} else {
+		v.namespaceMu.RUnlock()
+	}
+	v.registerOpenHandle(handle, callerPID(ctx))
 	success = true
 	return handle, nil
 }
@@ -194,6 +228,9 @@ func (f *OpenFile) Write(
 	data []byte,
 	offset int64,
 ) (uint32, syscall.Errno) {
+	overlappingWrite := f.pendingWrites.Add(1) > 1
+	defer f.pendingWrites.Add(-1)
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.released {
@@ -204,6 +241,18 @@ func (f *OpenFile) Write(
 	}
 	if f.append {
 		offset = int64(len(f.data))
+	} else if concurrentAppendWorkaround {
+		currentSize := int64(len(f.data))
+		switch {
+		case overlappingWrite &&
+			offset == f.appendCandidateOffset &&
+			offset < currentSize:
+			offset = currentSize
+		case offset == currentSize:
+			f.appendCandidateOffset = offset
+		default:
+			f.appendCandidateOffset = -1
+		}
 	}
 	if offset < 0 || offset > f.volume.maxFileSize {
 		return 0, syscall.EFBIG
@@ -239,6 +288,10 @@ func (f *OpenFile) flushLocked() error {
 	if !f.dirty {
 		return nil
 	}
+	if f.unlockPath == nil {
+		unlockPath := f.volume.acquirePathLock(f.relative, true)
+		defer unlockPath()
+	}
 	if err := f.volume.persistFile(f.relative, f.data, f.meta); err != nil {
 		return err
 	}
@@ -259,8 +312,14 @@ func (f *OpenFile) Release(ctx context.Context) syscall.Errno {
 	f.released = true
 	unlock := f.unlock
 	f.unlock = nil
+	unlockPath := f.unlockPath
+	f.unlockPath = nil
 	f.mu.Unlock()
 
+	f.volume.unregisterOpenHandle(f)
+	if unlockPath != nil {
+		unlockPath()
+	}
 	if unlock != nil {
 		unlock()
 	}

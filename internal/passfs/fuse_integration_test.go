@@ -5,6 +5,7 @@ package passfs
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -60,6 +61,37 @@ func TestFUSEEndToEnd(t *testing.T) {
 		server.Wait()
 		volume.Lock()
 	})
+
+	batchDirectory := t.TempDir()
+	batchPaths := []string{
+		filepath.Join(batchDirectory, ".env"),
+		filepath.Join(batchDirectory, "credentials.json"),
+	}
+	for index, path := range batchPaths {
+		if err := os.WriteFile(
+			path,
+			[]byte(fmt.Sprintf("SECRET_%d=value\n", index)),
+			0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	promptsBeforeBatch := prompter.requestCount()
+	batchToken, err := BeginEncryptSession(mountPoint)
+	if err != nil {
+		t.Fatalf("begin encrypt session: %v", err)
+	}
+	for _, path := range batchPaths {
+		if _, err := ImportThroughMount(path, mountPoint, 1024*1024); err != nil {
+			t.Fatalf("batch ImportThroughMount(%s): %v", path, err)
+		}
+	}
+	if err := EndEncryptSession(mountPoint, batchToken); err != nil {
+		t.Fatalf("end encrypt session: %v", err)
+	}
+	if got, want := prompter.requestCount(), promptsBeforeBatch+1; got != want {
+		t.Fatalf("batch prompts = %d, want %d", got, want)
+	}
 
 	projectDirectory := t.TempDir()
 	sourcePath := filepath.Join(projectDirectory, ".env")
@@ -193,7 +225,14 @@ func TestFUSEEndToEnd(t *testing.T) {
 	}
 
 	records := volume.linkRecords()
-	if len(records) != 1 || records[0].linkTarget != result.TargetPath {
+	linkPersisted := false
+	for _, record := range records {
+		if record.linkTarget == result.TargetPath {
+			linkPersisted = true
+			break
+		}
+	}
+	if !linkPersisted {
 		t.Fatalf("link marker was not persisted synchronously: %#v", records)
 	}
 

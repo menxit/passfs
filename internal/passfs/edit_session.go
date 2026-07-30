@@ -9,61 +9,77 @@ import (
 )
 
 const (
-	editSessionBegin = "begin:"
-	editSessionEnd   = "end:"
+	sessionBegin = "begin:"
+	sessionEnd   = "end:"
 )
 
 func BeginEditSession(targetPath string) (string, error) {
+	return beginControlSession(
+		targetPath,
+		editSessionMarkerName,
+		"edit session",
+	)
+}
+
+func EndEditSession(targetPath, token string) error {
+	return endControlSession(targetPath, editSessionMarkerName, token)
+}
+
+func beginControlSession(
+	targetPath string,
+	markerName string,
+	description string,
+) (string, error) {
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
-		return "", fmt.Errorf("generate edit session token: %w", err)
+		return "", fmt.Errorf("generate %s token: %w", description, err)
 	}
 	token := hex.EncodeToString(random)
 	if err := setControlXattr(
 		targetPath,
-		editSessionMarkerName,
-		[]byte(editSessionBegin+token),
+		markerName,
+		[]byte(sessionBegin+token),
 	); err != nil {
 		return "", err
 	}
 	return token, nil
 }
 
-func EndEditSession(targetPath, token string) error {
-	if err := validateEditSessionToken(token); err != nil {
+func endControlSession(targetPath, markerName, token string) error {
+	if err := validateSessionToken(token); err != nil {
 		return err
 	}
 	return setControlXattr(
 		targetPath,
-		editSessionMarkerName,
-		[]byte(editSessionEnd+token),
+		markerName,
+		[]byte(sessionEnd+token),
 	)
 }
 
-func parseEditSessionCommand(value []byte) (operation, token string, err error) {
+func parseSessionCommand(value []byte) (operation, token string, err error) {
 	command := string(value)
 	switch {
-	case strings.HasPrefix(command, editSessionBegin):
+	case strings.HasPrefix(command, sessionBegin):
 		operation = "begin"
-		token = strings.TrimPrefix(command, editSessionBegin)
-	case strings.HasPrefix(command, editSessionEnd):
+		token = strings.TrimPrefix(command, sessionBegin)
+	case strings.HasPrefix(command, sessionEnd):
 		operation = "end"
-		token = strings.TrimPrefix(command, editSessionEnd)
+		token = strings.TrimPrefix(command, sessionEnd)
 	default:
-		return "", "", errors.New("invalid edit session command")
+		return "", "", errors.New("invalid session command")
 	}
-	if err := validateEditSessionToken(token); err != nil {
+	if err := validateSessionToken(token); err != nil {
 		return "", "", err
 	}
 	return operation, token, nil
 }
 
-func validateEditSessionToken(token string) error {
+func validateSessionToken(token string) error {
 	if len(token) != 32 {
-		return errors.New("invalid edit session token")
+		return errors.New("invalid session token")
 	}
 	if _, err := hex.DecodeString(token); err != nil {
-		return errors.New("invalid edit session token")
+		return errors.New("invalid session token")
 	}
 	return nil
 }

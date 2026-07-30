@@ -384,15 +384,11 @@ func (v *Volume) removeMaterializedCiphertext(
 	v.metadataMu.Lock()
 	meta, hadMeta := v.metadata.Files[key]
 	linkTarget, hadLink := v.metadata.Links[key]
-	delete(v.metadata.Files, key)
-	delete(v.metadata.Links, key)
-	if err := v.saveMetadataLocked(); err != nil {
-		if hadMeta {
-			v.metadata.Files[key] = meta
-		}
-		if hadLink {
-			v.metadata.Links[key] = linkTarget
-		}
+	if err := v.updateMetadataLocked(func(metadata *Metadata) error {
+		delete(metadata.Files, key)
+		delete(metadata.Links, key)
+		return nil
+	}); err != nil {
 		v.metadataMu.Unlock()
 		return false, fmt.Errorf("prepare encrypted metadata removal: %w", err)
 	}
@@ -427,13 +423,15 @@ func (v *Volume) restoreUnprotectMetadata(
 ) error {
 	v.metadataMu.Lock()
 	defer v.metadataMu.Unlock()
-	if hadMeta {
-		v.metadata.Files[key] = meta
-	}
-	if hadLink {
-		v.metadata.Links[key] = linkTarget
-	}
-	if err := v.saveMetadataLocked(); err != nil {
+	if err := v.updateMetadataLocked(func(metadata *Metadata) error {
+		if hadMeta {
+			metadata.Files[key] = meta
+		}
+		if hadLink {
+			metadata.Links[key] = linkTarget
+		}
+		return nil
+	}); err != nil {
 		return fmt.Errorf("restore metadata after encrypted-file removal failed: %w", err)
 	}
 	return nil

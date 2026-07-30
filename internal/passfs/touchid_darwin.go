@@ -51,16 +51,11 @@ import (
 )
 
 const touchIDRightPrefix = "com.menxit.passfs.identity."
-const touchIDPromptTimeout = 45 * time.Second
 
 var (
-	ErrTouchIDNotConfigured    = errors.New("Touch ID is not configured for this passfs volume")
-	ErrTouchIDAuthentication   = errors.New("Touch ID authentication failed")
-	ErrTouchIDInProgress       = errors.New("another Touch ID authorization is already in progress")
-	ErrTouchIDTimeout          = errors.New("Touch ID authorization timed out")
-	ErrTouchIDUnsupportedBuild = errors.New(
-		"this passfs build cannot use Touch ID; macOS requires a signed app bundle with Keychain entitlements",
-	)
+	ErrTouchIDNotConfigured  = errors.New("Touch ID is not configured for this passfs volume")
+	ErrTouchIDAuthentication = errors.New("Touch ID authentication failed")
+	ErrTouchIDInProgress     = errors.New("another Touch ID authorization is already in progress")
 )
 
 type TouchIDPrompter struct {

@@ -203,8 +203,25 @@ func TestInitVolumeOptionalIdentitySuccessIsConfigured(t *testing.T) {
 
 func createTestFile(t *testing.T, volume *Volume, relative string, plaintext []byte) {
 	t.Helper()
-	handle, err := volume.createFile(
+	createTestFileWithContext(
+		t,
 		context.Background(),
+		volume,
+		relative,
+		plaintext,
+	)
+}
+
+func createTestFileWithContext(
+	t *testing.T,
+	ctx context.Context,
+	volume *Volume,
+	relative string,
+	plaintext []byte,
+) {
+	t.Helper()
+	handle, err := volume.createFile(
+		ctx,
 		relative,
 		syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR,
 		0o600,
@@ -212,15 +229,15 @@ func createTestFile(t *testing.T, volume *Volume, relative string, plaintext []b
 	if err != nil {
 		t.Fatalf("createFile: %v", err)
 	}
-	if written, errno := handle.Write(context.Background(), plaintext, 0); errno != 0 {
+	if written, errno := handle.Write(ctx, plaintext, 0); errno != 0 {
 		t.Fatalf("Write: %v", errno)
 	} else if written != uint32(len(plaintext)) {
 		t.Fatalf("Write = %d, want %d", written, len(plaintext))
 	}
-	if errno := handle.Flush(context.Background()); errno != 0 {
+	if errno := handle.Flush(ctx); errno != 0 {
 		t.Fatalf("Flush: %v", errno)
 	}
-	if errno := handle.Release(context.Background()); errno != 0 {
+	if errno := handle.Release(ctx); errno != 0 {
 		t.Fatalf("Release: %v", errno)
 	}
 }
@@ -416,12 +433,12 @@ func TestEditSessionUsesOneAuthorizationUntilItEnds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadVolume: %v", err)
 	}
-	const token = "0123456789abcdef0123456789abcdef"
+	const sessionID = "0123456789abcdef0123456789abcdef"
 	pid := uint32(os.Getpid())
 	if err := editingVolume.beginEditSession(
 		context.Background(),
 		"editable.env",
-		token,
+		sessionID,
 		pid,
 	); err != nil {
 		t.Fatalf("beginEditSession: %v", err)
@@ -446,7 +463,7 @@ func TestEditSessionUsesOneAuthorizationUntilItEnds(t *testing.T) {
 	if got := prompter.requestCount(); got != 1 {
 		t.Fatalf("prompts during edit session = %d, want 1", got)
 	}
-	if err := editingVolume.endEditSession("editable.env", token, pid); err != nil {
+	if err := editingVolume.endEditSession("editable.env", sessionID, pid); err != nil {
 		t.Fatalf("endEditSession: %v", err)
 	}
 
@@ -461,6 +478,47 @@ func TestEditSessionUsesOneAuthorizationUntilItEnds(t *testing.T) {
 	_ = handle.Release(context.Background())
 	if got := prompter.requestCount(); got != 2 {
 		t.Fatalf("prompts after edit session = %d, want 2", got)
+	}
+}
+
+func TestEncryptSessionUsesOneAuthorizationAndIsScopedToOwnerPID(t *testing.T) {
+	const passphrase = "encrypt session password"
+	volume, prompter := initializeTestVolume(t, passphrase, 1024*1024)
+	const sessionID = "0123456789abcdef0123456789abcdef"
+	ownerPID := uint32(os.Getpid())
+	ownerContext := fuse.NewContext(
+		context.Background(),
+		&fuse.Caller{Pid: ownerPID},
+	)
+
+	if err := volume.beginEncryptSession(ownerContext, sessionID, ownerPID); err != nil {
+		t.Fatalf("beginEncryptSession: %v", err)
+	}
+	if got := prompter.requestCount(); got != 1 {
+		t.Fatalf("begin session prompts = %d, want 1", got)
+	}
+
+	createTestFileWithContext(t, ownerContext, volume, "first.env", []byte("A=1\n"))
+	createTestFileWithContext(t, ownerContext, volume, "second.env", []byte("B=2\n"))
+	if got := prompter.requestCount(); got != 1 {
+		t.Fatalf("owner prompts during batch = %d, want 1", got)
+	}
+
+	otherContext := fuse.NewContext(
+		context.Background(),
+		&fuse.Caller{Pid: ownerPID + 1_000_000},
+	)
+	createTestFileWithContext(t, otherContext, volume, "other.env", []byte("C=3\n"))
+	if got := prompter.requestCount(); got != 2 {
+		t.Fatalf("other process prompts = %d, want 2", got)
+	}
+
+	if err := volume.endEncryptSession(sessionID, ownerPID); err != nil {
+		t.Fatalf("endEncryptSession: %v", err)
+	}
+	createTestFileWithContext(t, ownerContext, volume, "after.env", []byte("D=4\n"))
+	if got := prompter.requestCount(); got != 3 {
+		t.Fatalf("prompts after batch = %d, want 3", got)
 	}
 }
 

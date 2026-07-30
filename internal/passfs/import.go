@@ -1,11 +1,13 @@
 package passfs
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -27,29 +29,11 @@ func ImportThroughMount(sourcePath, mountPoint string, maxFileSize int64) (resul
 	if maxFileSize <= 0 {
 		return result, errors.New("maximum file size must be greater than zero")
 	}
-	mountPoint, err = filepath.Abs(mountPoint)
-	if err != nil {
-		return result, err
-	}
-	mounted, isPassFS, err := MountStatus(mountPoint)
-	if err != nil {
-		return result, fmt.Errorf("inspect passfs mount: %w", err)
-	}
-	if !mounted || !isPassFS {
-		return result, errors.New("target is not a mounted passfs filesystem")
-	}
-	sourcePath, err = filepath.Abs(sourcePath)
-	if err != nil {
-		return result, err
-	}
-	targetPath, err := MountedPath(mountPoint, sourcePath)
+	sourcePath, targetPath, err := resolveImportPaths(sourcePath, mountPoint)
 	if err != nil {
 		return result, err
 	}
 	result.TargetPath = targetPath
-	if PathWithin(mountPoint, sourcePath) {
-		return result, errors.New("cannot import a file from inside the passfs mount")
-	}
 	result, err = importFile(sourcePath, targetPath, maxFileSize)
 	if err != nil {
 		return result, err
@@ -61,6 +45,199 @@ func ImportThroughMount(sourcePath, mountPoint string, maxFileSize int64) (resul
 		)
 	}
 	return result, nil
+}
+
+// ValidateImportThroughMount checks whether an import can proceed without
+// changing either the source file or the mounted volume. ImportThroughMount
+// still repeats every check to protect against changes after validation.
+func ValidateImportThroughMount(sourcePath, mountPoint string, maxFileSize int64) error {
+	if maxFileSize <= 0 {
+		return errors.New("maximum file size must be greater than zero")
+	}
+	sourcePath, targetPath, err := resolveImportPaths(sourcePath, mountPoint)
+	if err != nil {
+		return err
+	}
+	targetInfo, targetErr := os.Lstat(targetPath)
+	switch {
+	case targetErr == nil:
+		if !targetInfo.Mode().IsRegular() {
+			return fmt.Errorf("protected target %s is not a regular file", targetPath)
+		}
+		link, err := inspectProtectedLink(sourcePath)
+		if err != nil {
+			return fmt.Errorf("inspect protected path %s: %w", sourcePath, err)
+		}
+		if !link.exists {
+			return nil
+		}
+		if !link.isSymlink {
+			return fmt.Errorf(
+				"%s already exists and is not the passfs protected link",
+				sourcePath,
+			)
+		}
+		if link.target != filepath.Clean(targetPath) {
+			return fmt.Errorf(
+				"%s points to %s instead of the passfs target %s",
+				sourcePath,
+				link.target,
+				targetPath,
+			)
+		}
+		return nil
+	case !errors.Is(targetErr, os.ErrNotExist):
+		return fmt.Errorf("check encrypted target: %w", targetErr)
+	}
+
+	file, _, err := openValidatedSource(sourcePath, maxFileSize)
+	if err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+func resolveImportPaths(sourcePath, mountPoint string) (string, string, error) {
+	absoluteMountPoint, err := filepath.Abs(mountPoint)
+	if err != nil {
+		return "", "", err
+	}
+	mountPoint = absoluteMountPoint
+	mounted, isPassFS, err := MountStatus(mountPoint)
+	if err != nil {
+		return "", "", fmt.Errorf("inspect passfs mount: %w", err)
+	}
+	if !mounted || !isPassFS {
+		return "", "", errors.New("target is not a mounted passfs filesystem")
+	}
+	sourcePath, err = filepath.Abs(sourcePath)
+	if err != nil {
+		return "", "", err
+	}
+	targetPath, err := MountedPath(mountPoint, sourcePath)
+	if err != nil {
+		return "", "", err
+	}
+	if PathWithin(mountPoint, sourcePath) {
+		return "", "", errors.New("cannot import a file from inside the passfs mount")
+	}
+	if err := validateImportTarget(mountPoint, targetPath); err != nil {
+		return "", "", err
+	}
+	return sourcePath, targetPath, nil
+}
+
+func validateImportTarget(mountPoint, targetPath string) error {
+	relative, err := filepath.Rel(mountPoint, targetPath)
+	if err != nil {
+		return err
+	}
+	components := strings.Split(filepath.Clean(relative), string(os.PathSeparator))
+	for _, component := range components[:len(components)-1] {
+		if strings.HasSuffix(component, encryptedSuffix) {
+			return fmt.Errorf(
+				"cannot protect files below directory %q because passfs reserves the %s suffix for encrypted files",
+				component,
+				encryptedSuffix,
+			)
+		}
+	}
+	name := components[len(components)-1]
+	if len([]byte(name))+len(encryptedSuffix) > 255 {
+		return fmt.Errorf(
+			"file name is too long after adding passfs encrypted suffix %s",
+			encryptedSuffix,
+		)
+	}
+	return nil
+}
+
+// ReconcileProtectedEdit restores the protected link after an editor replaces
+// it with a regular file during an atomic save. The replacement plaintext is
+// written through the mounted target before the link is atomically restored.
+// A matching protected link needs no reconciliation.
+func ReconcileProtectedEdit(sourcePath, targetPath string, maxFileSize int64) (bool, error) {
+	if maxFileSize <= 0 {
+		return false, errors.New("maximum file size must be greater than zero")
+	}
+	sourcePath, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return false, err
+	}
+	targetPath, err = filepath.Abs(targetPath)
+	if err != nil {
+		return false, err
+	}
+
+	link, err := inspectProtectedLink(sourcePath)
+	if err != nil {
+		return false, fmt.Errorf("inspect edited path: %w", err)
+	}
+	if !link.exists {
+		return false, fmt.Errorf("%s was removed by the editor", sourcePath)
+	}
+	if link.isSymlink {
+		if link.target != filepath.Clean(targetPath) {
+			return false, fmt.Errorf(
+				"%s points to %s instead of the passfs target %s",
+				sourcePath,
+				link.target,
+				targetPath,
+			)
+		}
+		return false, nil
+	}
+
+	data, info, err := readSourceFile(sourcePath, maxFileSize)
+	if err != nil {
+		return false, fmt.Errorf("read editor replacement: %w", err)
+	}
+	defer wipe(data)
+
+	if err := writeProtectedReplacement(targetPath, data, info); err != nil {
+		return false, err
+	}
+	installed, err := replaceRegularFileWithLink(
+		sourcePath,
+		targetPath,
+		info,
+		data,
+	)
+	if err != nil {
+		return installed, fmt.Errorf(
+			"restore protected link after editor replacement: %w",
+			err,
+		)
+	}
+	if err := MarkProtectedLink(targetPath); err != nil {
+		return true, fmt.Errorf("register restored protected link: %w", err)
+	}
+	return true, nil
+}
+
+func writeProtectedReplacement(targetPath string, data []byte, info os.FileInfo) error {
+	target, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("open protected target after editor replacement: %w", err)
+	}
+	if _, err := target.Write(data); err != nil {
+		_ = target.Close()
+		return fmt.Errorf("write protected target after editor replacement: %w", err)
+	}
+	if err := target.Sync(); err != nil {
+		_ = target.Close()
+		return fmt.Errorf("sync protected target after editor replacement: %w", err)
+	}
+	if err := target.Close(); err != nil {
+		return fmt.Errorf("close protected target after editor replacement: %w", err)
+	}
+	if err := os.Chmod(targetPath, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("preserve edited file mode: %w", err)
+	}
+	if err := os.Chtimes(targetPath, info.ModTime(), info.ModTime()); err != nil {
+		return fmt.Errorf("preserve edited file modification time: %w", err)
+	}
+	return nil
 }
 
 func importFile(sourcePath, targetPath string, maxFileSize int64) (result ImportResult, err error) {
@@ -125,7 +302,12 @@ func importFile(sourcePath, targetPath string, maxFileSize int64) (result Import
 	if err := os.Chtimes(targetPath, info.ModTime(), info.ModTime()); err != nil {
 		return result, fmt.Errorf("preserve modification time: %w", err)
 	}
-	linkInstalled, err = replaceRegularFileWithLink(sourcePath, targetPath, info)
+	linkInstalled, err = replaceRegularFileWithLink(
+		sourcePath,
+		targetPath,
+		info,
+		data,
+	)
 	if linkInstalled {
 		result.Imported = true
 		result.LinkCreated = true
@@ -137,6 +319,29 @@ func importFile(sourcePath, targetPath string, maxFileSize int64) (result Import
 }
 
 func readSourceFile(sourcePath string, maxFileSize int64) ([]byte, os.FileInfo, error) {
+	file, info, err := openValidatedSource(sourcePath, maxFileSize)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	data, readErr := io.ReadAll(io.LimitReader(file, maxFileSize+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		wipe(data)
+		return nil, nil, readErr
+	}
+	if closeErr != nil {
+		wipe(data)
+		return nil, nil, closeErr
+	}
+	if int64(len(data)) > maxFileSize {
+		wipe(data)
+		return nil, nil, ErrFileTooLarge
+	}
+	return data, info, nil
+}
+
+func openValidatedSource(sourcePath string, maxFileSize int64) (*os.File, os.FileInfo, error) {
 	initial, err := os.Lstat(sourcePath)
 	if err != nil {
 		return nil, nil, err
@@ -170,28 +375,14 @@ func readSourceFile(sourcePath string, maxFileSize int64) ([]byte, os.FileInfo, 
 		_ = file.Close()
 		return nil, nil, ErrFileTooLarge
 	}
-
-	data, readErr := io.ReadAll(io.LimitReader(file, maxFileSize+1))
-	closeErr := file.Close()
-	if readErr != nil {
-		wipe(data)
-		return nil, nil, readErr
-	}
-	if closeErr != nil {
-		wipe(data)
-		return nil, nil, closeErr
-	}
-	if int64(len(data)) > maxFileSize {
-		wipe(data)
-		return nil, nil, ErrFileTooLarge
-	}
-	return data, info, nil
+	return file, info, nil
 }
 
 func replaceRegularFileWithLink(
 	sourcePath string,
 	targetPath string,
 	expected os.FileInfo,
+	expectedData []byte,
 ) (installed bool, err error) {
 	current, err := os.Lstat(sourcePath)
 	if err != nil {
@@ -201,13 +392,6 @@ func replaceRegularFileWithLink(
 		return false, fmt.Errorf("%s changed while it was being encrypted", sourcePath)
 	}
 
-	current, err = os.Lstat(sourcePath)
-	if err != nil {
-		return false, fmt.Errorf("recheck source before installing link: %w", err)
-	}
-	if !sameFileVersion(expected, current) {
-		return false, fmt.Errorf("%s changed while it was being encrypted", sourcePath)
-	}
 	return exchangePathWithSymlink(
 		sourcePath,
 		targetPath,
@@ -217,6 +401,17 @@ func replaceRegularFileWithLink(
 				return fmt.Errorf("inspect displaced source file: %w", err)
 			}
 			if !sameFileVersion(expected, displaced) {
+				return fmt.Errorf("%s changed while it was being encrypted", sourcePath)
+			}
+			displacedData, _, err := readSourceFile(
+				displacedPath,
+				int64(len(expectedData))+1,
+			)
+			if err != nil {
+				return fmt.Errorf("verify displaced source contents: %w", err)
+			}
+			defer wipe(displacedData)
+			if !bytes.Equal(displacedData, expectedData) {
 				return fmt.Errorf("%s changed while it was being encrypted", sourcePath)
 			}
 			return nil

@@ -59,6 +59,23 @@ func TestEncryptWithoutMountExplainsHowToRecover(t *testing.T) {
 	}
 }
 
+func TestEncryptHelpDocumentsBatchAuthorization(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := runEncrypt([]string{"-h"}, &stdout, &stderr)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("runEncrypt(-h) error = %v, want flag.ErrHelp", err)
+	}
+	for _, expected := range []string{
+		"passfs encrypt [options] FILE...",
+		"batch requires one authorization",
+	} {
+		if !strings.Contains(stderr.String(), expected) {
+			t.Fatalf("help %q does not contain %q", stderr.String(), expected)
+		}
+	}
+}
+
 func TestConfigChangePrintsReloadCommand(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "config.json")

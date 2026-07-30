@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -183,11 +182,36 @@ func DescribePrompt(request PromptRequest) string {
 	if request.Description != "" {
 		return request.Description
 	}
-	description := fmt.Sprintf("Authorize %s access to %s", request.Operation, request.Path)
+	actor := "passfs"
 	if request.PID != 0 {
-		description += " (PID " + strconv.FormatUint(uint64(request.PID), 10) + ")"
+		actor = processDisplayName(request.PID)
 	}
-	return description
+	action := promptAction(request.Operation)
+	if request.Path == "" {
+		return actor + " wants to " + action
+	}
+	return actor + " wants to " + action + " " + request.Path
+}
+
+func promptAction(operation string) string {
+	switch strings.TrimSpace(strings.ToLower(operation)) {
+	case "create", "encrypt":
+		return "encrypt"
+	case "read":
+		return "read"
+	case "read/write":
+		return "read and modify"
+	case "truncate", "write":
+		return "modify"
+	case "edit":
+		return "edit"
+	default:
+		operation = strings.TrimSpace(operation)
+		if operation == "" {
+			return "access a protected file"
+		}
+		return operation
+	}
 }
 
 func sendAssuanCommand(stdin io.Writer, scanner *bufio.Scanner, command string) (string, error) {

@@ -42,7 +42,7 @@ type pathLockEntry struct {
 	users int
 }
 
-type editSession struct {
+type authorizationSession struct {
 	identity *age.X25519Identity
 	ownerPID uint32
 }
@@ -57,11 +57,12 @@ type Volume struct {
 	uid         uint32
 	gid         uint32
 
-	unlockMu       sync.Mutex
-	cachedIdentity *age.X25519Identity
-	authorized     map[string]time.Time
-	editSessions   map[string]map[string]editSession
-	unlockTimer    *time.Timer
+	unlockMu        sync.Mutex
+	cachedIdentity  *age.X25519Identity
+	authorized      map[string]time.Time
+	editSessions    map[string]map[string]authorizationSession
+	encryptSessions map[string]authorizationSession
+	unlockTimer     *time.Timer
 
 	metadataMu sync.RWMutex
 	metadata   Metadata
@@ -69,8 +70,15 @@ type Volume struct {
 	locksMu sync.Mutex
 	locks   map[string]*pathLockEntry
 
-	// Open handles hold a read lock. Namespace changes take the write lock so
-	// an editor cannot rename or remove a backing file while it is being used.
+	openHandlesMu sync.Mutex
+	openHandles   map[string]map[*OpenFile]uint32
+
+	linkSynchronizerMu sync.RWMutex
+	linkSynchronizer   *LinkSynchronizer
+
+	// Writable handles hold a read lock. Namespace changes take the write lock
+	// so an editor cannot rename or remove a backing file before it is flushed.
+	// Read handles use an in-memory snapshot and release the lock after open.
 	namespaceMu sync.RWMutex
 }
 
@@ -108,18 +116,20 @@ func LoadVolume(
 	}
 
 	return &Volume{
-		root:         root,
-		config:       public,
-		recipient:    recipient,
-		prompter:     prompter,
-		maxFileSize:  maxFileSize,
-		unlockFor:    unlockFor,
-		uid:          uint32(os.Getuid()),
-		gid:          uint32(os.Getgid()),
-		authorized:   make(map[string]time.Time),
-		editSessions: make(map[string]map[string]editSession),
-		metadata:     metadata,
-		locks:        make(map[string]*pathLockEntry),
+		root:            root,
+		config:          public,
+		recipient:       recipient,
+		prompter:        prompter,
+		maxFileSize:     maxFileSize,
+		unlockFor:       unlockFor,
+		uid:             uint32(os.Getuid()),
+		gid:             uint32(os.Getgid()),
+		authorized:      make(map[string]time.Time),
+		editSessions:    make(map[string]map[string]authorizationSession),
+		encryptSessions: make(map[string]authorizationSession),
+		metadata:        metadata,
+		locks:           make(map[string]*pathLockEntry),
+		openHandles:     make(map[string]map[*OpenFile]uint32),
 	}, nil
 }
 
@@ -159,8 +169,34 @@ func loadMetadata(root string) (Metadata, error) {
 	return metadata, nil
 }
 
-func (v *Volume) saveMetadataLocked() error {
-	return saveMetadata(v.root, v.metadata)
+func cloneMetadata(metadata Metadata) Metadata {
+	clone := Metadata{
+		Version: metadata.Version,
+		Files:   make(map[string]FileMeta, len(metadata.Files)),
+		Links:   make(map[string]string, len(metadata.Links)),
+	}
+	for key, value := range metadata.Files {
+		clone.Files[key] = value
+	}
+	for key, value := range metadata.Links {
+		clone.Links[key] = value
+	}
+	return clone
+}
+
+// updateMetadataLocked persists a complete replacement before publishing it
+// in memory. A failed disk write therefore cannot leak a partial mutation into
+// a later, otherwise unrelated metadata update.
+func (v *Volume) updateMetadataLocked(update func(*Metadata) error) error {
+	next := cloneMetadata(v.metadata)
+	if err := update(&next); err != nil {
+		return err
+	}
+	if err := saveMetadata(v.root, next); err != nil {
+		return err
+	}
+	v.metadata = next
+	return nil
 }
 
 func saveMetadata(root string, metadata Metadata) error {
@@ -253,16 +289,20 @@ func (v *Volume) setFileMeta(relative string, meta FileMeta) error {
 	meta.Mode &= 0o777
 	v.metadataMu.Lock()
 	defer v.metadataMu.Unlock()
-	v.metadata.Files[key] = meta
-	return v.saveMetadataLocked()
+	return v.updateMetadataLocked(func(metadata *Metadata) error {
+		metadata.Files[key] = meta
+		return nil
+	})
 }
 
 func (v *Volume) removeFileMeta(relative string) error {
 	key := metadataKey(relative)
 	v.metadataMu.Lock()
 	defer v.metadataMu.Unlock()
-	delete(v.metadata.Files, key)
-	return v.saveMetadataLocked()
+	return v.updateMetadataLocked(func(metadata *Metadata) error {
+		delete(metadata.Files, key)
+		return nil
+	})
 }
 
 type linkRecord struct {
@@ -311,47 +351,83 @@ func (v *Volume) setLinkTarget(relative, target string) error {
 	key := metadataKey(relative)
 	v.metadataMu.Lock()
 	defer v.metadataMu.Unlock()
-	if target != "" {
-		if _, protected := v.metadata.Files[key]; !protected {
-			return os.ErrNotExist
+	return v.updateMetadataLocked(func(metadata *Metadata) error {
+		if target != "" {
+			if _, protected := metadata.Files[key]; !protected {
+				return os.ErrNotExist
+			}
+			metadata.Links[key] = filepath.Clean(target)
+		} else {
+			delete(metadata.Links, key)
 		}
-		v.metadata.Links[key] = filepath.Clean(target)
-	} else {
-		delete(v.metadata.Links, key)
-	}
-	return v.saveMetadataLocked()
+		return nil
+	})
 }
 
 func (v *Volume) renameMetadata(oldRelative, newRelative string, directory bool) error {
+	return v.renameMetadataEntries(oldRelative, newRelative, directory, false)
+}
+
+func (v *Volume) renameProtectedMetadata(oldRelative, newRelative string) error {
+	return v.renameMetadataEntries(oldRelative, newRelative, false, true)
+}
+
+// renameMetadataEntries moves link ownership only when the project-side link
+// itself moved. A rename through the mounted namespace moves ciphertext but
+// leaves project-side paths in place so the synchronizer can remove the old
+// dangling link and retain any link already registered at the destination.
+func (v *Volume) renameMetadataEntries(
+	oldRelative string,
+	newRelative string,
+	directory bool,
+	moveLinks bool,
+) error {
 	oldKey := metadataKey(oldRelative)
 	newKey := metadataKey(newRelative)
 
 	v.metadataMu.Lock()
 	defer v.metadataMu.Unlock()
-	if !directory {
-		if meta, ok := v.metadata.Files[oldKey]; ok {
-			delete(v.metadata.Files, oldKey)
-			v.metadata.Files[newKey] = meta
+	return v.updateMetadataLocked(func(metadata *Metadata) error {
+		if !directory {
+			if meta, ok := metadata.Files[oldKey]; ok {
+				delete(metadata.Files, oldKey)
+				metadata.Files[newKey] = meta
+			}
+			if moveLinks {
+				linkTarget, ok := metadata.Links[oldKey]
+				if !ok {
+					return nil
+				}
+				delete(metadata.Links, oldKey)
+				metadata.Links[newKey] = linkTarget
+			}
+			return nil
 		}
-		return v.saveMetadataLocked()
-	}
 
+		renameMetadataPrefix(metadata.Files, oldKey, newKey)
+		if moveLinks {
+			renameMetadataPrefix(metadata.Links, oldKey, newKey)
+		}
+		return nil
+	})
+}
+
+func renameMetadataPrefix[T any](entries map[string]T, oldKey, newKey string) {
 	prefix := oldKey + "/"
 	keys := make([]string, 0)
-	for key := range v.metadata.Files {
+	for key := range entries {
 		if strings.HasPrefix(key, prefix) {
 			keys = append(keys, key)
 		}
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		meta := v.metadata.Files[key]
-		delete(v.metadata.Files, key)
+		value := entries[key]
+		delete(entries, key)
 		suffix := strings.TrimPrefix(key, prefix)
 		targetKey := newKey + "/" + suffix
-		v.metadata.Files[targetKey] = meta
+		entries[targetKey] = value
 	}
-	return v.saveMetadataLocked()
 }
 
 func metadataKey(relative string) string {
@@ -413,13 +489,19 @@ func (v *Volume) virtualType(relative string) (isDirectory bool, info os.FileInf
 	if err != nil {
 		return false, nil, err
 	}
-	if directoryInfo, statErr := os.Lstat(directoryPath); statErr == nil {
+	directoryInfo, directoryErr := os.Lstat(directoryPath)
+	if directoryErr == nil {
 		if directoryInfo.IsDir() {
 			return true, directoryInfo, nil
 		}
-		return false, nil, syscall.EIO
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return false, nil, statErr
+		if !directoryInfo.Mode().IsRegular() {
+			return false, nil, syscall.EIO
+		}
+		// A regular path ending in .age can be the ciphertext backing the
+		// sibling virtual file without the suffix. It must not hide an exact
+		// virtual filename such as "config.age".
+	} else if !errors.Is(directoryErr, os.ErrNotExist) {
+		return false, nil, directoryErr
 	}
 
 	encryptedPath, err := v.encryptedPath(relative)
@@ -438,15 +520,7 @@ func (v *Volume) virtualType(relative string) (isDirectory bool, info os.FileInf
 
 func (v *Volume) acquirePathLock(relative string, writable bool) func() {
 	key := metadataKey(relative)
-	v.locksMu.Lock()
-	entry := v.locks[key]
-	if entry == nil {
-		entry = &pathLockEntry{}
-		v.locks[key] = entry
-	}
-	entry.users++
-	v.locksMu.Unlock()
-
+	entry := v.registerPathLockUser(key)
 	if writable {
 		entry.mutex.Lock()
 	} else {
@@ -458,13 +532,54 @@ func (v *Volume) acquirePathLock(relative string, writable bool) func() {
 		} else {
 			entry.mutex.RUnlock()
 		}
-		v.locksMu.Lock()
-		entry.users--
-		if entry.users == 0 && v.locks[key] == entry {
-			delete(v.locks, key)
-		}
-		v.locksMu.Unlock()
+		v.unregisterPathLockUser(key, entry)
 	}
+}
+
+func (v *Volume) tryPathLock(
+	relative string,
+	writable bool,
+) (unlock func(), acquired bool) {
+	key := metadataKey(relative)
+	entry := v.registerPathLockUser(key)
+	if writable {
+		acquired = entry.mutex.TryLock()
+	} else {
+		acquired = entry.mutex.TryRLock()
+	}
+	if !acquired {
+		v.unregisterPathLockUser(key, entry)
+		return nil, false
+	}
+	return func() {
+		if writable {
+			entry.mutex.Unlock()
+		} else {
+			entry.mutex.RUnlock()
+		}
+		v.unregisterPathLockUser(key, entry)
+	}, true
+}
+
+func (v *Volume) registerPathLockUser(key string) *pathLockEntry {
+	v.locksMu.Lock()
+	entry := v.locks[key]
+	if entry == nil {
+		entry = &pathLockEntry{}
+		v.locks[key] = entry
+	}
+	entry.users++
+	v.locksMu.Unlock()
+	return entry
+}
+
+func (v *Volume) unregisterPathLockUser(key string, entry *pathLockEntry) {
+	v.locksMu.Lock()
+	entry.users--
+	if entry.users == 0 && v.locks[key] == entry {
+		delete(v.locks, key)
+	}
+	v.locksMu.Unlock()
 }
 
 func (v *Volume) acquireOpenLock(relative string, writable bool) func() {
@@ -483,14 +598,77 @@ func (v *Volume) tryNamespaceLock() (func(), bool) {
 	return v.namespaceMu.Unlock, true
 }
 
+func (v *Volume) registerOpenHandle(handle *OpenFile, ownerPID uint32) {
+	key := metadataKey(handle.relative)
+	v.openHandlesMu.Lock()
+	handles := v.openHandles[key]
+	if handles == nil {
+		handles = make(map[*OpenFile]uint32)
+		v.openHandles[key] = handles
+	}
+	handles[handle] = ownerPID
+	v.openHandlesMu.Unlock()
+}
+
+func (v *Volume) unregisterOpenHandle(handle *OpenFile) {
+	key := metadataKey(handle.relative)
+	v.openHandlesMu.Lock()
+	handles := v.openHandles[key]
+	delete(handles, handle)
+	if len(handles) == 0 {
+		delete(v.openHandles, key)
+	}
+	v.openHandlesMu.Unlock()
+}
+
+func (v *Volume) writableOpenHandle(
+	relative string,
+	ownerPID uint32,
+) *OpenFile {
+	key := metadataKey(relative)
+	type candidate struct {
+		handle *OpenFile
+		pid    uint32
+	}
+	v.openHandlesMu.Lock()
+	candidates := make([]candidate, 0, len(v.openHandles[key]))
+	for handle, pid := range v.openHandles[key] {
+		if handle.writable {
+			candidates = append(candidates, candidate{handle: handle, pid: pid})
+		}
+	}
+	v.openHandlesMu.Unlock()
+
+	if ownerPID == 0 {
+		if len(candidates) == 1 {
+			return candidates[0].handle
+		}
+		return nil
+	}
+	for _, candidate := range candidates {
+		pid := candidate.pid
+		if pid == ownerPID ||
+			processIsOrDescendsFrom(ownerPID, pid) ||
+			processIsOrDescendsFrom(pid, ownerPID) {
+			return candidate.handle
+		}
+	}
+	return nil
+}
+
 func (v *Volume) unlockIdentity(
 	ctx context.Context,
 	relative string,
 	operation string,
 ) (*age.X25519Identity, error) {
 	cacheKey := metadataKey(relative)
+	ownerPID := callerPID(ctx)
 	v.unlockMu.Lock()
-	if identity := v.activeEditIdentityLocked(cacheKey); identity != nil {
+	if identity := v.activeEncryptIdentityLocked(ownerPID); identity != nil {
+		v.unlockMu.Unlock()
+		return identity, nil
+	}
+	if identity := v.activeEditIdentityLocked(cacheKey, ownerPID); identity != nil {
 		v.unlockMu.Unlock()
 		return identity, nil
 	}
@@ -508,17 +686,13 @@ func (v *Volume) unlockIdentity(
 		v.unlockMu.Unlock()
 	}
 
-	var pid uint32
-	if caller, ok := fuse.FromContext(ctx); ok {
-		pid = caller.Pid
-	}
 	displayPath := filepath.ToSlash(filepath.Clean(relative))
 	displayPath = strings.TrimPrefix(displayPath, "files/")
 	displayPath = "/" + strings.TrimPrefix(displayPath, "/")
 	request := PromptRequest{
 		Path:      displayPath,
 		Operation: operation,
-		PID:       pid,
+		PID:       ownerPID,
 	}
 	identity, err := v.requestIdentity(ctx, request)
 	if err != nil {
@@ -560,6 +734,9 @@ func (v *Volume) requestIdentity(
 			return nil, fmt.Errorf("parse volume identity: %w", err)
 		}
 	}
+	if identity == nil {
+		return nil, errors.New("prompter returned no volume identity")
+	}
 	if identity.Recipient().String() != v.config.Recipient {
 		return nil, errors.New("unlocked identity does not match the volume recipient")
 	}
@@ -572,7 +749,7 @@ func (v *Volume) beginEditSession(
 	token string,
 	ownerPID uint32,
 ) error {
-	if err := validateEditSessionToken(token); err != nil {
+	if err := validateSessionToken(token); err != nil {
 		return err
 	}
 	if ownerPID == 0 {
@@ -587,10 +764,10 @@ func (v *Volume) beginEditSession(
 	v.unlockMu.Lock()
 	sessions := v.editSessions[cacheKey]
 	if sessions == nil {
-		sessions = make(map[string]editSession)
+		sessions = make(map[string]authorizationSession)
 		v.editSessions[cacheKey] = sessions
 	}
-	sessions[token] = editSession{identity: identity, ownerPID: ownerPID}
+	sessions[token] = authorizationSession{identity: identity, ownerPID: ownerPID}
 	v.unlockMu.Unlock()
 
 	go v.monitorEditSession(cacheKey, token, ownerPID)
@@ -598,7 +775,7 @@ func (v *Volume) beginEditSession(
 }
 
 func (v *Volume) endEditSession(relative, token string, ownerPID uint32) error {
-	if err := validateEditSessionToken(token); err != nil {
+	if err := validateSessionToken(token); err != nil {
 		return err
 	}
 	cacheKey := metadataKey(relative)
@@ -619,13 +796,86 @@ func (v *Volume) endEditSession(relative, token string, ownerPID uint32) error {
 	return nil
 }
 
-func (v *Volume) activeEditIdentityLocked(cacheKey string) *age.X25519Identity {
-	sessions := v.editSessions[cacheKey]
-	for token, session := range sessions {
-		if processAlive(session.ownerPID) {
+func (v *Volume) beginEncryptSession(
+	ctx context.Context,
+	token string,
+	ownerPID uint32,
+) error {
+	if err := validateSessionToken(token); err != nil {
+		return err
+	}
+	if ownerPID == 0 {
+		return errors.New("encrypt session caller is unavailable")
+	}
+	identity, err := v.requestIdentity(ctx, PromptRequest{
+		Path:      "multiple files",
+		Operation: "encrypt",
+		PID:       ownerPID,
+	})
+	if err != nil {
+		return err
+	}
+
+	v.unlockMu.Lock()
+	v.encryptSessions[token] = authorizationSession{
+		identity: identity,
+		ownerPID: ownerPID,
+	}
+	v.unlockMu.Unlock()
+
+	go v.monitorEncryptSession(token, ownerPID)
+	return nil
+}
+
+func (v *Volume) endEncryptSession(token string, ownerPID uint32) error {
+	if err := validateSessionToken(token); err != nil {
+		return err
+	}
+	v.unlockMu.Lock()
+	defer v.unlockMu.Unlock()
+	session, exists := v.encryptSessions[token]
+	if !exists {
+		return nil
+	}
+	if ownerPID == 0 || session.ownerPID != ownerPID {
+		return syscall.EPERM
+	}
+	delete(v.encryptSessions, token)
+	return nil
+}
+
+func (v *Volume) activeEncryptIdentityLocked(
+	ownerPID uint32,
+) *age.X25519Identity {
+	if ownerPID == 0 {
+		return nil
+	}
+	for token, session := range v.encryptSessions {
+		if !processAlive(session.ownerPID) {
+			delete(v.encryptSessions, token)
+			continue
+		}
+		if session.ownerPID == ownerPID {
 			return session.identity
 		}
-		delete(sessions, token)
+	}
+	return nil
+}
+
+func (v *Volume) activeEditIdentityLocked(
+	cacheKey string,
+	callerPID uint32,
+) *age.X25519Identity {
+	sessions := v.editSessions[cacheKey]
+	for token, session := range sessions {
+		if !processAlive(session.ownerPID) {
+			delete(sessions, token)
+			continue
+		}
+		if callerPID == 0 ||
+			processIsOrDescendsFrom(callerPID, session.ownerPID) {
+			return session.identity
+		}
 	}
 	if len(sessions) == 0 {
 		delete(v.editSessions, cacheKey)
@@ -656,6 +906,32 @@ func (v *Volume) monitorEditSession(cacheKey, token string, ownerPID uint32) {
 	}
 }
 
+func (v *Volume) monitorEncryptSession(token string, ownerPID uint32) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		v.unlockMu.Lock()
+		session, exists := v.encryptSessions[token]
+		if !exists || session.ownerPID != ownerPID {
+			v.unlockMu.Unlock()
+			return
+		}
+		if !processAlive(ownerPID) {
+			delete(v.encryptSessions, token)
+			v.unlockMu.Unlock()
+			return
+		}
+		v.unlockMu.Unlock()
+	}
+}
+
+func callerPID(ctx context.Context) uint32 {
+	if caller, ok := fuse.FromContext(ctx); ok {
+		return platformProcessID(caller.Pid)
+	}
+	return 0
+}
+
 func processAlive(pid uint32) bool {
 	if pid == 0 {
 		return false
@@ -673,6 +949,7 @@ func (v *Volume) Lock() {
 	v.cachedIdentity = nil
 	clear(v.authorized)
 	clear(v.editSessions)
+	clear(v.encryptSessions)
 	v.unlockMu.Unlock()
 }
 
@@ -817,18 +1094,58 @@ func (v *Volume) persistFile(relative string, data []byte, meta FileMeta) error 
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return err
-	}
-	if err := syncDirectory(parent); err != nil {
-		return err
-	}
-
 	meta.Size = uint64(len(data))
 	if meta.MTime == 0 {
 		meta.MTime = time.Now().UnixNano()
 	}
-	return v.setFileMeta(relative, meta)
+
+	previousExists := false
+	if info, statErr := os.Lstat(path); statErr == nil {
+		if !info.Mode().IsRegular() {
+			return syscall.EIO
+		}
+		previousExists = true
+		if err := exchangePaths(tempPath, path); err != nil {
+			return err
+		}
+	} else if errors.Is(statErr, os.ErrNotExist) {
+		if err := renameNoReplace(tempPath, path); err != nil {
+			return err
+		}
+	} else {
+		return statErr
+	}
+	if err := syncDirectory(parent); err != nil {
+		rollbackErr := rollbackPersistedFile(path, tempPath, previousExists)
+		return errors.Join(err, rollbackErr)
+	}
+
+	if err := v.setFileMeta(relative, meta); err != nil {
+		rollbackErr := rollbackPersistedFile(path, tempPath, previousExists)
+		return errors.Join(err, rollbackErr)
+	}
+	if previousExists {
+		if err := os.Remove(tempPath); err != nil {
+			return fmt.Errorf("remove previous encrypted file: %w", err)
+		}
+	}
+	return syncDirectory(parent)
+}
+
+func rollbackPersistedFile(path, temporaryPath string, previousExists bool) error {
+	var err error
+	if previousExists {
+		err = exchangePaths(temporaryPath, path)
+	} else {
+		err = os.Remove(path)
+	}
+	if err != nil {
+		return fmt.Errorf("rollback encrypted file: %w", err)
+	}
+	if syncErr := syncDirectory(filepath.Dir(path)); syncErr != nil {
+		return fmt.Errorf("sync encrypted file rollback: %w", syncErr)
+	}
+	return nil
 }
 
 func (v *Volume) removeProtectedFile(relative string) error {
@@ -837,7 +1154,195 @@ func (v *Volume) removeProtectedFile(relative string) error {
 		return syscall.EBUSY
 	}
 	defer unlock()
+	unlockPath, ok := v.tryPathLock(relative, true)
+	if !ok {
+		return syscall.EBUSY
+	}
+	defer unlockPath()
 	return v.removeProtectedFileLocked(relative)
+}
+
+func (v *Volume) renameProtectedFile(oldRelative, newRelative string) error {
+	if err := validateRelativePath(oldRelative); err != nil {
+		return err
+	}
+	if err := validateRelativePath(newRelative); err != nil {
+		return err
+	}
+	unlock, ok := v.tryNamespaceLock()
+	if !ok {
+		return syscall.EBUSY
+	}
+	defer unlock()
+	unlockPaths, ok := v.tryPathLocks(oldRelative, newRelative)
+	if !ok {
+		return syscall.EBUSY
+	}
+	defer unlockPaths()
+
+	oldPath, err := v.encryptedPath(oldRelative)
+	if err != nil {
+		return err
+	}
+	newPath, err := v.encryptedPath(newRelative)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
+		return err
+	}
+	if err := renameNoReplace(oldPath, newPath); err != nil {
+		return err
+	}
+	if err := v.renameProtectedMetadata(oldRelative, newRelative); err != nil {
+		rollbackErr := renameNoReplace(newPath, oldPath)
+		return errors.Join(err, rollbackErr)
+	}
+	oldParent := filepath.Dir(oldPath)
+	newParent := filepath.Dir(newPath)
+	var newSyncErr error
+	if newParent != oldParent {
+		newSyncErr = syncDirectory(newParent)
+	}
+	return errors.Join(
+		syncDirectory(oldParent),
+		newSyncErr,
+		pruneEmptyDirectories(oldParent, filepath.Join(v.root, "files")),
+	)
+}
+
+func (v *Volume) cycleProtectedFiles(
+	cycle []string,
+) (committed bool, resultErr error) {
+	if len(cycle) < 2 {
+		return false, errors.New("protected file cycle requires at least two paths")
+	}
+	unlockNamespace, ok := v.tryNamespaceLock()
+	if !ok {
+		return false, syscall.EBUSY
+	}
+	defer unlockNamespace()
+	unlockPaths, ok := v.tryPathLocks(cycle...)
+	if !ok {
+		return false, syscall.EBUSY
+	}
+	defer unlockPaths()
+
+	paths := make([]string, len(cycle))
+	for index, relative := range cycle {
+		if err := validateRelativePath(relative); err != nil {
+			return false, err
+		}
+		path, err := v.encryptedPath(relative)
+		if err != nil {
+			return false, err
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return false, err
+		}
+		if !info.Mode().IsRegular() {
+			return false, syscall.EIO
+		}
+		paths[index] = path
+	}
+
+	exchanged := 0
+	for index := 1; index < len(paths); index++ {
+		if err := exchangePaths(paths[0], paths[index]); err != nil {
+			rollbackErr := rollbackProtectedFileCycle(paths, exchanged)
+			return false, errors.Join(err, rollbackErr)
+		}
+		exchanged = index
+	}
+
+	v.metadataMu.Lock()
+	metadataErr := v.updateMetadataLocked(func(metadata *Metadata) error {
+		return permuteProtectedMetadata(metadata, cycle)
+	})
+	v.metadataMu.Unlock()
+	if metadataErr != nil {
+		rollbackErr := rollbackProtectedFileCycle(paths, exchanged)
+		return false, errors.Join(metadataErr, rollbackErr)
+	}
+	committed = true
+
+	directories := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		directories[filepath.Dir(path)] = struct{}{}
+	}
+	for directory := range directories {
+		resultErr = errors.Join(resultErr, syncDirectory(directory))
+	}
+	return committed, resultErr
+}
+
+func rollbackProtectedFileCycle(paths []string, exchanged int) error {
+	var resultErr error
+	for index := exchanged; index >= 1; index-- {
+		resultErr = errors.Join(
+			resultErr,
+			exchangePaths(paths[0], paths[index]),
+		)
+	}
+	return resultErr
+}
+
+func permuteProtectedMetadata(metadata *Metadata, cycle []string) error {
+	files := make(map[string]FileMeta, len(cycle))
+	links := make(map[string]string, len(cycle))
+	for _, relative := range cycle {
+		key := metadataKey(relative)
+		meta, exists := metadata.Files[key]
+		if !exists {
+			return os.ErrNotExist
+		}
+		files[key] = meta
+		if target, exists := metadata.Links[key]; exists {
+			links[key] = target
+		}
+		delete(metadata.Files, key)
+		delete(metadata.Links, key)
+	}
+	for index, relative := range cycle {
+		oldKey := metadataKey(relative)
+		newKey := metadataKey(cycle[(index+1)%len(cycle)])
+		metadata.Files[newKey] = files[oldKey]
+		if target, exists := links[oldKey]; exists {
+			metadata.Links[newKey] = target
+		}
+	}
+	return nil
+}
+
+func (v *Volume) tryPathLocks(relatives ...string) (func(), bool) {
+	byKey := make(map[string]string, len(relatives))
+	keys := make([]string, 0, len(relatives))
+	for _, relative := range relatives {
+		key := metadataKey(relative)
+		if _, exists := byKey[key]; exists {
+			continue
+		}
+		byKey[key] = relative
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	unlocks := make([]func(), 0, len(keys))
+	for _, key := range keys {
+		unlock, ok := v.tryPathLock(byKey[key], true)
+		if !ok {
+			for index := len(unlocks) - 1; index >= 0; index-- {
+				unlocks[index]()
+			}
+			return nil, false
+		}
+		unlocks = append(unlocks, unlock)
+	}
+	return func() {
+		for index := len(unlocks) - 1; index >= 0; index-- {
+			unlocks[index]()
+		}
+	}, true
 }
 
 func (v *Volume) removeProtectedFileLocked(relative string) error {
@@ -845,10 +1350,55 @@ func (v *Volume) removeProtectedFileLocked(relative string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil {
+	parent := filepath.Dir(path)
+	info, err := os.Lstat(path)
+	if err != nil {
 		return err
 	}
-	return v.removeFileMeta(relative)
+	if !info.Mode().IsRegular() {
+		return syscall.EIO
+	}
+	meta := v.fileMeta(relative, info)
+	temporary, err := os.CreateTemp(parent, temporaryPrefix+"removed-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
+		return err
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		return err
+	}
+	if err := renameNoReplace(path, temporaryPath); err != nil {
+		return err
+	}
+	if err := syncDirectory(parent); err != nil {
+		return errors.Join(err, restoreRemovedFile(temporaryPath, path))
+	}
+	if err := v.removeFileMeta(relative); err != nil {
+		return errors.Join(err, restoreRemovedFile(temporaryPath, path))
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		metadataErr := v.setFileMeta(relative, meta)
+		restoreErr := restoreRemovedFile(temporaryPath, path)
+		return errors.Join(err, metadataErr, restoreErr)
+	}
+	return errors.Join(
+		syncDirectory(parent),
+		pruneEmptyDirectories(parent, filepath.Join(v.root, "files")),
+	)
+}
+
+func restoreRemovedFile(temporaryPath, path string) error {
+	if err := renameNoReplace(temporaryPath, path); err != nil {
+		return fmt.Errorf("restore encrypted file after failed removal: %w", err)
+	}
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync restored encrypted file: %w", err)
+	}
+	return nil
 }
 
 func errnoFromError(err error) syscall.Errno {

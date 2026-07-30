@@ -153,6 +153,8 @@ EXPECTED="$(
 		"${TEMPORARY_DIRECTORY}/SHA256SUMS"
 )"
 [[ -n "${EXPECTED}" ]] || fail "checksum not found for ${ASSET}."
+[[ "${EXPECTED}" =~ ^[[:xdigit:]]{64}$ ]] ||
+	fail "invalid SHA-256 checksum for ${ASSET}."
 
 if command -v sha256sum >/dev/null 2>&1; then
 	ACTUAL="$(
@@ -180,6 +182,9 @@ mkdir -p "${INSTALL_DIRECTORY}"
 STAGED_BINARY="${INSTALL_DIRECTORY}/.passfs-install-$$"
 gzip -dc "${TEMPORARY_DIRECTORY}/${ASSET}" > "${STAGED_BINARY}"
 chmod 0755 "${STAGED_BINARY}"
+REPORTED_VERSION="$("${STAGED_BINARY}" version 2>/dev/null || true)"
+[[ "${REPORTED_VERSION}" == "passfs ${VERSION}" ]] ||
+	fail "downloaded executable reported an unexpected version."
 mv "${STAGED_BINARY}" "${INSTALL_DIRECTORY}/passfs"
 STAGED_BINARY=""
 

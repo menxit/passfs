@@ -5,6 +5,7 @@ package passfs
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -71,22 +73,37 @@ func mountInfoPathMatches(encodedPath, target string) (bool, error) {
 
 func UnmountPath(mountPoint string) error {
 	var unmountErrors []error
+	var helper string
 	for _, name := range []string{"fusermount3", "fusermount"} {
-		helper, err := exec.LookPath(name)
-		if err != nil {
-			continue
+		if path, err := exec.LookPath(name); err == nil {
+			helper = path
+			break
 		}
+	}
+	if helper != "" {
 		for _, arguments := range [][]string{
 			{"-u", mountPoint},
 			{"-u", "-z", mountPoint},
 		} {
-			output, err := exec.Command(helper, arguments...).CombinedOutput()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			output, err := exec.CommandContext(ctx, helper, arguments...).CombinedOutput()
+			contextErr := ctx.Err()
+			cancel()
 			if err == nil {
 				return nil
 			}
+			if contextErr != nil {
+				err = errors.Join(err, contextErr)
+			}
 			unmountErrors = append(
 				unmountErrors,
-				fmt.Errorf("%s %v: %w: %s", name, arguments, err, bytes.TrimSpace(output)),
+				fmt.Errorf(
+					"%s %v: %w: %s",
+					filepath.Base(helper),
+					arguments,
+					err,
+					bytes.TrimSpace(output),
+				),
 			)
 		}
 	}

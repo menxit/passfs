@@ -2,22 +2,22 @@ package passfs
 
 import "testing"
 
-func TestParseEditSessionCommand(t *testing.T) {
-	const token = "0123456789abcdef0123456789abcdef"
+func TestParseSessionCommand(t *testing.T) {
+	const sessionID = "0123456789abcdef0123456789abcdef"
 	for _, test := range []struct {
 		value     string
 		operation string
 	}{
-		{value: editSessionBegin + token, operation: "begin"},
-		{value: editSessionEnd + token, operation: "end"},
+		{value: sessionBegin + sessionID, operation: "begin"},
+		{value: sessionEnd + sessionID, operation: "end"},
 	} {
-		operation, parsedToken, err := parseEditSessionCommand([]byte(test.value))
+		operation, parsedToken, err := parseSessionCommand([]byte(test.value))
 		if err != nil {
-			t.Fatalf("parseEditSessionCommand(%q): %v", test.value, err)
+			t.Fatalf("parseSessionCommand(%q): %v", test.value, err)
 		}
-		if operation != test.operation || parsedToken != token {
+		if operation != test.operation || parsedToken != sessionID {
 			t.Fatalf(
-				"parseEditSessionCommand(%q) = %q, %q",
+				"parseSessionCommand(%q) = %q, %q",
 				test.value,
 				operation,
 				parsedToken,
@@ -26,7 +26,7 @@ func TestParseEditSessionCommand(t *testing.T) {
 	}
 }
 
-func TestParseEditSessionCommandRejectsInvalidValues(t *testing.T) {
+func TestParseSessionCommandRejectsInvalidValues(t *testing.T) {
 	for _, value := range []string{
 		"",
 		"begin:",
@@ -34,8 +34,8 @@ func TestParseEditSessionCommandRejectsInvalidValues(t *testing.T) {
 		"begin:not-hexadecimal-token-value!!",
 		"end:0123456789abcdef",
 	} {
-		if _, _, err := parseEditSessionCommand([]byte(value)); err == nil {
-			t.Fatalf("parseEditSessionCommand(%q) succeeded", value)
+		if _, _, err := parseSessionCommand([]byte(value)); err == nil {
+			t.Fatalf("parseSessionCommand(%q) succeeded", value)
 		}
 	}
 }

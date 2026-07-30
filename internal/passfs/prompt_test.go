@@ -2,6 +2,7 @@ package passfs
 
 import (
 	"bufio"
+	"os"
 	"strings"
 	"testing"
 )
@@ -23,15 +24,53 @@ func TestAssuanEscape(t *testing.T) {
 	}
 }
 
-func TestPromptDescriptionIncludesPID(t *testing.T) {
+func TestPromptDescriptionNamesRequestingSoftware(t *testing.T) {
+	pid := uint32(os.Getpid())
 	got := DescribePrompt(PromptRequest{
 		Path:      "/project/.env",
 		Operation: "read",
-		PID:       1234,
+		PID:       pid,
 	})
-	for _, expected := range []string{"read", "/project/.env", "1234"} {
-		if !strings.Contains(got, expected) {
-			t.Fatalf("prompt %q does not include %q", got, expected)
+	want := processDisplayName(pid) + " wants to read /project/.env"
+	if got != want {
+		t.Fatalf("DescribePrompt = %q, want %q", got, want)
+	}
+}
+
+func TestPromptDescriptionUsesConciseOperationNames(t *testing.T) {
+	tests := []struct {
+		operation string
+		want      string
+	}{
+		{operation: "create", want: "passfs wants to encrypt /project/.env"},
+		{operation: "read/write", want: "passfs wants to read and modify /project/.env"},
+		{operation: "truncate", want: "passfs wants to modify /project/.env"},
+	}
+	for _, test := range tests {
+		got := DescribePrompt(PromptRequest{
+			Path:      "/project/.env",
+			Operation: test.operation,
+		})
+		if got != test.want {
+			t.Errorf("DescribePrompt(%q) = %q, want %q", test.operation, got, test.want)
 		}
+	}
+}
+
+func TestPromptExplicitDescriptionIsPreserved(t *testing.T) {
+	const description = "Choose the passphrase for the new passfs volume"
+	if got := DescribePrompt(PromptRequest{Description: description}); got != description {
+		t.Fatalf("DescribePrompt = %q, want %q", got, description)
+	}
+}
+
+func TestSanitizeProcessName(t *testing.T) {
+	if got, want := sanitizeProcessName("/usr/bin/no\x1b[31mde\n"), "no[31mde"; got != want {
+		t.Fatalf("sanitizeProcessName = %q, want %q", got, want)
+	}
+	if got, want := sanitizeProcessName(
+		"/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+	), "Visual Studio Code"; got != want {
+		t.Fatalf("sanitizeProcessName app = %q, want %q", got, want)
 	}
 }

@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+func synchronizeLinksOnce(volume *Volume, mountPoint string) map[string]error {
+	return synchronizeLinksOnceTracked(volume, mountPoint, nil)
+}
+
 func testStoragePath(t *testing.T, absolutePath string) string {
 	t.Helper()
 	if !filepath.IsAbs(absolutePath) {
@@ -94,7 +98,7 @@ func TestDeletingProtectedLinkDeletesEncryptedFile(t *testing.T) {
 	}
 }
 
-func TestDeletingLinkWhileStoppedIsAppliedAfterReload(t *testing.T) {
+func TestMissingLinkAtReloadPreservesCiphertext(t *testing.T) {
 	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
 	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
 	if err := os.Remove(sourcePath); err != nil {
@@ -110,13 +114,22 @@ func TestDeletingLinkWhileStoppedIsAppliedAfterReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadVolume: %v", err)
 	}
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(reloaded, mountPoint))
+	synchronizer, err := NewLinkSynchronizer(reloaded, mountPoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synchronizer.Synchronize()
+	defer synchronizer.Close()
 	cipherPath, err := reloaded.encryptedPath(storagePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(cipherPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("reloaded volume did not apply the deleted link: %v", err)
+	if _, err := os.Stat(cipherPath); err != nil {
+		t.Fatalf("reloaded volume did not preserve the ciphertext: %v", err)
+	}
+	records := reloaded.linkRecords()
+	if len(records) != 1 || !records[0].protected {
+		t.Fatalf("preserved link records = %#v", records)
 	}
 }
 
@@ -153,7 +166,7 @@ func TestReloadRecoversCiphertextMissingFromMetadata(t *testing.T) {
 	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
 	volume.metadataMu.Lock()
 	delete(volume.metadata.Files, metadataKey(storagePath))
-	if err := volume.saveMetadataLocked(); err != nil {
+	if err := saveMetadata(volume.root, volume.metadata); err != nil {
 		volume.metadataMu.Unlock()
 		t.Fatal(err)
 	}
@@ -248,9 +261,14 @@ func TestBackgroundLinkSynchronizerAppliesDeletion(t *testing.T) {
 	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
+	synchronizer, err := NewLinkSynchronizer(volume, mountPoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synchronizer.Synchronize()
 	go func() {
 		defer close(done)
-		RunLinkSynchronizer(ctx, volume, mountPoint, nil)
+		synchronizer.Run(ctx)
 	}()
 	t.Cleanup(func() {
 		cancel()

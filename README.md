@@ -125,6 +125,33 @@ works with any regular file, not only `.env` files:
 passfs encrypt file.md config/settings.json
 ```
 
+When several files are passed, passfs requests authorization once and keeps
+the age identity in memory only for that command. The authorization is scoped
+to the `passfs` process and is discarded when the command ends.
+
+### Find and protect repository secrets with a coding agent
+
+Run this prompt from the repository you want to inspect:
+
+```text
+Audit the current repository for unencrypted local files that are likely to
+contain secrets, then protect them with passfs.
+
+Do not read, print, copy, or transmit file contents or secret values. Find
+candidates using filenames, file type, .gitignore rules, and Git metadata.
+Consider .env and .env.* files, credentials, secrets, private keys, and local
+configuration files. Exclude examples, samples, templates, tests, dependencies,
+build output, .git, symbolic links, and files already protected by passfs. Do
+not modify tracked files; report tracked candidates separately because their
+contents may already exist in Git history.
+
+First run passfs doctor. If passfs is ready and there are untracked or ignored
+regular-file candidates, invoke passfs encrypt exactly once with every
+candidate as a separate argument, using -- before the paths. Verify only that
+each original path is now a symbolic link. Report paths and results only,
+never file contents. If there are no candidates, make no changes.
+```
+
 Linux desktops show a password window. On a server or SSH terminal, passfs
 uses a full-screen terminal prompt associated with the process opening the
 file. Test the selected prompt without opening a protected file:
@@ -138,10 +165,15 @@ encrypted the file but removed its original pathname, the command recreates the
 missing link without re-encrypting the data.
 
 Deleting the symbolic link deletes its encrypted file shortly afterward. If the
-service is stopped, the deletion is applied at the next mount. Deleting a
-directory containing protected links has the same effect. Moving a protected
-link is treated as deleting its old pathname; moving protected links is not
-currently supported.
+service observes the deletion, deleting a directory containing protected links
+has the same effect. Renaming a protected link, moving it to another directory,
+or renaming one of its parent directories is tracked automatically while
+passfs is running, as long as the move stays on the same filesystem.
+
+If a registered link is already missing when passfs starts, its ciphertext is
+preserved because an offline move and deletion cannot be distinguished safely.
+For an offline move, move the link back to its original pathname, start passfs,
+then repeat the move while the service is running.
 
 Do not replace a protected link with a regular file. Some editors implement
 atomic saves by replacing the pathname and can therefore bypass the link.

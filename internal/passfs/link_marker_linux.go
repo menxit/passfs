@@ -3,6 +3,7 @@
 package passfs
 
 const (
-	linkMarkerName        = "user.passfs.link-target"
-	editSessionMarkerName = "user.passfs.edit-session"
+	linkMarkerName           = "user.passfs.link-target"
+	editSessionMarkerName    = "user.passfs.edit-session"
+	encryptSessionMarkerName = "user.passfs.encrypt-session"
 )
