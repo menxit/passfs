@@ -51,6 +51,7 @@ func TestSettingsRoundTripHasNoProjects(t *testing.T) {
 		t.Fatalf("NewSettings: %v", err)
 	}
 	settings.TouchID = true
+	settings.Adapter = "fskit"
 	if err := settings.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -75,6 +76,9 @@ func TestSettingsRoundTripHasNoProjects(t *testing.T) {
 	}
 	if !loaded.TouchID {
 		t.Fatal("Touch ID setting was not preserved")
+	}
+	if loaded.Adapter != "fskit" {
+		t.Fatalf("adapter = %q, want fskit", loaded.Adapter)
 	}
 	if duration, err := loaded.UnlockDuration(); err != nil || duration != 5*time.Minute {
 		t.Fatalf("unlock duration = %s, %v", duration, err)

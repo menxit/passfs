@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"filippo.io/age"
-	"github.com/hanwen/go-fuse/v2/fuse"
+	"passfs/internal/fsapi"
 )
 
 type recordingPrompter struct {
@@ -231,13 +231,13 @@ func createTestFileWithContext(
 	}
 	if written, errno := handle.Write(ctx, plaintext, 0); errno != 0 {
 		t.Fatalf("Write: %v", errno)
-	} else if written != uint32(len(plaintext)) {
+	} else if written != len(plaintext) {
 		t.Fatalf("Write = %d, want %d", written, len(plaintext))
 	}
 	if errno := handle.Flush(ctx); errno != 0 {
 		t.Fatalf("Flush: %v", errno)
 	}
-	if errno := handle.Release(ctx); errno != 0 {
+	if errno := handle.Close(ctx); errno != 0 {
 		t.Fatalf("Release: %v", errno)
 	}
 }
@@ -245,16 +245,11 @@ func createTestFileWithContext(
 func readOpenFile(t *testing.T, handle *OpenFile) []byte {
 	t.Helper()
 	buffer := make([]byte, 4096)
-	result, errno := handle.Read(context.Background(), buffer, 0)
+	count, errno := handle.Read(context.Background(), buffer, 0)
 	if errno != 0 {
 		t.Fatalf("Read: %v", errno)
 	}
-	data, status := result.Bytes(buffer)
-	if status != fuse.OK {
-		t.Fatalf("ReadResult.Bytes: %v", status)
-	}
-	result.Done()
-	return append([]byte(nil), data...)
+	return append([]byte(nil), buffer[:count]...)
 }
 
 func TestEncryptedFileRoundTripPromptsOnEveryOpen(t *testing.T) {
@@ -288,7 +283,7 @@ func TestEncryptedFileRoundTripPromptsOnEveryOpen(t *testing.T) {
 		if got := readOpenFile(t, handle); !bytes.Equal(got, plaintext) {
 			t.Fatalf("read %q, want %q", got, plaintext)
 		}
-		if errno := handle.Release(context.Background()); errno != 0 {
+		if errno := handle.Close(context.Background()); errno != 0 {
 			t.Fatalf("Release: %v", errno)
 		}
 	}
@@ -316,7 +311,7 @@ func TestWrongPassphraseCannotOpenFile(t *testing.T) {
 	}
 	handle, err := lockedVolume.openFile(context.Background(), "secret.env", syscall.O_RDONLY)
 	if handle != nil {
-		_ = handle.Release(context.Background())
+		_ = handle.Close(context.Background())
 		t.Fatal("openFile returned a handle with the wrong passphrase")
 	}
 	if !errors.Is(err, ErrAuthentication) {
@@ -370,7 +365,7 @@ func TestIdentityPrompterUnlocksWithoutRequestingPassphrase(t *testing.T) {
 		if got := readOpenFile(t, handle); !bytes.Equal(got, plaintext) {
 			t.Fatalf("plaintext = %q, want %q", got, plaintext)
 		}
-		_ = handle.Release(context.Background())
+		_ = handle.Close(context.Background())
 	}
 	identityPrompts, passwordPrompts := prompter.counts()
 	if identityPrompts != 2 || passwordPrompts != 0 {
@@ -398,7 +393,7 @@ func TestUnlockWindowReusesIdentityOnlyInMemory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("openFile %d: %v", openNumber+1, err)
 		}
-		_ = handle.Release(context.Background())
+		_ = handle.Close(context.Background())
 	}
 	if got := prompter.requestCount(); got != 1 {
 		t.Fatalf("prompts within unlock window = %d, want 1", got)
@@ -407,7 +402,7 @@ func TestUnlockWindowReusesIdentityOnlyInMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open other file: %v", err)
 	}
-	_ = otherHandle.Release(context.Background())
+	_ = otherHandle.Close(context.Background())
 	if got := prompter.requestCount(); got != 2 {
 		t.Fatalf("prompts for a different path = %d, want 2", got)
 	}
@@ -417,7 +412,7 @@ func TestUnlockWindowReusesIdentityOnlyInMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openFile after Lock: %v", err)
 	}
-	_ = handle.Release(context.Background())
+	_ = handle.Close(context.Background())
 	if got := prompter.requestCount(); got != 3 {
 		t.Fatalf("prompts after Lock = %d, want 3", got)
 	}
@@ -456,7 +451,7 @@ func TestEditSessionUsesOneAuthorizationUntilItEnds(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open during edit session: %v", err)
 		}
-		if errno := handle.Release(context.Background()); errno != 0 {
+		if errno := handle.Close(context.Background()); errno != 0 {
 			t.Fatal(errno)
 		}
 	}
@@ -475,7 +470,7 @@ func TestEditSessionUsesOneAuthorizationUntilItEnds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open after edit session: %v", err)
 	}
-	_ = handle.Release(context.Background())
+	_ = handle.Close(context.Background())
 	if got := prompter.requestCount(); got != 2 {
 		t.Fatalf("prompts after edit session = %d, want 2", got)
 	}
@@ -486,9 +481,9 @@ func TestEncryptSessionUsesOneAuthorizationAndIsScopedToOwnerPID(t *testing.T) {
 	volume, prompter := initializeTestVolume(t, passphrase, 1024*1024)
 	const sessionID = "0123456789abcdef0123456789abcdef"
 	ownerPID := uint32(os.Getpid())
-	ownerContext := fuse.NewContext(
+	ownerContext := fsapi.WithCaller(
 		context.Background(),
-		&fuse.Caller{Pid: ownerPID},
+		fsapi.Caller{PID: ownerPID},
 	)
 
 	if err := volume.beginEncryptSession(ownerContext, sessionID, ownerPID); err != nil {
@@ -504,9 +499,9 @@ func TestEncryptSessionUsesOneAuthorizationAndIsScopedToOwnerPID(t *testing.T) {
 		t.Fatalf("owner prompts during batch = %d, want 1", got)
 	}
 
-	otherContext := fuse.NewContext(
+	otherContext := fsapi.WithCaller(
 		context.Background(),
-		&fuse.Caller{Pid: ownerPID + 1_000_000},
+		fsapi.Caller{PID: ownerPID + 1_000_000},
 	)
 	createTestFileWithContext(t, otherContext, volume, "other.env", []byte("C=3\n"))
 	if got := prompter.requestCount(); got != 2 {
@@ -550,25 +545,19 @@ func TestConcurrentReadsShareOnlyTheInMemoryAuthorization(t *testing.T) {
 				return
 			}
 			buffer := make([]byte, len(plaintext)+16)
-			result, errno := handle.Read(context.Background(), buffer, 0)
+			count, errno := handle.Read(context.Background(), buffer, 0)
 			if errno != 0 {
-				_ = handle.Release(context.Background())
+				_ = handle.Close(context.Background())
 				results <- errno
 				return
 			}
-			data, status := result.Bytes(buffer)
-			result.Done()
-			if status != fuse.OK {
-				_ = handle.Release(context.Background())
-				results <- fmt.Errorf("read status: %s", status)
-				return
-			}
+			data := buffer[:count]
 			if !bytes.Equal(data, plaintext) {
-				_ = handle.Release(context.Background())
+				_ = handle.Close(context.Background())
 				results <- fmt.Errorf("plaintext = %q, want %q", data, plaintext)
 				return
 			}
-			if errno := handle.Release(context.Background()); errno != 0 {
+			if errno := handle.Close(context.Background()); errno != 0 {
 				results <- errno
 				return
 			}
@@ -616,16 +605,16 @@ func TestConcurrentWritesRemainWholeAndEncrypted(t *testing.T) {
 				return
 			}
 			if _, errno := handle.Write(context.Background(), []byte(value), 0); errno != 0 {
-				_ = handle.Release(context.Background())
+				_ = handle.Close(context.Background())
 				results <- errno
 				return
 			}
 			if errno := handle.Flush(context.Background()); errno != 0 {
-				_ = handle.Release(context.Background())
+				_ = handle.Close(context.Background())
 				results <- errno
 				return
 			}
-			if errno := handle.Release(context.Background()); errno != 0 {
+			if errno := handle.Close(context.Background()); errno != 0 {
 				results <- errno
 				return
 			}
@@ -644,7 +633,7 @@ func TestConcurrentWritesRemainWholeAndEncrypted(t *testing.T) {
 		t.Fatalf("open final value: %v", err)
 	}
 	finalValue := string(readOpenFile(t, handle))
-	_ = handle.Release(context.Background())
+	_ = handle.Close(context.Background())
 	if !expected[finalValue] {
 		t.Fatalf("final value is partial or unexpected: %q", finalValue)
 	}
@@ -671,7 +660,7 @@ func TestReleasedHandlesDoNotLeakPathLocks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if errno := handle.Release(context.Background()); errno != 0 {
+		if errno := handle.Close(context.Background()); errno != 0 {
 			t.Fatal(errno)
 		}
 	}
@@ -704,7 +693,7 @@ func TestChangePassphrase(t *testing.T) {
 	}
 	if handle, err := oldVolume.openFile(context.Background(), "config.json", syscall.O_RDONLY); !errors.Is(err, ErrAuthentication) {
 		if handle != nil {
-			_ = handle.Release(context.Background())
+			_ = handle.Close(context.Background())
 		}
 		t.Fatalf("old passphrase error = %v, want ErrAuthentication", err)
 	}
@@ -720,7 +709,7 @@ func TestChangePassphrase(t *testing.T) {
 	if got := string(readOpenFile(t, handle)); got != `{"secret":"value"}` {
 		t.Fatalf("plaintext = %q", got)
 	}
-	_ = handle.Release(context.Background())
+	_ = handle.Close(context.Background())
 }
 
 func TestWriteHonorsMaximumPlaintextSize(t *testing.T) {
@@ -737,7 +726,7 @@ func TestWriteHonorsMaximumPlaintextSize(t *testing.T) {
 	if _, errno := handle.Write(context.Background(), []byte("12345"), 0); errno != syscall.EFBIG {
 		t.Fatalf("Write errno = %v, want EFBIG", errno)
 	}
-	_ = handle.Release(context.Background())
+	_ = handle.Close(context.Background())
 }
 
 func TestPrivateIdentityIsEncrypted(t *testing.T) {

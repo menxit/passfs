@@ -46,7 +46,7 @@ func (p *TouchIDHelperPrompter) Prompt(
 	context.Context,
 	PromptRequest,
 ) (string, error) {
-	return "", errors.New("Touch ID provides an age identity, not a passphrase")
+	return "", errors.New("touch ID provides an age identity, not a passphrase")
 }
 
 func (p *TouchIDHelperPrompter) PromptIdentity(
@@ -69,7 +69,7 @@ func (p *TouchIDHelperPrompter) PromptIdentity(
 		"--vault",
 		p.vault,
 		"--reason",
-		DescribePrompt(request),
+		describeTouchIDReason(request),
 	)
 	command.WaitDelay = 2 * time.Second
 	var stdout bytes.Buffer
@@ -85,19 +85,19 @@ func (p *TouchIDHelperPrompter) PromptIdentity(
 		}
 		message := strings.TrimSpace(stderr.String())
 		if message == "" {
-			return nil, fmt.Errorf("Touch ID helper: %w", err)
+			return nil, fmt.Errorf("touch ID helper: %w", err)
 		}
-		return nil, fmt.Errorf("Touch ID helper: %w: %s", err, message)
+		return nil, fmt.Errorf("touch ID helper: %w: %s", err, message)
 	}
 
 	secret := stdout.Bytes()
 	defer wipe(secret)
 	if len(secret) == 0 || len(secret) > maxTouchIDHelperOutput {
-		return nil, errors.New("Touch ID helper returned an invalid identity")
+		return nil, errors.New("touch ID helper returned an invalid identity")
 	}
 	identity, err := age.ParseX25519Identity(strings.TrimSpace(string(secret)))
 	if err != nil {
-		return nil, errors.New("Touch ID helper returned an invalid identity")
+		return nil, errors.New("touch ID helper returned an invalid identity")
 	}
 	return identity, nil
 }

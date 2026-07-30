@@ -16,7 +16,11 @@ import (
 
 const systemdUnitName = "passfs.service"
 
-func installAndStartService(executable, configPath string) error {
+func installAndStartService(
+	executable,
+	configPath,
+	adapterName string,
+) error {
 	if _, err := systemctlExecutable(); err != nil {
 		return err
 	}
@@ -24,7 +28,7 @@ func installAndStartService(executable, configPath string) error {
 	if err != nil {
 		return err
 	}
-	data, err := systemdUnitDefinition(executable, configPath)
+	data, err := systemdUnitDefinition(executable, configPath, adapterName)
 	if err != nil {
 		return err
 	}
@@ -171,12 +175,20 @@ func importGraphicalEnvironment() error {
 	return runSystemctl(arguments...)
 }
 
-func systemdUnitDefinition(executable, configPath string) ([]byte, error) {
+func systemdUnitDefinition(
+	executable,
+	configPath,
+	adapterName string,
+) ([]byte, error) {
 	execStart, err := systemdQuote(executable)
 	if err != nil {
 		return nil, err
 	}
 	config, err := systemdQuote(configPath)
+	if err != nil {
+		return nil, err
+	}
+	adapter, err := systemdQuote(adapterName)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +198,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=` + execStart + ` serve --config ` + config + `
+ExecStart=` + execStart + ` serve --config ` + config + ` --adapter ` + adapter + `
 Restart=always
 RestartSec=2
 TimeoutStopSec=8

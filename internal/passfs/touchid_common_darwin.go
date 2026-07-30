@@ -10,7 +10,7 @@ import (
 const touchIDPromptTimeout = 45 * time.Second
 
 var (
-	ErrTouchIDTimeout          = errors.New("Touch ID authorization timed out")
+	ErrTouchIDTimeout          = errors.New("touch ID authorization timed out")
 	ErrTouchIDUnsupportedBuild = errors.New(
 		"this passfs build cannot use Touch ID; macOS requires a signed app bundle with Keychain entitlements",
 	)

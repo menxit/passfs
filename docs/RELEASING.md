@@ -14,7 +14,10 @@ Create and retain these maintainer-only assets:
    `PassFS-macos-universal.pkg`.
 3. A Developer ID provisioning profile for `com.menxit.passfs` containing the
    Keychain access group required by Touch ID.
-4. A team App Store Connect API key accepted by `notarytool`. Individual API
+4. A second Developer ID provisioning profile for
+   `com.menxit.passfs.filesystem`, containing both the same Keychain access
+   group and the `com.apple.developer.fskit.fsmodule` entitlement.
+5. A team App Store Connect API key accepted by `notarytool`. Individual API
    keys cannot use the notarization service.
 
 Apple documents the two certificate types in
@@ -38,6 +41,7 @@ secrets:
 | `MACOS_SIGNING_CERTIFICATES_P12_BASE64` | Base64-encoded `.p12` containing both Developer ID identities |
 | `MACOS_SIGNING_CERTIFICATES_PASSWORD` | Password of the signing `.p12` |
 | `MACOS_PROVISIONING_PROFILE_BASE64` | Base64-encoded provisioning profile |
+| `MACOS_FSKIT_PROVISIONING_PROFILE_BASE64` | Base64-encoded FSKit extension provisioning profile |
 | `MACOS_NOTARY_KEY_P8_BASE64` | Base64-encoded team App Store Connect `.p8` key |
 | `MACOS_NOTARY_KEY_ID` | App Store Connect key ID |
 | `MACOS_NOTARY_ISSUER_ID` | App Store Connect issuer ID |

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,35 @@ import (
 	"golang.org/x/sys/unix"
 	"passfs/internal/passfs"
 )
+
+func launchPlatformApp() (bool, error) {
+	return false, nil
+}
+
+func platformFilesystemAdapters() []filesystemAdapter {
+	return []filesystemAdapter{fuseFilesystemAdapter{}}
+}
+
+func preparePlatformFilesystemForInit(
+	_ *passfs.Settings,
+	_ string,
+	_ io.Writer,
+) error {
+	return nil
+}
+
+func platformFilesystemApprovalRequired(string, string, int64) bool {
+	return false
+}
+
+func completePlatformFilesystemApproval(
+	_ *passfs.Settings,
+	_ string,
+	_ bool,
+	_ io.Writer,
+) error {
+	return errPlatformFilesystemApprovalRequired
+}
 
 func platformFUSECapability() platformCapability {
 	info, err := os.Stat("/dev/fuse")
@@ -83,16 +113,14 @@ func platformFUSEError(capability platformCapability) error {
 				"FUSE is required before passfs can mount its filesystem: " + capability.detail,
 				"install it with the detected package manager:",
 				"  " + installCommand,
-				"then run:",
-				"  passfs doctor",
-				"  passfs mount",
+				"then rerun:",
+				"  passfs init",
 			}
 		}
 		return actionableError{
 			"FUSE is required before passfs can mount its filesystem: " + capability.detail,
-			"install the fuse3 package for this distribution, then run:",
-			"  passfs doctor",
-			"  passfs mount",
+			"install the fuse3 package for this distribution, then rerun:",
+			"  passfs init",
 		}
 	}
 	return actionableError{
@@ -100,9 +128,8 @@ func platformFUSEError(capability platformCapability) error {
 		"do not reinstall fuse3; make /dev/fuse accessible to this process",
 		"for Docker, start the container with:",
 		"  --device /dev/fuse --cap-add SYS_ADMIN",
-		"then run:",
-		"  passfs doctor",
-		"  passfs mount",
+		"then rerun:",
+		"  passfs init",
 	}
 }
 
@@ -143,6 +170,10 @@ func guidePlatformFUSESetup(writer io.Writer, _ bool) error {
 	return nil
 }
 
+func guidePlatformFilesystemSetup(writer io.Writer, open bool) error {
+	return guidePlatformFUSESetup(writer, open)
+}
+
 func guidePlatformPromptSetup(writer io.Writer) error {
 	if prompt := platformPromptCapability(); prompt.ready {
 		return nil
@@ -162,10 +193,8 @@ func platformMountWaitError(err error, logHint string) error {
 	return actionableError{
 		err.Error(),
 		"the Linux FUSE filesystem did not become ready",
-		"verify the kernel device, permissions, and user service with:",
-		"  passfs doctor",
-		"then retry:",
-		"  passfs mount",
+		"verify the kernel device and permissions, then retry:",
+		"  passfs init",
 		"service log: " + logHint,
 	}
 }

@@ -1,0 +1,344 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1A87E72150CFFA419ECE6143 /* Bridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7758706686E05749F8146351 /* Bridge.swift */; };
+		5DBAF7D119D9618475E44D16 /* PassFSItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90D0468482901B648313CDAF /* PassFSItem.swift */; };
+		ABA09E61D674D83CFA9BC4E4 /* PassFSFileSystemExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2061A6706A671D622827983B /* PassFSFileSystemExtension.swift */; };
+		CA111834D188892702A17451 /* PassFSFileSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44AEA3508FD5173E00C5A8B7 /* PassFSFileSystem.swift */; };
+		E8342446EADC22FBF7508EB9 /* PassFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23B2B53EF4BA1A1B5B1634DC /* PassFSVolume.swift */; };
+		E8E5C7C1A7A0F4B4C54F21B4 /* PassFSVolumeOperations.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8F5FC835DE216DBBFC5E073 /* PassFSVolumeOperations.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		2061A6706A671D622827983B /* PassFSFileSystemExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassFSFileSystemExtension.swift; sourceTree = "<group>"; };
+		23B2B53EF4BA1A1B5B1634DC /* PassFSVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassFSVolume.swift; sourceTree = "<group>"; };
+		44AEA3508FD5173E00C5A8B7 /* PassFSFileSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassFSFileSystem.swift; sourceTree = "<group>"; };
+		7758706686E05749F8146351 /* Bridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Bridge.swift; sourceTree = "<group>"; };
+		7A207129C9982401E14B1CEF /* PassFSFileSystem-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "PassFSFileSystem-Bridging-Header.h"; sourceTree = "<group>"; };
+		90D0468482901B648313CDAF /* PassFSItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassFSItem.swift; sourceTree = "<group>"; };
+		C8F5FC835DE216DBBFC5E073 /* PassFSVolumeOperations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassFSVolumeOperations.swift; sourceTree = "<group>"; };
+		DB42C8A77E0A88EAC1FDCE2B /* PassFSFileSystem.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = PassFSFileSystem.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		224850A270BC32A8B6866711 /* PassFSFileSystem */ = {
+			isa = PBXGroup;
+			children = (
+				7758706686E05749F8146351 /* Bridge.swift */,
+				7A207129C9982401E14B1CEF /* PassFSFileSystem-Bridging-Header.h */,
+				44AEA3508FD5173E00C5A8B7 /* PassFSFileSystem.swift */,
+				2061A6706A671D622827983B /* PassFSFileSystemExtension.swift */,
+				90D0468482901B648313CDAF /* PassFSItem.swift */,
+				23B2B53EF4BA1A1B5B1634DC /* PassFSVolume.swift */,
+				C8F5FC835DE216DBBFC5E073 /* PassFSVolumeOperations.swift */,
+			);
+			path = PassFSFileSystem;
+			sourceTree = "<group>";
+		};
+		57F5A0044B9EE2C9198BD698 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				DB42C8A77E0A88EAC1FDCE2B /* PassFSFileSystem.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A56DDBBF94B791B8167F08E1 = {
+			isa = PBXGroup;
+			children = (
+				224850A270BC32A8B6866711 /* PassFSFileSystem */,
+				57F5A0044B9EE2C9198BD698 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A03B6F89C8122BE4D3E1DF36 /* PassFSFileSystem */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 78B9D8EBBC2EFA3934714A41 /* Build configuration list for PBXNativeTarget "PassFSFileSystem" */;
+			buildPhases = (
+				8C156FD60790E1BB631BC6F1 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PassFSFileSystem;
+			packageProductDependencies = (
+			);
+			productName = PassFSFileSystem;
+			productReference = DB42C8A77E0A88EAC1FDCE2B /* PassFSFileSystem.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		0272BE14DBCA414B98E91242 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = C049F435C79B922461585D7D /* Build configuration list for PBXProject "PassFSFileSystem" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = A56DDBBF94B791B8167F08E1;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 57F5A0044B9EE2C9198BD698 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A03B6F89C8122BE4D3E1DF36 /* PassFSFileSystem */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		8C156FD60790E1BB631BC6F1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1A87E72150CFFA419ECE6143 /* Bridge.swift in Sources */,
+				CA111834D188892702A17451 /* PassFSFileSystem.swift in Sources */,
+				ABA09E61D674D83CFA9BC4E4 /* PassFSFileSystemExtension.swift in Sources */,
+				5DBAF7D119D9618475E44D16 /* PassFSItem.swift in Sources */,
+				E8342446EADC22FBF7508EB9 /* PassFSVolume.swift in Sources */,
+				E8E5C7C1A7A0F4B4C54F21B4 /* PassFSVolumeOperations.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		13EEF3DB2AA6C6079876754E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		49A65C0DC7EC9C6875ADC52C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_ENTITLEMENTS = PassFSFileSystem/PassFSFileSystem.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)",
+				);
+				INFOPLIST_FILE = PassFSFileSystem/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"$(PASSFS_BRIDGE_ARCHIVE)",
+					"-framework",
+					AppKit,
+					"-framework",
+					LocalAuthentication,
+					"-framework",
+					Security,
+					"-lresolv",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.menxit.passfs.filesystem;
+				PRODUCT_NAME = PassFSFileSystem;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "PassFSFileSystem/PassFSFileSystem-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		EF4DCA7F13A9D7A2CBA3794A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_ENTITLEMENTS = PassFSFileSystem/PassFSFileSystem.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)",
+				);
+				INFOPLIST_FILE = PassFSFileSystem/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"$(PASSFS_BRIDGE_ARCHIVE)",
+					"-framework",
+					AppKit,
+					"-framework",
+					LocalAuthentication,
+					"-framework",
+					Security,
+					"-lresolv",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.menxit.passfs.filesystem;
+				PRODUCT_NAME = PassFSFileSystem;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "PassFSFileSystem/PassFSFileSystem-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		FF8B3EFC3A392B5645A20E4F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		78B9D8EBBC2EFA3934714A41 /* Build configuration list for PBXNativeTarget "PassFSFileSystem" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				49A65C0DC7EC9C6875ADC52C /* Debug */,
+				EF4DCA7F13A9D7A2CBA3794A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C049F435C79B922461585D7D /* Build configuration list for PBXProject "PassFSFileSystem" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				13EEF3DB2AA6C6079876754E /* Debug */,
+				FF8B3EFC3A392B5645A20E4F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 0272BE14DBCA414B98E91242 /* Project object */;
+}

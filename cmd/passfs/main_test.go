@@ -59,6 +59,45 @@ func TestEncryptWithoutMountExplainsHowToRecover(t *testing.T) {
 	}
 }
 
+func TestInitWithPromptIsIdempotentForExistingVault(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	settings, err := passfs.NewSettings(
+		configPath,
+		filepath.Join(root, "vault"),
+		filepath.Join(root, "mnt"),
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runInit(
+		[]string{
+			"--config", configPath,
+			"--prompt", "native",
+			"--no-mount",
+		},
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("runInit on an existing vault: %v", err)
+	}
+	for _, expected := range []string{
+		"PassFS is initialized",
+		"filesystem startup was skipped",
+	} {
+		if !strings.Contains(stdout.String(), expected) {
+			t.Fatalf("output %q does not contain %q", stdout.String(), expected)
+		}
+	}
+}
+
 func TestEncryptHelpDocumentsBatchAuthorization(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

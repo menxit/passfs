@@ -6,8 +6,10 @@
 
 `passfs` stores selected files encrypted with
 [age](https://age-encryption.org/) and keeps them available at their original
-paths through one local FUSE filesystem and symbolic links. Decrypted contents
-stay in memory and every file open requires authorization by default.
+paths through one local virtual filesystem and symbolic links. Decrypted
+contents stay in memory and every file open requires authorization by default.
+On macOS 26 and later, the default frontend is Apple FSKit; FUSE remains the
+compatibility frontend for older systems.
 
 ## Supported platforms
 
@@ -16,7 +18,8 @@ stay in memory and every file open requires authorization by default.
 
 ## Requirements
 
-- macOS 13 or later; `passfs setup` guides the required macFUSE installation
+- macOS 26 or later: the native Apple FSKit frontend included in PassFS.app
+- macOS 13–15: macFUSE compatibility frontend
 - Linux: a systemd user session; the installer configures FUSE automatically
   when supported by the distribution package manager
 
@@ -28,20 +31,32 @@ Download and open the signed and notarized installer:
 
 [Download passfs for macOS](https://getpassfs.com/)
 
-The package installs `PassFS.app` in `/Applications` and the `passfs` command
-in `/usr/local/bin`. The application is already signed by the passfs
-developer; users do not need an Apple Developer certificate, a provisioning
-profile, Go, or Git.
+The package installs `PassFS.app` in `/Applications`, starts its menu bar
+control, and installs the `passfs` command in `/usr/local/bin`.
 
-Before the first mount, run:
+To uninstall PassFS while preserving the encrypted vault:
 
 ```sh
-passfs setup
+/Applications/PassFS.app/Contents/Resources/uninstall-passfs.sh
 ```
 
-If macFUSE is missing, passfs opens its official download page and explains
-how to finish setup. It never installs a system extension silently. Check the
-result at any time with `passfs doctor`.
+Add `--purge-data` only if the vault should also be moved to the Trash.
+
+Open PassFS after installation. The app initializes and mounts the protected
+filesystem automatically. The same operation is available from the terminal:
+
+```sh
+passfs init
+```
+
+If the native frontend needs one-time approval, PassFS opens a guided window
+with the correct system control, waits for approval, and then continues
+mounting. This does not require a kernel extension, reduced security, or
+macFUSE.
+
+On older macOS releases, `init` reports how to install the macFUSE
+compatibility frontend. `setup`, `doctor`, and `mount` remain available as
+advanced troubleshooting commands, but are not part of the normal first run.
 
 Installing a newer package also reloads an existing passfs service.
 
@@ -67,7 +82,8 @@ passfs init
 ```
 
 This creates one age identity and one encrypted vault shared by every protected
-file on the computer:
+file, prepares the best filesystem adapter for the platform, installs its
+background service, and mounts it:
 
 ```text
 ~/.config/passfs/
@@ -76,18 +92,17 @@ file on the computer:
 └── vault/
 ```
 
-Start the filesystem:
-
-```sh
-passfs mount
-```
-
-The command returns after mounting at `~/.config/passfs/mnt`. The filesystem
+`init` returns after mounting at `~/.config/passfs/mnt`. It is idempotent: if
+platform approval interrupted the first attempt, enable the extension and run
+the same command again. The filesystem
 runs as a supervised background service, survives terminal closure, restarts
 after a failure, and starts automatically after login. On macOS it is also
 shown in Finder as the `passfs` volume.
 
 Only one passfs filesystem is mounted for all protected files.
+
+`passfs init` automatically selects the best available filesystem frontend,
+preferring the native macOS implementation.
 
 ## Encrypt a file
 
@@ -129,36 +144,43 @@ When several files are passed, passfs requests authorization once and keeps
 the age identity in memory only for that command. The authorization is scoped
 to the `passfs` process and is discarded when the command ends.
 
-### Find and protect repository secrets with a coding agent
+## Find unprotected secrets
 
-Run this prompt from the repository you want to inspect:
-
-```text
-Audit the current repository for unencrypted local files that are likely to
-contain secrets, then protect them with passfs.
-
-Do not read, print, copy, or transmit file contents or secret values. Find
-candidates using filenames, file type, .gitignore rules, and Git metadata.
-Consider .env and .env.* files, credentials, secrets, private keys, and local
-configuration files. Exclude examples, samples, templates, tests, dependencies,
-build output, .git, symbolic links, and files already protected by passfs. Do
-not modify tracked files; report tracked candidates separately because their
-contents may already exist in Git history.
-
-First run passfs doctor. If passfs is ready and there are untracked or ignored
-regular-file candidates, invoke passfs encrypt exactly once with every
-candidate as a separate argument, using -- before the paths. Verify only that
-each original path is now a symbolic link. Report paths and results only,
-never file contents. If there are no candidates, make no changes.
-```
-
-Linux desktops show a password window. On a server or SSH terminal, passfs
-uses a full-screen terminal prompt associated with the process opening the
-file. Test the selected prompt without opening a protected file:
+Scan the current repository and the usual user credential/config locations:
 
 ```sh
-passfs doctor --test-prompt
+passfs scan
 ```
+
+Scan a specific tree, or every relevant user-data root:
+
+```sh
+passfs scan ~/Development
+passfs scan --all
+```
+
+In an interactive terminal, `passfs scan` groups results by Git repository and
+shows the filename, project, size, last-opened time, and a masked preview. Select
+individual files, ranges, or all results to protect them in one operation.
+Files that should not appear again can be ignored from the same prompt.
+
+The scanner skips Git-tracked files, existing PassFS links, the vault,
+dependencies, package vendors, build output, caches, examples, tests, and
+platform system trees. It recognizes common AWS, Google Cloud, Azure, SSH,
+container, Kubernetes, package-manager, and environment credential formats on
+macOS and Linux. Secret values are never printed. For scripts and integrations,
+`--json`, `-0`, and `--no-interactive` return paths only.
+
+The macOS app provides the same project-grouped view for unprotected, protected,
+and ignored files in a dedicated, resizable management window. It includes
+masked previews, search, file size, last-opened metadata, one-click protect,
+unprotect, ignore and restore actions, and a badge showing the current number
+of unprotected files. The menu bar control is intentionally compact: it shows
+the filesystem status, starts or stops PassFS, and opens the management window.
+The interface defaults to English and is also available in Italian, German,
+French, Spanish, and Portuguese. PassFS initializes and mounts automatically
+when the app starts. Touch ID is enabled by default, and the default unlock
+duration is `0m`.
 
 Running `passfs encrypt FILE` again is safe. If an older passfs version already
 encrypted the file but removed its original pathname, the command recreates the
@@ -245,10 +267,8 @@ file.
 
 ## Touch ID on macOS
 
-`passfs init` attempts to enable Touch ID by default on macOS. A device-local
-copy of the age identity is protected by the currently enrolled fingerprints.
-The distributed application includes the Developer ID signature, provisioning
-profile, and Keychain entitlements required by macOS.
+`passfs init` enables Touch ID by default on supported Macs. A device-local copy
+of the age identity is protected by the currently enrolled fingerprints.
 
 On a Mac without Touch ID, initialization continues normally and reports that
 passphrase authorization will be used instead. With `--unlock-for 0`, every

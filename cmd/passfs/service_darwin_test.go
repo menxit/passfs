@@ -14,6 +14,7 @@ func TestLaunchAgentRunsForegroundServer(t *testing.T) {
 	data, err := launchAgentDefinition(
 		"/Applications/passfs & tools/passfs",
 		"/Users/menxit/.config/passfs/config.json",
+		"fskit",
 		"/Users/menxit/.config/passfs/passfs.log",
 	)
 	if err != nil {
@@ -24,6 +25,8 @@ func TestLaunchAgentRunsForegroundServer(t *testing.T) {
 		"<string>/Applications/passfs &amp; tools/passfs</string>",
 		"<string>serve</string>",
 		"<string>--config</string>",
+		"<string>--adapter</string>",
+		"<string>fskit</string>",
 		"<key>RunAtLoad</key><true/>",
 		"<key>KeepAlive</key><true/>",
 	} {

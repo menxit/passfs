@@ -66,7 +66,7 @@ func initVolume(
 	passphrase, err := prompter.Prompt(ctx, PromptRequest{
 		Path:        cipherDir,
 		Operation:   "initialize",
-		Description: "Choose the passphrase for the new passfs volume",
+		Description: "Choose a recovery passphrase for your new PassFS vault.",
 	})
 	if err != nil {
 		return err
@@ -74,7 +74,7 @@ func initVolume(
 	confirmation, err := prompter.Prompt(ctx, PromptRequest{
 		Path:        cipherDir,
 		Operation:   "initialize",
-		Description: "Confirm the passphrase for the new passfs volume",
+		Description: "Confirm the recovery passphrase for your new PassFS vault.",
 	})
 	if err != nil {
 		return err
@@ -187,7 +187,7 @@ func ChangePassphrase(ctx context.Context, cipherDir string, prompter Prompter) 
 	privateData, err := unlockPrivateConfig(ctx, cipherDir, public, prompter, PromptRequest{
 		Path:        cipherDir,
 		Operation:   "change passphrase",
-		Description: "Enter the current passfs passphrase",
+		Description: "Enter the current PassFS passphrase.",
 	})
 	if err != nil {
 		return err
@@ -197,7 +197,7 @@ func ChangePassphrase(ctx context.Context, cipherDir string, prompter Prompter) 
 	newPassphrase, err := prompter.Prompt(ctx, PromptRequest{
 		Path:        cipherDir,
 		Operation:   "change passphrase",
-		Description: "Enter the new passfs passphrase",
+		Description: "Choose a new PassFS recovery passphrase.",
 	})
 	if err != nil {
 		return err
@@ -205,7 +205,7 @@ func ChangePassphrase(ctx context.Context, cipherDir string, prompter Prompter) 
 	confirmation, err := prompter.Prompt(ctx, PromptRequest{
 		Path:        cipherDir,
 		Operation:   "change passphrase",
-		Description: "Confirm the new passfs passphrase",
+		Description: "Confirm the new PassFS recovery passphrase.",
 	})
 	if err != nil {
 		return err

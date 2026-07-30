@@ -100,6 +100,40 @@ func runUpdate(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
+type cachedUpdateStatus struct {
+	Available string `json:"available,omitempty"`
+}
+
+func runCachedUpdateStatus(args []string, writer io.Writer) error {
+	if len(args) != 0 {
+		return errors.New("invalid cached update status request")
+	}
+	path, err := updateStatePath()
+	if err != nil {
+		return err
+	}
+	return writeCachedUpdateStatus(path, version, writer)
+}
+
+func writeCachedUpdateStatus(
+	path string,
+	currentVersion string,
+	writer io.Writer,
+) error {
+	result := cachedUpdateStatus{}
+	state, err := updater.LoadState(path)
+	if err == nil && state.Available != "" {
+		newer, compareErr := updater.IsNewer(
+			state.Available,
+			currentVersion,
+		)
+		if compareErr == nil && newer {
+			result.Available = state.Available
+		}
+	}
+	return writeJSON(writer, result)
+}
+
 type platformUpdateResult struct {
 	installed  bool
 	reload     bool
@@ -142,9 +176,12 @@ func recordAvailableUpdate(available string, newer bool) error {
 }
 
 func printCachedUpdateNotice(command string, writer io.Writer) {
+	if os.Getenv("PASSFS_NO_UPDATE_NOTICE") == "1" {
+		return
+	}
 	switch command {
 	case "update", "serve", "__touchid-helper", "help", "--help", "-h",
-		"version", "--version", "-version":
+		"version", "--version", "-version", "__update-status":
 		return
 	}
 	path, err := updateStatePath()

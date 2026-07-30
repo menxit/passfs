@@ -10,12 +10,14 @@ bundle_id="com.menxit.passfs"
 profile=${1-}
 signing_identity=${2-}
 output=${3-}
+fskit_profile=${4-}
 release_version=${PASSFS_VERSION:-0.1.0}
 build_number=${PASSFS_BUILD_NUMBER:-1}
 architectures=${PASSFS_MACOS_ARCHES:-$(uname -m)}
 
-if [ -z "$profile" ] || [ -z "$signing_identity" ] || [ -z "$output" ]; then
-	echo "usage: $0 PROVISIONING_PROFILE SIGNING_IDENTITY OUTPUT_APP" >&2
+if [ -z "$profile" ] || [ -z "$signing_identity" ] ||
+	[ -z "$output" ] || [ -z "$fskit_profile" ]; then
+	echo "usage: $0 APP_PROVISIONING_PROFILE SIGNING_IDENTITY OUTPUT_APP FSKIT_PROVISIONING_PROFILE" >&2
 	exit 2
 fi
 if ! printf '%s\n' "$release_version" |
@@ -33,6 +35,10 @@ if [ ! -f "$profile" ]; then
 	echo "provisioning profile not found: $profile" >&2
 	exit 1
 fi
+if [ ! -f "$fskit_profile" ]; then
+	echo "FSKit provisioning profile not found: $fskit_profile" >&2
+	exit 1
+fi
 if [ "$(basename "$output")" != "PassFS.app" ]; then
 	echo "refusing unexpected app bundle output: $output" >&2
 	exit 1
@@ -40,8 +46,15 @@ fi
 
 output_parent=$(dirname "$output")
 mkdir -p "$output_parent"
+output_parent=$(
+	cd "$output_parent" &&
+		pwd
+)
+output="$output_parent/$(basename "$output")"
 build_directory=$(mktemp -d "$output_parent/.passfs-macos-build.XXXXXX")
 staged_app="$build_directory/PassFS.app"
+cli_bundle="$staged_app/Contents/Helpers/PassFSCLI.bundle"
+cli_binary="$cli_bundle/Contents/MacOS/passfs-cli"
 previous_app="$build_directory/PreviousPassFS.app"
 profile_plist="$build_directory/profile.plist"
 profile_certificate="$build_directory/profile-certificate.der"
@@ -89,21 +102,50 @@ if ! /usr/libexec/PlistBuddy \
 	echo "profile does not authorize the passfs Keychain access group" >&2
 	exit 1
 fi
+if [ "$(
+	/usr/libexec/PlistBuddy \
+		-c "Print :Entitlements:com.apple.developer.fskit.mount" \
+		"$profile_plist" 2>/dev/null || true
+)" != "true" ]; then
+	echo "profile does not authorize com.apple.developer.fskit.mount" >&2
+	exit 1
+fi
 
 sed "s/__TEAM_IDENTIFIER__/$team_identifier/g" \
 	"$project_root/packaging/macos/passfs.entitlements.in" >"$entitlements"
 plutil -lint "$project_root/packaging/macos/Info.plist" "$entitlements" >/dev/null
 
 mkdir -p \
+	"$staged_app/Contents/Helpers" \
 	"$staged_app/Contents/MacOS" \
+	"$staged_app/Contents/Extensions" \
 	"$staged_app/Contents/Resources" \
+	"$cli_bundle/Contents/MacOS" \
 	"$binary_directory"
 cp "$project_root/packaging/macos/Info.plist" \
 	"$staged_app/Contents/Info.plist"
+cp "$project_root/packaging/macos/PassFSCLI-Info.plist" \
+	"$cli_bundle/Contents/Info.plist"
 cp "$project_root/packaging/macos/PassFS.icns" \
 	"$staged_app/Contents/Resources/PassFS.icns"
-cp "$profile" "$staged_app/Contents/embedded.provisionprofile"
+cp \
+	"$project_root/packaging/macos/PassFSMenuIcon.png" \
+	"$project_root/packaging/macos/PassFSMenuIcon@2x.png" \
+	"$staged_app/Contents/Resources/"
+cp "$project_root/packaging/macos/uninstall-passfs.sh" \
+	"$staged_app/Contents/Resources/uninstall-passfs.sh"
+chmod 0755 "$staged_app/Contents/Resources/uninstall-passfs.sh"
+for localization in "$project_root"/native/menubar/Resources/*.lproj; do
+	cp -R "$localization" "$staged_app/Contents/Resources/"
+done
+COPYFILE_DISABLE=1 cp "$profile" \
+	"$staged_app/Contents/embedded.provisionprofile"
+COPYFILE_DISABLE=1 cp "$profile" \
+	"$cli_bundle/Contents/embedded.provisionprofile"
+/usr/bin/xattr -c "$staged_app/Contents/embedded.provisionprofile"
+/usr/bin/xattr -c "$cli_bundle/Contents/embedded.provisionprofile"
 chmod 0644 "$staged_app/Contents/embedded.provisionprofile"
+chmod 0644 "$cli_bundle/Contents/embedded.provisionprofile"
 
 plist_version=${release_version%%-*}
 /usr/libexec/PlistBuddy \
@@ -112,7 +154,12 @@ plist_version=${release_version%%-*}
 /usr/libexec/PlistBuddy \
 	-c "Set :CFBundleVersion $build_number" \
 	"$staged_app/Contents/Info.plist"
-
+/usr/libexec/PlistBuddy \
+	-c "Set :CFBundleShortVersionString $plist_version" \
+	"$cli_bundle/Contents/Info.plist"
+/usr/libexec/PlistBuddy \
+	-c "Set :CFBundleVersion $build_number" \
+	"$cli_bundle/Contents/Info.plist"
 binary_count=0
 for architecture in $architectures; do
 	case "$architecture" in
@@ -144,19 +191,59 @@ for architecture in $architectures; do
 			env -u GOROOT GOWORK=off go build \
 			-trimpath \
 			-ldflags "-s -w -X main.version=$release_version" \
-			-o "$binary_directory/passfs-$architecture" \
+			-o "$binary_directory/passfs-cli-$architecture" \
 			./cmd/passfs
 	)
+	xcrun swiftc \
+		-parse-as-library \
+		-O \
+		-target "$compiler_architecture-apple-macos13.0" \
+		-framework AppKit \
+		-framework CoreServices \
+		-Xlinker -weak_framework \
+		-Xlinker FSKit \
+		-framework ServiceManagement \
+		-framework SwiftUI \
+		-o "$binary_directory/passfs-ui-$architecture" \
+		"$project_root/native/menubar/PassFSMenuApp.swift"
 done
 
 if [ "$binary_count" -eq 1 ]; then
-	cp "$binary_directory"/passfs-* \
-		"$staged_app/Contents/MacOS/passfs"
+	cp "$binary_directory"/passfs-cli-* \
+		"$binary_directory/passfs-cli-final"
+	cp "$binary_directory"/passfs-ui-* \
+		"$binary_directory/passfs-ui-final"
 else
-	lipo -create "$binary_directory"/passfs-* \
-		-output "$staged_app/Contents/MacOS/passfs"
+	lipo -create "$binary_directory"/passfs-cli-* \
+		-output "$binary_directory/passfs-cli-final"
+	lipo -create "$binary_directory"/passfs-ui-* \
+		-output "$binary_directory/passfs-ui-final"
 fi
-chmod 0755 "$staged_app/Contents/MacOS/passfs"
+chmod 0755 \
+	"$binary_directory/passfs-cli-final" \
+	"$binary_directory/passfs-ui-final"
+
+cp "$binary_directory/passfs-cli-final" \
+	"$cli_binary"
+cp "$binary_directory/passfs-ui-final" \
+	"$staged_app/Contents/MacOS/PassFS"
+
+PASSFS_VERSION="$release_version" \
+PASSFS_BUILD_NUMBER="$build_number" \
+PASSFS_MACOS_ARCHES="$architectures" \
+	"$project_root/scripts/build-fskit-extension.sh" \
+	"$fskit_profile" \
+	"$signing_identity" \
+	"$staged_app/Contents/Extensions/PassFSFileSystem.appex"
+
+codesign \
+	--force \
+	--identifier "$bundle_id" \
+	--options runtime \
+	--timestamp \
+	--entitlements "$entitlements" \
+	--sign "$signing_identity" \
+	"$cli_bundle"
 
 codesign \
 	--force \
@@ -166,7 +253,7 @@ codesign \
 	--entitlements "$entitlements" \
 	--sign "$signing_identity" \
 	"$staged_app"
-codesign --verify --strict --verbose=2 "$staged_app"
+codesign --verify --deep --strict --verbose=2 "$staged_app"
 
 had_previous=false
 if [ -e "$output" ] || [ -L "$output" ]; then

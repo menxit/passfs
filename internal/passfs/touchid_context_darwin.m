@@ -97,6 +97,18 @@ static int passfs_status_error(char **error_message, OSStatus status)
 	return passfs_result_for_error(error);
 }
 
+int passfs_touchid_prefers_italian(void)
+{
+	@autoreleasepool {
+		NSArray<NSString *> *languages = [NSLocale preferredLanguages];
+		if ([languages count] == 0) {
+			return 0;
+		}
+		NSString *language = [[languages objectAtIndex:0] lowercaseString];
+		return [language hasPrefix:@"it"] ? 1 : 0;
+	}
+}
+
 int passfs_touchid_prepare_ui(char **error_message)
 {
 	@autoreleasepool {

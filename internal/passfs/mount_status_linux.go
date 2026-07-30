@@ -19,15 +19,22 @@ import (
 )
 
 func MountStatus(mountPoint string) (mounted bool, passfsMount bool, err error) {
+	mounted, adapter, err := MountAdapterStatus(mountPoint)
+	return mounted, adapter != MountAdapterUnknown, err
+}
+
+func MountAdapterStatus(
+	mountPoint string,
+) (mounted bool, adapter string, err error) {
 	file, err := os.Open("/proc/self/mountinfo")
 	if err != nil {
-		return false, false, err
+		return false, MountAdapterUnknown, err
 	}
 	defer file.Close()
 
 	target, err := canonicalMountPoint(mountPoint)
 	if err != nil {
-		return false, false, err
+		return false, MountAdapterUnknown, err
 	}
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -44,19 +51,22 @@ func MountStatus(mountPoint string) (mounted bool, passfsMount bool, err error) 
 		}
 		matches, decodeErr := mountInfoPathMatches(fields[4], target)
 		if decodeErr != nil {
-			return false, false, decodeErr
+			return false, MountAdapterUnknown, decodeErr
 		}
 		if !matches {
 			continue
 		}
 		fsType := fields[separator+1]
 		source := fields[separator+2]
-		return true, fsType == "fuse.passfs" && source == "passfs", nil
+		if fsType == "fuse.passfs" && source == "passfs" {
+			return true, MountAdapterFUSE, nil
+		}
+		return true, MountAdapterUnknown, nil
 	}
 	if err := scanner.Err(); err != nil {
-		return false, false, err
+		return false, MountAdapterUnknown, err
 	}
-	return false, false, nil
+	return false, MountAdapterUnknown, nil
 }
 
 // Mount points in /proc/self/mountinfo are kernel-resolved paths. Comparing

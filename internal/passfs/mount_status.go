@@ -5,6 +5,12 @@ import (
 	"path/filepath"
 )
 
+const (
+	MountAdapterUnknown = ""
+	MountAdapterFUSE    = "fuse"
+	MountAdapterFSKit   = "fskit"
+)
+
 // canonicalMountPoint resolves aliases in the parent directory without
 // traversing the mount itself. Traversing the mount point would fail for an
 // orphaned FUSE mount, which is precisely when MountStatus is needed most.

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"filippo.io/age"
-	"github.com/hanwen/go-fuse/v2/fuse"
+	"passfs/internal/fsapi"
 )
 
 const (
@@ -29,6 +29,7 @@ type FileMeta struct {
 	Size  uint64 `json:"size"`
 	Mode  uint32 `json:"mode"`
 	MTime int64  `json:"mtime"`
+	ATime int64  `json:"atime,omitempty"`
 }
 
 type Metadata struct {
@@ -134,6 +135,28 @@ func LoadVolume(
 }
 
 func loadMetadata(root string) (Metadata, error) {
+	var metadata Metadata
+	err := withMetadataFileLock(root, func() error {
+		var err error
+		metadata, err = readMetadata(root)
+		if err != nil {
+			return err
+		}
+		changed, err := reconcileMetadata(root, &metadata)
+		if err != nil {
+			return fmt.Errorf("reconcile metadata: %w", err)
+		}
+		if changed {
+			if err := saveMetadata(root, metadata); err != nil {
+				return fmt.Errorf("save reconciled metadata: %w", err)
+			}
+		}
+		return nil
+	})
+	return metadata, err
+}
+
+func readMetadata(root string) (Metadata, error) {
 	metadata := Metadata{
 		Version: formatVersion,
 		Files:   make(map[string]FileMeta),
@@ -157,15 +180,6 @@ func loadMetadata(root string) (Metadata, error) {
 	if metadata.Links == nil {
 		metadata.Links = make(map[string]string)
 	}
-	changed, err := reconcileMetadata(root, &metadata)
-	if err != nil {
-		return metadata, fmt.Errorf("reconcile metadata: %w", err)
-	}
-	if changed {
-		if err := saveMetadata(root, metadata); err != nil {
-			return metadata, fmt.Errorf("save reconciled metadata: %w", err)
-		}
-	}
 	return metadata, nil
 }
 
@@ -188,11 +202,18 @@ func cloneMetadata(metadata Metadata) Metadata {
 // in memory. A failed disk write therefore cannot leak a partial mutation into
 // a later, otherwise unrelated metadata update.
 func (v *Volume) updateMetadataLocked(update func(*Metadata) error) error {
-	next := cloneMetadata(v.metadata)
-	if err := update(&next); err != nil {
-		return err
-	}
-	if err := saveMetadata(v.root, next); err != nil {
+	var next Metadata
+	if err := withMetadataFileLock(v.root, func() error {
+		current, err := readMetadata(v.root)
+		if err != nil {
+			return err
+		}
+		next = cloneMetadata(current)
+		if err := update(&next); err != nil {
+			return err
+		}
+		return saveMetadata(v.root, next)
+	}); err != nil {
 		return err
 	}
 	v.metadata = next
@@ -237,6 +258,9 @@ func reconcileMetadata(root string, metadata *Metadata) (bool, error) {
 		if err := validateRelativePath(relative); err != nil {
 			return err
 		}
+		if isReservedStorageMetadataPath(relative) {
+			return nil
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return err
@@ -245,6 +269,7 @@ func reconcileMetadata(root string, metadata *Metadata) (bool, error) {
 		actual[key] = FileMeta{
 			Mode:  0o600,
 			MTime: info.ModTime().UnixNano(),
+			ATime: info.ModTime().UnixNano(),
 		}
 		return nil
 	})
@@ -281,7 +306,11 @@ func (v *Volume) fileMeta(relative string, encryptedInfo os.FileInfo) FileMeta {
 	if encryptedInfo != nil {
 		modTime = encryptedInfo.ModTime()
 	}
-	return FileMeta{Mode: 0o600, MTime: modTime.UnixNano()}
+	return FileMeta{
+		Mode:  0o600,
+		MTime: modTime.UnixNano(),
+		ATime: modTime.UnixNano(),
+	}
 }
 
 func (v *Volume) setFileMeta(relative string, meta FileMeta) error {
@@ -926,8 +955,8 @@ func (v *Volume) monitorEncryptSession(token string, ownerPID uint32) {
 }
 
 func callerPID(ctx context.Context) uint32 {
-	if caller, ok := fuse.FromContext(ctx); ok {
-		return platformProcessID(caller.Pid)
+	if caller, ok := fsapi.CallerFromContext(ctx); ok {
+		return platformProcessID(caller.PID)
 	}
 	return 0
 }
@@ -1406,7 +1435,9 @@ func errnoFromError(err error) syscall.Errno {
 		return 0
 	}
 	switch {
-	case errors.Is(err, ErrAuthentication), errors.Is(err, ErrPromptCancelled):
+	case errors.Is(err, ErrPromptCancelled):
+		return syscall.ECANCELED
+	case errors.Is(err, ErrAuthentication):
 		return syscall.EACCES
 	case errors.Is(err, ErrFileTooLarge):
 		return syscall.EFBIG

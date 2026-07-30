@@ -64,6 +64,25 @@ func TestPromptExplicitDescriptionIsPreserved(t *testing.T) {
 	}
 }
 
+func TestBiometricReasonIsARequestedLocalizedAction(t *testing.T) {
+	request := PromptRequest{
+		Path:      "/Users/example/.env",
+		Operation: "read/write",
+	}
+	if got, want := DescribeBiometricReason(
+		request,
+		"it-IT",
+	), "aprire e modificare il file protetto /Users/example/.env"; got != want {
+		t.Fatalf("Italian biometric reason = %q, want %q", got, want)
+	}
+	if got, want := DescribeBiometricReason(
+		request,
+		"en-US",
+	), "open and modify the protected file /Users/example/.env"; got != want {
+		t.Fatalf("English biometric reason = %q, want %q", got, want)
+	}
+}
+
 func TestSanitizeProcessName(t *testing.T) {
 	if got, want := sanitizeProcessName("/usr/bin/no\x1b[31mde\n"), "no[31mde"; got != want {
 		t.Fatalf("sanitizeProcessName = %q, want %q", got, want)

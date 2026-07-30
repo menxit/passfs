@@ -96,7 +96,7 @@ func runTouchIDDisable(args []string, stdout, stderr io.Writer) error {
 	}
 	if err := passfs.DisableTouchID(settings.Vault); err != nil {
 		return fmt.Errorf(
-			"Touch ID is disabled in passfs but its protected identity could not be removed: %w",
+			"touch ID is disabled in passfs but its protected identity could not be removed: %w",
 			err,
 		)
 	}
@@ -133,7 +133,7 @@ func runTouchIDStatus(args []string, stdout, stderr io.Writer) error {
 	)
 	if !configured {
 		return errors.New(
-			"Touch ID is enabled but its protected identity is missing; run \"passfs touchid enable\"",
+			"touch ID is enabled but its protected identity is missing; run \"passfs touchid enable\"",
 		)
 	}
 	return nil
@@ -149,7 +149,7 @@ func runTouchIDVerify(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if !settings.TouchID {
-		return errors.New("Touch ID is disabled")
+		return errors.New("touch ID is disabled")
 	}
 	if err := passfs.VerifyTouchID(context.Background(), settings.Vault); err != nil {
 		return err

@@ -3,22 +3,44 @@
   "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>passfs</string>
+  <string>PassFS</string>
   <key>CFBundleExecutable</key>
-  <string>passfs</string>
+  <string>PassFS</string>
   <key>CFBundleIdentifier</key>
   <string>com.menxit.passfs</string>
   <key>CFBundleIconFile</key>
   <string>PassFS</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>it</string>
+    <string>de</string>
+    <string>fr</string>
+    <string>es</string>
+    <string>pt</string>
+  </array>
   <key>CFBundleName</key>
-  <string>passfs</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
+  <string>PassFS</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
   <key>CFBundleShortVersionString</key>
   <string>0.1.0</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>PassFS Setup</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>passfs</string>
+      </array>
+    </dict>
+  </array>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>

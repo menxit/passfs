@@ -110,6 +110,62 @@ func TestImportFileDoesNotOverwriteSourceWhenTargetExists(t *testing.T) {
 	}
 }
 
+func TestImportFileRecoversInterruptedEmptyTarget(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, ".env")
+	targetPath := filepath.Join(root, "mount", ".env")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plaintext := []byte("TOKEN=new-plaintext\n")
+	if err := os.WriteFile(sourcePath, plaintext, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := importFile(sourcePath, targetPath, 1024)
+	if err != nil {
+		t.Fatalf("importFile: %v", err)
+	}
+	if !result.Imported || !result.LinkCreated {
+		t.Fatalf("import result = %#v", result)
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != string(plaintext) {
+		t.Fatalf("target contents = %q, want %q", got, plaintext)
+	}
+}
+
+func TestImportFilePreservesExistingEmptyTargetForEmptySource(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, ".env")
+	targetPath := filepath.Join(root, "mount", ".env")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := importFile(sourcePath, targetPath, 1024); err == nil {
+		t.Fatal("importFile replaced an ambiguous existing empty target")
+	}
+	if info, err := os.Lstat(targetPath); err != nil || info.Size() != 0 {
+		t.Fatalf("empty target was changed: info=%v err=%v", info, err)
+	}
+	if info, err := os.Lstat(sourcePath); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("empty source was changed: info=%v err=%v", info, err)
+	}
+}
+
 func TestImportFileRejectsHardLinkedSource(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, ".env")

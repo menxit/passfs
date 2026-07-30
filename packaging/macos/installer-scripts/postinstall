@@ -1,7 +1,7 @@
 #!/bin/sh
 
-# Reload an existing per-user service after an upgrade. A first installation
-# has no configuration yet, so there is nothing to start.
+# Reload an existing per-user service after an upgrade, then arrange for the
+# menu app to open only after the user closes Installer.
 console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)
 case "$console_user" in
 	"" | root | loginwindow | _mbsetupuser)
@@ -12,14 +12,43 @@ esac
 user_id=$(/usr/bin/id -u "$console_user" 2>/dev/null || true)
 user_home=$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null |
 	/usr/bin/awk '{ print $2 }')
-if [ -z "$user_id" ] || [ -z "$user_home" ] ||
-	[ ! -f "$user_home/.config/passfs/config.json" ]; then
+if [ -z "$user_id" ] || [ -z "$user_home" ]; then
 	exit 0
 fi
 
+if [ -f "$user_home/.config/passfs/config.json" ]; then
+	/bin/launchctl asuser "$user_id" \
+		/usr/bin/sudo -H -u "$console_user" \
+		/Applications/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli \
+		reload --no-open \
+		>/dev/null 2>&1 || true
+fi
+
+# Ensure upgrades start the newly installed app. PassFSMenu is the executable
+# name used by older packages; PassFS is the current main app executable.
+# Reloading the filesystem before scheduling the app avoids two concurrent
+# initialization requests racing to bootstrap the same LaunchAgent.
+/usr/bin/pkill -x PassFSMenu >/dev/null 2>&1 || true
+/usr/bin/pkill -x PassFS >/dev/null 2>&1 || true
+
+# A transient launchd job survives the installer script and waits until the
+# Installer UI is gone. This keeps the PassFS setup guide behind the package
+# installation instead of covering its final screen.
+postinstall_label=com.menxit.passfs.postinstall
 /bin/launchctl asuser "$user_id" \
 	/usr/bin/sudo -H -u "$console_user" \
-	/Applications/PassFS.app/Contents/MacOS/passfs reload \
+	/bin/launchctl remove "$postinstall_label" \
+	>/dev/null 2>&1 || true
+/bin/launchctl asuser "$user_id" \
+	/usr/bin/sudo -H -u "$console_user" \
+	/bin/launchctl submit -l "$postinstall_label" -- \
+	/bin/sh -c \
+	'while /usr/bin/pgrep -x Installer >/dev/null 2>&1; do
+		/bin/sleep 1
+	done
+	/usr/bin/open /Applications/PassFS.app
+	/bin/launchctl remove com.menxit.passfs.postinstall \
+		>/dev/null 2>&1 || true' \
 	>/dev/null 2>&1 || true
 
 exit 0

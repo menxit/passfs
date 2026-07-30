@@ -9,8 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hanwen/go-fuse/v2/fs"
-	"github.com/hanwen/go-fuse/v2/fuse"
+	"passfs/internal/fsapi"
 )
 
 type OpenFile struct {
@@ -60,6 +59,7 @@ func (v *Volume) openFile(ctx context.Context, relative string, flags uint32) (*
 
 	meta := v.fileMeta(relative, info)
 	var data []byte
+	accessedAt := time.Now().UnixNano()
 	if writable && flags&syscall.O_TRUNC != 0 {
 		if err := v.authorize(ctx, relative, "truncate"); err != nil {
 			return nil, err
@@ -67,6 +67,7 @@ func (v *Volume) openFile(ctx context.Context, relative string, flags uint32) (*
 		data = make([]byte, 0)
 		meta.Size = 0
 		meta.MTime = time.Now().UnixNano()
+		meta.ATime = accessedAt
 	} else {
 		operation := "read"
 		if writable {
@@ -77,6 +78,11 @@ func (v *Volume) openFile(ctx context.Context, relative string, flags uint32) (*
 			return nil, err
 		}
 		meta.Size = uint64(len(data))
+		meta.ATime = accessedAt
+		if err := v.setFileMeta(relative, meta); err != nil {
+			wipe(data)
+			return nil, err
+		}
 	}
 
 	handle := &OpenFile{
@@ -142,12 +148,14 @@ func (v *Volume) createFile(
 	meta := FileMeta{
 		Mode:  mode & 0o777,
 		MTime: time.Now().UnixNano(),
+		ATime: time.Now().UnixNano(),
 	}
 	var data []byte
 	var dirty bool
 
 	if exists {
 		meta = v.fileMeta(relative, info)
+		meta.ATime = time.Now().UnixNano()
 		if flags&syscall.O_TRUNC != 0 {
 			if !writable {
 				return nil, syscall.EACCES
@@ -170,6 +178,10 @@ func (v *Volume) createFile(
 				return nil, err
 			}
 			meta.Size = uint64(len(data))
+			if err := v.setFileMeta(relative, meta); err != nil {
+				wipe(data)
+				return nil, err
+			}
 		}
 	} else {
 		if err := v.authorize(ctx, relative, "create"); err != nil {
@@ -204,30 +216,29 @@ func (v *Volume) createFile(
 }
 
 func (f *OpenFile) Read(
-	ctx context.Context,
+	_ context.Context,
 	destination []byte,
 	offset int64,
-) (fuse.ReadResult, syscall.Errno) {
+) (int, syscall.Errno) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.released {
-		return nil, syscall.EBADF
+		return 0, syscall.EBADF
 	}
 	if offset < 0 {
-		return nil, syscall.EINVAL
+		return 0, syscall.EINVAL
 	}
 	if offset >= int64(len(f.data)) {
-		return fuse.ReadResultData(destination[:0]), 0
+		return 0, 0
 	}
-	count := copy(destination, f.data[offset:])
-	return fuse.ReadResultData(destination[:count]), 0
+	return copy(destination, f.data[offset:]), 0
 }
 
 func (f *OpenFile) Write(
-	ctx context.Context,
+	_ context.Context,
 	data []byte,
 	offset int64,
-) (uint32, syscall.Errno) {
+) (int, syscall.Errno) {
 	overlappingWrite := f.pendingWrites.Add(1) > 1
 	defer f.pendingWrites.Add(-1)
 
@@ -268,20 +279,16 @@ func (f *OpenFile) Write(
 	f.meta.Size = uint64(len(f.data))
 	f.meta.MTime = time.Now().UnixNano()
 	f.dirty = true
-	return uint32(len(data)), 0
+	return len(data), 0
 }
 
-func (f *OpenFile) Flush(ctx context.Context) syscall.Errno {
+func (f *OpenFile) Flush(_ context.Context) syscall.Errno {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.released {
 		return syscall.EBADF
 	}
 	return errnoFromError(f.flushLocked())
-}
-
-func (f *OpenFile) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	return f.Flush(ctx)
 }
 
 func (f *OpenFile) flushLocked() error {
@@ -300,7 +307,7 @@ func (f *OpenFile) flushLocked() error {
 	return nil
 }
 
-func (f *OpenFile) Release(ctx context.Context) syscall.Errno {
+func (f *OpenFile) Close(_ context.Context) syscall.Errno {
 	f.mu.Lock()
 	if f.released {
 		f.mu.Unlock()
@@ -326,46 +333,46 @@ func (f *OpenFile) Release(ctx context.Context) syscall.Errno {
 	return errnoFromError(err)
 }
 
-func (f *OpenFile) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
+func (f *OpenFile) Attributes(
+	_ context.Context,
+) (fsapi.Attributes, syscall.Errno) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.released {
-		return syscall.EBADF
+		return fsapi.Attributes{}, syscall.EBADF
 	}
 	meta := f.meta
 	meta.Size = uint64(len(f.data))
-	fillFileAttr(
-		&out.Attr,
+	return fileAttributes(
 		meta,
 		f.volume.uid,
 		f.volume.gid,
 		stableInode(f.relative),
-	)
-	return 0
+	), 0
 }
 
-func (f *OpenFile) Setattr(
-	ctx context.Context,
-	input *fuse.SetAttrIn,
-	out *fuse.AttrOut,
-) syscall.Errno {
+func (f *OpenFile) SetAttributes(
+	_ context.Context,
+	input fsapi.SetAttributes,
+) (fsapi.Attributes, syscall.Errno) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.released {
-		return syscall.EBADF
+		return fsapi.Attributes{}, syscall.EBADF
 	}
-	if uid, ok := input.GetUID(); ok && uid != f.volume.uid {
-		return syscall.EPERM
+	if input.UID != nil && *input.UID != f.volume.uid {
+		return fsapi.Attributes{}, syscall.EPERM
 	}
-	if gid, ok := input.GetGID(); ok && gid != f.volume.gid {
-		return syscall.EPERM
+	if input.GID != nil && *input.GID != f.volume.gid {
+		return fsapi.Attributes{}, syscall.EPERM
 	}
-	if size, ok := input.GetSize(); ok {
+	if input.Size != nil {
 		if !f.writable {
-			return syscall.EBADF
+			return fsapi.Attributes{}, syscall.EBADF
 		}
+		size := *input.Size
 		if size > uint64(f.volume.maxFileSize) {
-			return syscall.EFBIG
+			return fsapi.Attributes{}, syscall.EFBIG
 		}
 		if size < uint64(len(f.data)) {
 			wipe(f.data[size:])
@@ -377,32 +384,26 @@ func (f *OpenFile) Setattr(
 		f.meta.MTime = time.Now().UnixNano()
 		f.dirty = true
 	}
-	if mode, ok := input.GetMode(); ok {
-		f.meta.Mode = mode & 0o777
+	if input.Mode != nil {
+		f.meta.Mode = *input.Mode & 0o777
 		f.dirty = true
 	}
-	if mtime, ok := input.GetMTime(); ok {
-		f.meta.MTime = mtime.UnixNano()
+	if input.ModifyTime != nil {
+		f.meta.MTime = input.ModifyTime.UnixNano()
+		f.dirty = true
+	}
+	if input.AccessTime != nil {
+		f.meta.ATime = input.AccessTime.UnixNano()
 		f.dirty = true
 	}
 	meta := f.meta
 	meta.Size = uint64(len(f.data))
-	fillFileAttr(
-		&out.Attr,
+	return fileAttributes(
 		meta,
 		f.volume.uid,
 		f.volume.gid,
 		stableInode(f.relative),
-	)
-	return 0
+	), 0
 }
 
-var (
-	_ fs.FileReader    = (*OpenFile)(nil)
-	_ fs.FileWriter    = (*OpenFile)(nil)
-	_ fs.FileFlusher   = (*OpenFile)(nil)
-	_ fs.FileFsyncer   = (*OpenFile)(nil)
-	_ fs.FileReleaser  = (*OpenFile)(nil)
-	_ fs.FileGetattrer = (*OpenFile)(nil)
-	_ fs.FileSetattrer = (*OpenFile)(nil)
-)
+var _ fsapi.Handle = (*OpenFile)(nil)

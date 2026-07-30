@@ -1,0 +1,6 @@
+#ifndef PASSFS_FILE_SYSTEM_BRIDGING_HEADER_H
+#define PASSFS_FILE_SYSTEM_BRIDGING_HEADER_H
+
+#include "../PassFSBridge.h"
+
+#endif

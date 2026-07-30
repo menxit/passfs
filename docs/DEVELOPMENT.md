@@ -3,7 +3,8 @@
 ## Requirements
 
 - Go 1.26.5 or later
-- macOS: macFUSE
+- macOS: Xcode 26 with the macOS 26 SDK for the native FSKit frontend
+- macOS: macFUSE only for testing the compatibility frontend
 - Linux: FUSE
 
 ## Test the server password UI
@@ -31,7 +32,6 @@ The complete mount flow can also be tested:
 
 ```sh
 passfs init
-passfs mount
 passfs status
 ```
 
@@ -52,9 +52,30 @@ Run the normal verification suite:
 make check
 ```
 
-`make check` runs the tests, `go vet`, and a build. Use `make test-race`
-manually when investigating concurrency changes; it is not part of the release
-workflow.
+`make check` runs the tests, `go vet`, and a build. On macOS it also builds the
+macOS app UI, Go-to-Swift bridge, and FSKit extension, then validates the
+extension metadata. Use `make test-race` manually when investigating
+concurrency changes; it is not part of the release workflow.
+
+The filesystem engine is exposed through `internal/fsapi`. Platform code lives
+in independent adapters:
+
+- `internal/fuseadapter` translates `fsapi` to go-fuse;
+- `native/fskit` and `cmd/passfs-fskit-bridge` translate the same contract to
+  Apple FSKit.
+
+New frontends should implement the neutral `fsapi.FileSystem` boundary and add
+their mount lifecycle through `filesystemAdapter`. The adapter also declares
+whether caller process sessions are available and owns protected-link
+registration. Native types must not leak into `internal/passfs`.
+
+The FSKit extension is sandboxed to its path resource. Its adapter therefore
+validates project-side links in the CLI and updates vault metadata under
+`metadata.lock`; every `Volume` metadata mutation takes the same inter-process
+lock and merges the latest on-disk state. Continuous project-side link
+move/deletion tracking is still FUSE-only because safely coordinating backing
+file namespace operations across the service and extension requires a
+dedicated companion control channel.
 
 On macOS, `make install` is a maintainer-oriented target because a Touch
 ID-capable app must be signed with the passfs Developer ID identity and

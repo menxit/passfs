@@ -18,6 +18,7 @@ type Settings struct {
 	MountPoint string `json:"mountPoint"`
 	UnlockFor  string `json:"unlockFor"`
 	TouchID    bool   `json:"touchId,omitempty"`
+	Adapter    string `json:"adapter,omitempty"`
 
 	path string
 }
@@ -110,6 +111,7 @@ func LoadSettings(path string) (*Settings, error) {
 	}
 	settings.UnlockFor = disk.UnlockFor
 	settings.TouchID = disk.TouchID
+	settings.Adapter = disk.Adapter
 	if _, err := settings.UnlockDuration(); err != nil {
 		return nil, err
 	}

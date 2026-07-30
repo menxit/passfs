@@ -7,6 +7,8 @@
   <string>__TEAM_IDENTIFIER__.com.menxit.passfs</string>
   <key>com.apple.developer.team-identifier</key>
   <string>__TEAM_IDENTIFIER__</string>
+  <key>com.apple.developer.fskit.mount</key>
+  <true/>
   <key>keychain-access-groups</key>
   <array>
     <string>__TEAM_IDENTIFIER__.com.menxit.passfs</string>

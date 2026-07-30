@@ -34,6 +34,7 @@ int passfs_touchid_delete(const char *identifier, char **error_message);
 int passfs_touchid_exists(const char *identifier, char **error_message);
 int passfs_touchid_prepare_ui(char **error_message);
 int passfs_touchid_parent_is_trusted(int parent_pid, char **error_message);
+int passfs_touchid_prefers_italian(void);
 void passfs_free_secret(unsigned char *secret, long length);
 */
 import "C"
@@ -53,8 +54,8 @@ import (
 const touchIDRightPrefix = "com.menxit.passfs.identity."
 
 var (
-	ErrTouchIDNotConfigured  = errors.New("Touch ID is not configured for this passfs volume")
-	ErrTouchIDAuthentication = errors.New("Touch ID authentication failed")
+	ErrTouchIDNotConfigured  = errors.New("touch ID is not configured for this passfs volume")
+	ErrTouchIDAuthentication = errors.New("touch ID authentication failed")
 	ErrTouchIDInProgress     = errors.New("another Touch ID authorization is already in progress")
 )
 
@@ -118,7 +119,7 @@ func (p *TouchIDPrompter) Prompt(
 	context.Context,
 	PromptRequest,
 ) (string, error) {
-	return "", errors.New("Touch ID provides an age identity, not a passphrase")
+	return "", errors.New("touch ID provides an age identity, not a passphrase")
 }
 
 func (p *TouchIDPrompter) PromptIdentity(
@@ -149,7 +150,7 @@ func (p *TouchIDPrompter) PromptIdentity(
 	result := make(chan copyResult)
 	abandoned := make(chan struct{})
 	go func() {
-		secret, err := p.copyIdentity(p.volumeID, DescribePrompt(request))
+		secret, err := p.copyIdentity(p.volumeID, describeTouchIDReason(request))
 		p.mu.Lock()
 		p.active = false
 		p.mu.Unlock()
@@ -181,7 +182,7 @@ func (p *TouchIDPrompter) PromptIdentity(
 	defer wipe(secret)
 	identity, err := age.ParseX25519Identity(strings.TrimSpace(string(secret)))
 	if err != nil || identity.Recipient().String() != p.recipient {
-		return nil, errors.New("Touch ID identity does not match the passfs volume")
+		return nil, errors.New("touch ID identity does not match the passfs volume")
 	}
 	return identity, nil
 }
@@ -243,7 +244,7 @@ func VerifyTouchID(ctx context.Context, cipherDir string) error {
 	}
 	identityPrompter, ok := prompter.(IdentityPrompter)
 	if !ok {
-		return errors.New("Touch ID identity prompter is unavailable")
+		return errors.New("touch ID identity prompter is unavailable")
 	}
 	_, err = identityPrompter.PromptIdentity(ctx, PromptRequest{
 		Path:        cipherDir,
@@ -261,7 +262,7 @@ func PrepareTouchIDUI() error {
 
 func ValidateTouchIDHelperParent(parentPID int) error {
 	if parentPID <= 1 {
-		return errors.New("Touch ID helper requires a passfs service parent")
+		return errors.New("touch ID helper requires a passfs service parent")
 	}
 	var errorMessage *C.char
 	status := C.passfs_touchid_parent_is_trusted(
@@ -283,9 +284,17 @@ func TouchIDIdentity(cipherDir, reason string) (*age.X25519Identity, error) {
 	defer wipe(secret)
 	identity, err := age.ParseX25519Identity(strings.TrimSpace(string(secret)))
 	if err != nil || identity.Recipient().String() != public.Recipient {
-		return nil, errors.New("Touch ID identity does not match the passfs volume")
+		return nil, errors.New("touch ID identity does not match the passfs volume")
 	}
 	return identity, nil
+}
+
+func describeTouchIDReason(request PromptRequest) string {
+	language := "en"
+	if C.passfs_touchid_prefers_italian() != 0 {
+		language = "it"
+	}
+	return DescribeBiometricReason(request, language)
 }
 
 func storeTouchIDIdentity(
@@ -293,7 +302,7 @@ func storeTouchIDIdentity(
 	identity *age.X25519Identity,
 ) error {
 	if identity.Recipient().String() != public.Recipient {
-		return errors.New("Touch ID identity does not match the passfs volume")
+		return errors.New("touch ID identity does not match the passfs volume")
 	}
 	secret := []byte(identity.String())
 	defer wipe(secret)
@@ -383,7 +392,7 @@ func requireTouchIDAvailable() error {
 		errorMessage,
 		"Touch ID is unavailable or has no enrolled fingerprints",
 	)
-	return fmt.Errorf("Touch ID is unavailable: %s", description)
+	return fmt.Errorf("touch ID is unavailable: %s", description)
 }
 
 func touchIDStatusError(status C.int, message *C.char) error {
@@ -405,7 +414,7 @@ func touchIDStatusError(status C.int, message *C.char) error {
 	case C.PASSFS_TOUCHID_MISSING_ENTITLEMENT:
 		return fmt.Errorf("%w: %s", ErrTouchIDUnsupportedBuild, description)
 	default:
-		return fmt.Errorf("Touch ID error: %s", description)
+		return fmt.Errorf("touch ID error: %s", description)
 	}
 }
 

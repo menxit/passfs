@@ -32,7 +32,8 @@ type plaintextDestination struct {
 
 // UnprotectAll materializes every protected file at its original absolute
 // path. A ciphertext is removed only after its plaintext has been durably
-// installed. Callers must stop the FUSE service before invoking this method.
+// installed. Callers must stop the filesystem service before invoking this
+// method.
 func (v *Volume) UnprotectAll(
 	ctx context.Context,
 	forbiddenRoots []string,
@@ -58,7 +59,7 @@ func (v *Volume) UnprotectAll(
 
 // UnprotectFile materializes one protected file at its original absolute path.
 // A ciphertext is removed only after its plaintext has been durably installed.
-// Callers must stop the FUSE service before invoking this method.
+// Callers must stop the filesystem service before invoking this method.
 func (v *Volume) UnprotectFile(
 	ctx context.Context,
 	sourcePath string,

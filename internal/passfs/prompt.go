@@ -214,6 +214,51 @@ func promptAction(operation string) string {
 	}
 }
 
+// DescribeBiometricReason returns a verb phrase because macOS places it after
+// its own localized "<app> is trying to" text in the Touch ID window.
+func DescribeBiometricReason(request PromptRequest, language string) string {
+	italian := strings.HasPrefix(strings.ToLower(language), "it")
+	operation := strings.TrimSpace(strings.ToLower(request.Operation))
+	path := strings.TrimSpace(request.Path)
+
+	var action string
+	if italian {
+		switch operation {
+		case "create", "encrypt":
+			action = "proteggere con PassFS il file"
+		case "read":
+			action = "aprire il file protetto"
+		case "read/write":
+			action = "aprire e modificare il file protetto"
+		case "truncate", "write", "edit":
+			action = "modificare il file protetto"
+		case "verify touch id":
+			return "verificare Touch ID per PassFS"
+		default:
+			action = "accedere al file protetto"
+		}
+	} else {
+		switch operation {
+		case "create", "encrypt":
+			action = "protect the file with PassFS"
+		case "read":
+			action = "open the protected file"
+		case "read/write":
+			action = "open and modify the protected file"
+		case "truncate", "write", "edit":
+			action = "modify the protected file"
+		case "verify touch id":
+			return "verify Touch ID for PassFS"
+		default:
+			action = "access the protected file"
+		}
+	}
+	if path == "" {
+		return action
+	}
+	return action + " " + path
+}
+
 func sendAssuanCommand(stdin io.Writer, scanner *bufio.Scanner, command string) (string, error) {
 	if _, err := io.WriteString(stdin, command+"\n"); err != nil {
 		return "", err

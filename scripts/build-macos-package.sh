@@ -66,7 +66,7 @@ trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$payload/Applications" "$payload/usr/local/bin"
 ditto "$source_app" "$payload/Applications/PassFS.app"
-ln -s /Applications/PassFS.app/Contents/MacOS/passfs \
+ln -s /Applications/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli \
 	"$payload/usr/local/bin/passfs"
 
 package_version=${release_version%%-*}

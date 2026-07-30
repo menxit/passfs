@@ -10,34 +10,27 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hanwen/go-fuse/v2/fs"
-	"github.com/hanwen/go-fuse/v2/fuse"
+	"passfs/internal/fsapi"
 )
 
-type Node struct {
-	fs.Inode
+// FileSystem exposes a Volume through the adapter-neutral fsapi contract.
+// Platform adapters own mount lifecycle and translate their native request
+// types into calls on this value.
+type FileSystem struct {
 	volume *Volume
-	isDir  bool
 }
 
-func NewRootNode(volume *Volume) *Node {
-	return &Node{volume: volume, isDir: true}
+// NewFileSystem creates the adapter-neutral view of a loaded encrypted volume.
+func NewFileSystem(volume *Volume) *FileSystem {
+	return &FileSystem{volume: volume}
 }
 
-func (n *Node) relativePath() string {
-	relative := n.Path(n.Root())
-	if relative == "." {
-		return ""
-	}
-	return filepath.Clean(relative)
-}
-
-func (n *Node) childPath(name string) (string, error) {
+func childPath(parent, name string) (string, error) {
 	if err := validateName(name); err != nil {
 		return "", err
 	}
-	if relative := n.relativePath(); relative != "" {
-		return filepath.Join(relative, name), nil
+	if parent != "" {
+		return filepath.Join(parent, name), nil
 	}
 	return name, nil
 }
@@ -59,44 +52,99 @@ func stableInode(relative string) uint64 {
 	return inode
 }
 
-func (n *Node) Lookup(
-	ctx context.Context,
-	name string,
-	out *fuse.EntryOut,
-) (*fs.Inode, syscall.Errno) {
-	relative, err := n.childPath(name)
-	if err != nil {
-		return nil, syscall.ENOENT
+var reservedRootMetadataNames = map[string]struct{}{
+	".DocumentRevisions-V100":             {},
+	".Spotlight-V100":                     {},
+	".TemporaryItems":                     {},
+	".Trash":                              {},
+	".Trashes":                            {},
+	".fseventsd":                          {},
+	".metadata_never_index":               {},
+	".metadata_never_index_unless_rootfs": {},
+	".vol":                                {},
+	".xdg-volume-info":                    {},
+	"System Volume Information":           {},
+	"lost+found":                          {},
+}
+
+// isReservedFilesystemMetadataPath identifies files created or probed by the
+// host operating system for volume bookkeeping. They are not user secrets and
+// must never enter the protected namespace or trigger authorization.
+func isReservedFilesystemMetadataPath(relative string) bool {
+	clean := filepath.Clean(relative)
+	if clean == "." || clean == "" {
+		return false
+	}
+	components := strings.Split(filepath.ToSlash(clean), "/")
+	first := components[0]
+	if _, reserved := reservedRootMetadataNames[first]; reserved {
+		return true
+	}
+	if strings.HasPrefix(first, ".com.apple.timemachine.") ||
+		strings.HasPrefix(first, ".Trash-") {
+		return true
+	}
+	for _, component := range components {
+		if component == ".DS_Store" || strings.HasPrefix(component, "._") {
+			return true
+		}
+	}
+	return false
+}
+
+func isReservedStorageMetadataPath(storage string) bool {
+	relative, err := filepath.Rel("files", filepath.Clean(storage))
+	if err != nil || relative == "." ||
+		relative == ".." ||
+		strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return false
+	}
+	return isReservedFilesystemMetadataPath(relative)
+}
+
+func (f *FileSystem) Lookup(
+	_ context.Context,
+	relative string,
+) (fsapi.Entry, syscall.Errno) {
+	if err := validateRelativePath(relative); err != nil {
+		return fsapi.Entry{}, syscall.ENOENT
+	}
+	if isReservedFilesystemMetadataPath(relative) {
+		return fsapi.Entry{}, syscall.ENOENT
 	}
 	storage := storagePath(relative)
-	isDirectory, info, err := n.volume.virtualType(storage)
+	isDirectory, info, err := f.volume.virtualType(storage)
+	if err != nil {
+		return fsapi.Entry{}, errnoFromError(err)
+	}
+	attributes := fileAttributes(
+		f.volume.fileMeta(storage, info),
+		f.volume.uid,
+		f.volume.gid,
+		stableInode(storage),
+	)
+	if isDirectory {
+		attributes = directoryAttributes(info, stableInode(storage))
+	}
+	return fsapi.Entry{Path: relative, Attributes: attributes}, 0
+}
+
+func (f *FileSystem) ReadDirectory(
+	_ context.Context,
+	relative string,
+) ([]fsapi.DirectoryEntry, syscall.Errno) {
+	if err := validateRelativePath(relative); err != nil {
+		return nil, syscall.EINVAL
+	}
+	storage := storagePath(relative)
+	isDirectory, _, err := f.volume.virtualType(storage)
 	if err != nil {
 		return nil, errnoFromError(err)
 	}
-
-	child := &Node{volume: n.volume, isDir: isDirectory}
-	inode := stableInode(storage)
-	stable := fs.StableAttr{Mode: fuse.S_IFREG, Ino: inode}
-	if isDirectory {
-		stable.Mode = fuse.S_IFDIR
-		fillDirectoryAttr(&out.Attr, info, inode)
-	} else {
-		fillFileAttr(
-			&out.Attr,
-			n.volume.fileMeta(storage, info),
-			n.volume.uid,
-			n.volume.gid,
-			inode,
-		)
-	}
-	return n.NewInode(ctx, child, stable), 0
-}
-
-func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	if !n.isDir {
+	if !isDirectory {
 		return nil, syscall.ENOTDIR
 	}
-	path, err := n.volume.directoryPath(storagePath(n.relativePath()))
+	path, err := f.volume.directoryPath(storage)
 	if err != nil {
 		return nil, errnoFromError(err)
 	}
@@ -105,7 +153,7 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		return nil, errnoFromError(err)
 	}
 
-	virtualEntries := make([]fuse.DirEntry, 0, len(entries))
+	virtualEntries := make([]fsapi.DirectoryEntry, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
 		switch {
@@ -115,229 +163,232 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 			if strings.HasSuffix(name, encryptedSuffix) {
 				continue
 			}
-			virtualEntries = append(virtualEntries, fuse.DirEntry{
-				Name: name,
-				Mode: fuse.S_IFDIR,
+			if isReservedFilesystemMetadataPath(filepath.Join(relative, name)) {
+				continue
+			}
+			virtualEntries = append(virtualEntries, fsapi.DirectoryEntry{
+				Name:  name,
+				Type:  fsapi.TypeDirectory,
+				Inode: stableInode(filepath.Join(storage, name)),
 			})
 		case entry.Type().IsRegular() && strings.HasSuffix(name, encryptedSuffix):
-			virtualEntries = append(virtualEntries, fuse.DirEntry{
-				Name: strings.TrimSuffix(name, encryptedSuffix),
-				Mode: fuse.S_IFREG,
+			virtualName := strings.TrimSuffix(name, encryptedSuffix)
+			if isReservedFilesystemMetadataPath(
+				filepath.Join(relative, virtualName),
+			) {
+				continue
+			}
+			virtualEntries = append(virtualEntries, fsapi.DirectoryEntry{
+				Name:  virtualName,
+				Type:  fsapi.TypeFile,
+				Inode: stableInode(filepath.Join(storage, virtualName)),
 			})
 		}
 	}
-	return fs.NewListDirStream(virtualEntries), 0
+	return virtualEntries, 0
 }
 
-func (n *Node) Getattr(
+func (f *FileSystem) GetAttributes(
 	ctx context.Context,
-	handle fs.FileHandle,
-	out *fuse.AttrOut,
-) syscall.Errno {
+	relative string,
+	handle fsapi.Handle,
+) (fsapi.Attributes, syscall.Errno) {
 	if handle != nil {
-		if getter, ok := handle.(fs.FileGetattrer); ok {
-			return getter.Getattr(ctx, out)
-		}
+		return handle.Attributes(ctx)
 	}
-
-	relative := n.relativePath()
-	storage := storagePath(relative)
-	if n.isDir {
-		path, err := n.volume.directoryPath(storage)
-		if err != nil {
-			return errnoFromError(err)
-		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			return errnoFromError(err)
-		}
-		fillDirectoryAttr(&out.Attr, info, stableInode(storage))
-		return 0
-	}
-
-	path, err := n.volume.encryptedPath(storage)
-	if err != nil {
-		return errnoFromError(err)
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return errnoFromError(err)
-	}
-	fillFileAttr(
-		&out.Attr,
-		n.volume.fileMeta(storage, info),
-		n.volume.uid,
-		n.volume.gid,
-		stableInode(storage),
-	)
-	return 0
+	entry, errno := f.Lookup(ctx, relative)
+	return entry.Attributes, errno
 }
 
-func (n *Node) Open(
+func (f *FileSystem) Open(
 	ctx context.Context,
+	relative string,
 	flags uint32,
-) (fs.FileHandle, uint32, syscall.Errno) {
-	if n.isDir {
-		return nil, 0, syscall.EISDIR
+) (fsapi.Handle, syscall.Errno) {
+	entry, errno := f.Lookup(ctx, relative)
+	if errno != 0 {
+		return nil, errno
 	}
-	handle, err := n.volume.openFile(ctx, storagePath(n.relativePath()), flags)
+	if entry.Attributes.Type == fsapi.TypeDirectory {
+		return nil, syscall.EISDIR
+	}
+	handle, err := f.volume.openFile(ctx, storagePath(relative), flags)
 	if err != nil {
-		return nil, 0, errnoFromError(err)
+		return nil, errnoFromError(err)
 	}
-	return handle, fuse.FOPEN_DIRECT_IO, 0
+	return handle, 0
 }
 
-func (n *Node) Create(
+func (f *FileSystem) Create(
 	ctx context.Context,
+	parent string,
 	name string,
 	flags uint32,
 	mode uint32,
-	out *fuse.EntryOut,
-) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	if !n.isDir {
-		return nil, nil, 0, syscall.ENOTDIR
+) (fsapi.Entry, fsapi.Handle, syscall.Errno) {
+	parentEntry, errno := f.Lookup(ctx, parent)
+	if errno != 0 {
+		return fsapi.Entry{}, nil, errno
 	}
-	relative, err := n.childPath(name)
+	if parentEntry.Attributes.Type != fsapi.TypeDirectory {
+		return fsapi.Entry{}, nil, syscall.ENOTDIR
+	}
+	relative, err := childPath(parent, name)
 	if err != nil {
-		return nil, nil, 0, syscall.EINVAL
+		return fsapi.Entry{}, nil, syscall.EINVAL
 	}
-	handle, err := n.volume.createFile(ctx, storagePath(relative), flags, mode)
+	if isReservedFilesystemMetadataPath(relative) {
+		return fsapi.Entry{}, nil, syscall.EPERM
+	}
+	handle, err := f.volume.createFile(ctx, storagePath(relative), flags, mode)
 	if err != nil {
-		return nil, nil, 0, errnoFromError(err)
+		return fsapi.Entry{}, nil, errnoFromError(err)
 	}
-
-	child := &Node{volume: n.volume}
-	inode := n.NewInode(ctx, child, fs.StableAttr{
-		Mode: fuse.S_IFREG,
-		Ino:  stableInode(storagePath(relative)),
-	})
-	var attributes fuse.AttrOut
-	if errno := handle.Getattr(ctx, &attributes); errno != 0 {
-		_ = handle.Release(ctx)
-		return nil, nil, 0, errno
+	attributes, errno := handle.Attributes(ctx)
+	if errno != 0 {
+		_ = handle.Close(ctx)
+		return fsapi.Entry{}, nil, errno
 	}
-	out.Attr = attributes.Attr
-	return inode, handle, fuse.FOPEN_DIRECT_IO, 0
+	return fsapi.Entry{Path: relative, Attributes: attributes}, handle, 0
 }
 
-func (n *Node) Mkdir(
+func (f *FileSystem) MakeDirectory(
 	ctx context.Context,
+	parent string,
 	name string,
 	mode uint32,
-	out *fuse.EntryOut,
-) (*fs.Inode, syscall.Errno) {
-	if !n.isDir {
-		return nil, syscall.ENOTDIR
+) (fsapi.Entry, syscall.Errno) {
+	parentEntry, errno := f.Lookup(ctx, parent)
+	if errno != 0 {
+		return fsapi.Entry{}, errno
+	}
+	if parentEntry.Attributes.Type != fsapi.TypeDirectory {
+		return fsapi.Entry{}, syscall.ENOTDIR
 	}
 	if strings.HasSuffix(name, encryptedSuffix) {
-		return nil, syscall.EINVAL
+		return fsapi.Entry{}, syscall.EINVAL
 	}
-	relative, err := n.childPath(name)
+	relative, err := childPath(parent, name)
 	if err != nil {
-		return nil, syscall.EINVAL
+		return fsapi.Entry{}, syscall.EINVAL
+	}
+	if isReservedFilesystemMetadataPath(relative) {
+		return fsapi.Entry{}, syscall.EPERM
 	}
 	storage := storagePath(relative)
-	unlock, ok := n.volume.tryNamespaceLock()
+	unlock, ok := f.volume.tryNamespaceLock()
 	if !ok {
-		return nil, syscall.EBUSY
+		return fsapi.Entry{}, syscall.EBUSY
 	}
 	defer unlock()
 
-	if _, _, err := n.volume.virtualType(storage); err == nil {
-		return nil, syscall.EEXIST
+	if _, _, err := f.volume.virtualType(storage); err == nil {
+		return fsapi.Entry{}, syscall.EEXIST
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, errnoFromError(err)
+		return fsapi.Entry{}, errnoFromError(err)
 	}
-	path, err := n.volume.directoryPath(storage)
+	path, err := f.volume.directoryPath(storage)
 	if err != nil {
-		return nil, errnoFromError(err)
+		return fsapi.Entry{}, errnoFromError(err)
 	}
 	if err := os.Mkdir(path, os.FileMode(mode&0o777)); err != nil {
-		return nil, errnoFromError(err)
+		return fsapi.Entry{}, errnoFromError(err)
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		_ = os.Remove(path)
-		return nil, errnoFromError(err)
+		return fsapi.Entry{}, errnoFromError(err)
 	}
-	inodeNumber := stableInode(storage)
-	fillDirectoryAttr(&out.Attr, info, inodeNumber)
-	child := &Node{volume: n.volume, isDir: true}
-	return n.NewInode(ctx, child, fs.StableAttr{
-		Mode: fuse.S_IFDIR,
-		Ino:  inodeNumber,
-	}), 0
+	return fsapi.Entry{
+		Path:       relative,
+		Attributes: directoryAttributes(info, stableInode(storage)),
+	}, 0
 }
 
-func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
-	relative, err := n.childPath(name)
+func (f *FileSystem) Unlink(
+	_ context.Context,
+	parent string,
+	name string,
+) syscall.Errno {
+	relative, err := childPath(parent, name)
 	if err != nil {
 		return syscall.EINVAL
 	}
+	if isReservedFilesystemMetadataPath(relative) {
+		return syscall.EPERM
+	}
 	storage := storagePath(relative)
-	unlock, ok := n.volume.tryNamespaceLock()
+	unlock, ok := f.volume.tryNamespaceLock()
 	if !ok {
 		return syscall.EBUSY
 	}
 	defer unlock()
 
-	isDirectory, _, err := n.volume.virtualType(storage)
+	isDirectory, _, err := f.volume.virtualType(storage)
 	if err != nil {
 		return errnoFromError(err)
 	}
 	if isDirectory {
 		return syscall.EISDIR
 	}
-	return errnoFromError(n.volume.removeProtectedFileLocked(storage))
+	return errnoFromError(f.volume.removeProtectedFileLocked(storage))
 }
 
-func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
-	relative, err := n.childPath(name)
+func (f *FileSystem) RemoveDirectory(
+	_ context.Context,
+	parent string,
+	name string,
+) syscall.Errno {
+	relative, err := childPath(parent, name)
 	if err != nil {
 		return syscall.EINVAL
 	}
+	if isReservedFilesystemMetadataPath(relative) {
+		return syscall.EPERM
+	}
 	storage := storagePath(relative)
-	unlock, ok := n.volume.tryNamespaceLock()
+	unlock, ok := f.volume.tryNamespaceLock()
 	if !ok {
 		return syscall.EBUSY
 	}
 	defer unlock()
 
-	isDirectory, _, err := n.volume.virtualType(storage)
+	isDirectory, _, err := f.volume.virtualType(storage)
 	if err != nil {
 		return errnoFromError(err)
 	}
 	if !isDirectory {
 		return syscall.ENOTDIR
 	}
-	path, err := n.volume.directoryPath(storage)
+	path, err := f.volume.directoryPath(storage)
 	if err != nil {
 		return errnoFromError(err)
 	}
 	return errnoFromError(os.Remove(path))
 }
 
-func (n *Node) Rename(
-	ctx context.Context,
-	name string,
-	newParent fs.InodeEmbedder,
+func (f *FileSystem) Rename(
+	_ context.Context,
+	oldParent string,
+	oldName string,
+	newParent string,
 	newName string,
 	flags uint32,
 ) syscall.Errno {
 	if flags != 0 {
 		return syscall.ENOTSUP
 	}
-	targetParent, ok := newParent.(*Node)
-	if !ok || targetParent.volume != n.volume {
-		return syscall.EXDEV
-	}
-	oldRelative, err := n.childPath(name)
+	oldRelative, err := childPath(oldParent, oldName)
 	if err != nil {
 		return syscall.EINVAL
 	}
-	newRelative, err := targetParent.childPath(newName)
+	newRelative, err := childPath(newParent, newName)
 	if err != nil {
 		return syscall.EINVAL
+	}
+	if isReservedFilesystemMetadataPath(oldRelative) ||
+		isReservedFilesystemMetadataPath(newRelative) {
+		return syscall.EPERM
 	}
 	if oldRelative == newRelative {
 		return 0
@@ -345,20 +396,20 @@ func (n *Node) Rename(
 	oldStorage := storagePath(oldRelative)
 	newStorage := storagePath(newRelative)
 
-	unlock, ok := n.volume.tryNamespaceLock()
+	unlock, ok := f.volume.tryNamespaceLock()
 	if !ok {
 		return syscall.EBUSY
 	}
 	defer unlock()
 
-	isDirectory, _, err := n.volume.virtualType(oldStorage)
+	isDirectory, _, err := f.volume.virtualType(oldStorage)
 	if err != nil {
 		return errnoFromError(err)
 	}
 	if isDirectory && strings.HasSuffix(newName, encryptedSuffix) {
 		return syscall.EINVAL
 	}
-	if targetDirectory, _, targetErr := n.volume.virtualType(newStorage); targetErr == nil {
+	if targetDirectory, _, targetErr := f.volume.virtualType(newStorage); targetErr == nil {
 		if isDirectory && !targetDirectory {
 			return syscall.ENOTDIR
 		}
@@ -371,14 +422,14 @@ func (n *Node) Rename(
 
 	var oldPath, newPath string
 	if isDirectory {
-		oldPath, err = n.volume.directoryPath(oldStorage)
+		oldPath, err = f.volume.directoryPath(oldStorage)
 		if err == nil {
-			newPath, err = n.volume.directoryPath(newStorage)
+			newPath, err = f.volume.directoryPath(newStorage)
 		}
 	} else {
-		oldPath, err = n.volume.encryptedPath(oldStorage)
+		oldPath, err = f.volume.encryptedPath(oldStorage)
 		if err == nil {
-			newPath, err = n.volume.encryptedPath(newStorage)
+			newPath, err = f.volume.encryptedPath(newStorage)
 		}
 	}
 	if err != nil {
@@ -387,140 +438,146 @@ func (n *Node) Rename(
 	if err := os.Rename(oldPath, newPath); err != nil {
 		return errnoFromError(err)
 	}
-	return errnoFromError(n.volume.renameMetadata(oldStorage, newStorage, isDirectory))
+	return errnoFromError(f.volume.renameMetadata(oldStorage, newStorage, isDirectory))
 }
 
-func (n *Node) Setattr(
+func (f *FileSystem) SetAttributes(
 	ctx context.Context,
-	handle fs.FileHandle,
-	input *fuse.SetAttrIn,
-	out *fuse.AttrOut,
-) syscall.Errno {
-	if setter, ok := handle.(fs.FileSetattrer); ok && setter != nil {
-		return setter.Setattr(ctx, input, out)
+	relative string,
+	handle fsapi.Handle,
+	input fsapi.SetAttributes,
+) (fsapi.Attributes, syscall.Errno) {
+	if handle != nil {
+		return handle.SetAttributes(ctx, input)
 	}
-	if uid, ok := input.GetUID(); ok && uid != n.volume.uid {
-		return syscall.EPERM
+	if input.UID != nil && *input.UID != f.volume.uid {
+		return fsapi.Attributes{}, syscall.EPERM
 	}
-	if gid, ok := input.GetGID(); ok && gid != n.volume.gid {
-		return syscall.EPERM
+	if input.GID != nil && *input.GID != f.volume.gid {
+		return fsapi.Attributes{}, syscall.EPERM
 	}
 
-	relative := n.relativePath()
+	entry, errno := f.Lookup(ctx, relative)
+	if errno != 0 {
+		return fsapi.Attributes{}, errno
+	}
 	storage := storagePath(relative)
-	if n.isDir {
-		path, err := n.volume.directoryPath(storage)
+	if entry.Attributes.Type == fsapi.TypeDirectory {
+		path, err := f.volume.directoryPath(storage)
 		if err != nil {
-			return errnoFromError(err)
+			return fsapi.Attributes{}, errnoFromError(err)
 		}
-		if mode, ok := input.GetMode(); ok {
-			if err := os.Chmod(path, os.FileMode(mode&0o777)); err != nil {
-				return errnoFromError(err)
+		if input.Mode != nil {
+			if err := os.Chmod(path, os.FileMode(*input.Mode&0o777)); err != nil {
+				return fsapi.Attributes{}, errnoFromError(err)
 			}
 		}
-		mtime, mtimeSet := input.GetMTime()
-		atime, atimeSet := input.GetATime()
-		if mtimeSet || atimeSet {
+		if input.ModifyTime != nil || input.AccessTime != nil {
 			info, err := os.Stat(path)
 			if err != nil {
-				return errnoFromError(err)
+				return fsapi.Attributes{}, errnoFromError(err)
 			}
-			if !mtimeSet {
-				mtime = info.ModTime()
+			mtime := info.ModTime()
+			atime := info.ModTime()
+			if input.ModifyTime != nil {
+				mtime = *input.ModifyTime
 			}
-			if !atimeSet {
-				atime = info.ModTime()
+			if input.AccessTime != nil {
+				atime = *input.AccessTime
 			}
 			if err := os.Chtimes(path, atime, mtime); err != nil {
-				return errnoFromError(err)
+				return fsapi.Attributes{}, errnoFromError(err)
 			}
 		}
-		return n.Getattr(ctx, nil, out)
+		return f.GetAttributes(ctx, relative, nil)
 	}
 
-	if openHandle := n.volume.writableOpenHandle(
-		storage,
-		callerPID(ctx),
-	); openHandle != nil {
-		return openHandle.Setattr(ctx, input, out)
+	if openHandle := f.volume.writableOpenHandle(storage, callerPID(ctx)); openHandle != nil {
+		return openHandle.SetAttributes(ctx, input)
 	}
 
-	if _, resize := input.GetSize(); resize {
-		handle, err := n.volume.openFile(ctx, storage, syscall.O_RDWR)
+	if input.Size != nil {
+		openHandle, err := f.volume.openFile(ctx, storage, syscall.O_RDWR)
 		if err != nil {
-			return errnoFromError(err)
+			return fsapi.Attributes{}, errnoFromError(err)
 		}
-		errno := handle.Setattr(ctx, input, out)
+		attributes, errno := openHandle.SetAttributes(ctx, input)
 		if errno == 0 {
-			errno = handle.Flush(ctx)
+			errno = openHandle.Flush(ctx)
 		}
-		_ = handle.Release(ctx)
-		return errno
+		_ = openHandle.Close(ctx)
+		return attributes, errno
 	}
 
-	unlock := n.volume.acquireOpenLock(storage, true)
+	unlock := f.volume.acquireOpenLock(storage, true)
 	defer unlock()
-	path, err := n.volume.encryptedPath(storage)
+	path, err := f.volume.encryptedPath(storage)
 	if err != nil {
-		return errnoFromError(err)
+		return fsapi.Attributes{}, errnoFromError(err)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return errnoFromError(err)
+		return fsapi.Attributes{}, errnoFromError(err)
 	}
-	meta := n.volume.fileMeta(storage, info)
-	if mode, ok := input.GetMode(); ok {
-		meta.Mode = mode & 0o777
+	meta := f.volume.fileMeta(storage, info)
+	if input.Mode != nil {
+		meta.Mode = *input.Mode & 0o777
 	}
-	if mtime, ok := input.GetMTime(); ok {
-		meta.MTime = mtime.UnixNano()
+	if input.ModifyTime != nil {
+		meta.MTime = input.ModifyTime.UnixNano()
 	}
-	if err := n.volume.setFileMeta(storage, meta); err != nil {
-		return errnoFromError(err)
+	if input.AccessTime != nil {
+		meta.ATime = input.AccessTime.UnixNano()
 	}
-	fillFileAttr(
-		&out.Attr,
+	if err := f.volume.setFileMeta(storage, meta); err != nil {
+		return fsapi.Attributes{}, errnoFromError(err)
+	}
+	return fileAttributes(
 		meta,
-		n.volume.uid,
-		n.volume.gid,
+		f.volume.uid,
+		f.volume.gid,
 		stableInode(storage),
-	)
-	return 0
+	), 0
 }
 
-func (n *Node) Setxattr(
+func (f *FileSystem) SetExtendedAttribute(
 	ctx context.Context,
+	relative string,
 	name string,
 	data []byte,
-	flags uint32,
+	_ uint32,
 ) syscall.Errno {
+	entry, errno := f.Lookup(ctx, relative)
+	if errno != 0 {
+		return errno
+	}
 	switch name {
 	case encryptSessionMarkerName:
-		if !n.isDir || !n.IsRoot() {
+		if entry.Attributes.Type != fsapi.TypeDirectory || relative != "" {
 			return syscall.EPERM
 		}
-		return n.setEncryptSession(ctx, data)
+		return f.setEncryptSession(ctx, data)
 	case linkMarkerName:
-		if n.isDir {
+		if entry.Attributes.Type == fsapi.TypeDirectory {
 			return syscall.EINVAL
 		}
-		return n.setLinkMarker(data)
+		return f.setLinkMarker(relative, data)
 	case editSessionMarkerName:
-		if n.isDir {
+		if entry.Attributes.Type == fsapi.TypeDirectory {
 			return syscall.EINVAL
 		}
-		return n.setEditSession(ctx, data)
+		return f.setEditSession(ctx, relative, data)
 	default:
 		return syscall.ENOTSUP
 	}
 }
 
-func (n *Node) setLinkMarker(data []byte) syscall.Errno {
+func (f *FileSystem) setLinkMarker(relative string, data []byte) syscall.Errno {
 	if len(data) == 0 || len(data) > 4096 ||
 		strings.ContainsRune(string(data), 0) {
 		return syscall.EINVAL
 	}
-	storage := storagePath(n.relativePath())
+	storage := storagePath(relative)
 	sourcePath, err := OriginalPath(storage)
 	if err != nil {
 		return errnoFromError(err)
@@ -533,45 +590,44 @@ func (n *Node) setLinkMarker(data []byte) syscall.Errno {
 	if !link.isSymlink || link.target != targetPath {
 		return syscall.EINVAL
 	}
-	return errnoFromError(n.volume.registerProtectedLink(storage, targetPath))
+	return errnoFromError(f.volume.registerProtectedLink(storage, targetPath))
 }
 
-func (n *Node) setEditSession(ctx context.Context, data []byte) syscall.Errno {
+func (f *FileSystem) setEditSession(
+	ctx context.Context,
+	relative string,
+	data []byte,
+) syscall.Errno {
 	operation, token, err := parseSessionCommand(data)
 	if err != nil {
 		return syscall.EINVAL
-	}
-	caller, ok := fuse.FromContext(ctx)
-	if !ok || caller.Pid == 0 {
-		return syscall.EPERM
 	}
 	ownerPID := callerPID(ctx)
 	if ownerPID == 0 {
 		return syscall.EPERM
 	}
-	storage := storagePath(n.relativePath())
+	storage := storagePath(relative)
 	switch operation {
 	case "begin":
 		return errnoFromError(
-			n.volume.beginEditSession(ctx, storage, token, ownerPID),
+			f.volume.beginEditSession(ctx, storage, token, ownerPID),
 		)
 	case "end":
 		return errnoFromError(
-			n.volume.endEditSession(storage, token, ownerPID),
+			f.volume.endEditSession(storage, token, ownerPID),
 		)
 	default:
 		return syscall.EINVAL
 	}
 }
 
-func (n *Node) setEncryptSession(ctx context.Context, data []byte) syscall.Errno {
+func (f *FileSystem) setEncryptSession(
+	ctx context.Context,
+	data []byte,
+) syscall.Errno {
 	operation, token, err := parseSessionCommand(data)
 	if err != nil {
 		return syscall.EINVAL
-	}
-	caller, ok := fuse.FromContext(ctx)
-	if !ok || caller.Pid == 0 {
-		return syscall.EPERM
 	}
 	ownerPID := callerPID(ctx)
 	if ownerPID == 0 {
@@ -580,65 +636,82 @@ func (n *Node) setEncryptSession(ctx context.Context, data []byte) syscall.Errno
 	switch operation {
 	case "begin":
 		return errnoFromError(
-			n.volume.beginEncryptSession(ctx, token, ownerPID),
+			f.volume.beginEncryptSession(ctx, token, ownerPID),
 		)
 	case "end":
 		return errnoFromError(
-			n.volume.endEncryptSession(token, ownerPID),
+			f.volume.endEncryptSession(token, ownerPID),
 		)
 	default:
 		return syscall.EINVAL
 	}
 }
 
-func (n *Node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+func (f *FileSystem) Statistics(
+	_ context.Context,
+) (fsapi.Statistics, syscall.Errno) {
 	stats := syscall.Statfs_t{}
-	if err := syscall.Statfs(n.volume.root, &stats); err != nil {
-		return errnoFromError(err)
+	if err := syscall.Statfs(f.volume.root, &stats); err != nil {
+		return fsapi.Statistics{}, errnoFromError(err)
 	}
-	out.FromStatfsT(&stats)
-	return 0
+	blockSize := uint64(stats.Bsize)
+	return fsapi.Statistics{
+		BlockSize:       blockSize,
+		IOSize:          blockSize,
+		TotalBlocks:     uint64(stats.Blocks),
+		AvailableBlocks: uint64(stats.Bavail),
+		FreeBlocks:      uint64(stats.Bfree),
+		TotalFiles:      uint64(stats.Files),
+		FreeFiles:       uint64(stats.Ffree),
+	}, 0
 }
 
-func fillDirectoryAttr(out *fuse.Attr, info os.FileInfo, inode uint64) {
-	if attr := fuse.ToAttr(info); attr != nil {
-		*out = *attr
-		out.Ino = inode
-		return
+func directoryAttributes(info os.FileInfo, inode uint64) fsapi.Attributes {
+	modTime := info.ModTime()
+	return fsapi.Attributes{
+		Type:       fsapi.TypeDirectory,
+		Inode:      inode,
+		Size:       uint64(info.Size()),
+		Blocks:     (uint64(info.Size()) + 511) / 512,
+		Mode:       uint32(info.Mode().Perm()),
+		UID:        uint32(os.Getuid()),
+		GID:        uint32(os.Getgid()),
+		LinkCount:  1,
+		AccessTime: modTime,
+		ChangeTime: modTime,
+		ModifyTime: modTime,
+		BirthTime:  modTime,
 	}
-	now := info.ModTime()
-	out.Mode = fuse.S_IFDIR | uint32(info.Mode().Perm())
-	out.Ino = inode
-	out.Nlink = 1
-	out.SetTimes(&now, &now, &now)
 }
 
-func fillFileAttr(out *fuse.Attr, meta FileMeta, uid, gid uint32, inode uint64) {
+func fileAttributes(
+	meta FileMeta,
+	uid uint32,
+	gid uint32,
+	inode uint64,
+) fsapi.Attributes {
 	modTime := time.Unix(0, meta.MTime)
 	if meta.MTime == 0 {
 		modTime = time.Now()
 	}
-	out.Mode = fuse.S_IFREG | (meta.Mode & 0o777)
-	out.Ino = inode
-	out.Size = meta.Size
-	out.Blocks = (meta.Size + 511) / 512
-	out.Nlink = 1
-	out.Owner.Uid = uid
-	out.Owner.Gid = gid
-	out.SetTimes(&modTime, &modTime, &modTime)
+	accessTime := modTime
+	if meta.ATime != 0 {
+		accessTime = time.Unix(0, meta.ATime)
+	}
+	return fsapi.Attributes{
+		Type:       fsapi.TypeFile,
+		Inode:      inode,
+		Size:       meta.Size,
+		Blocks:     (meta.Size + 511) / 512,
+		Mode:       meta.Mode & 0o777,
+		UID:        uid,
+		GID:        gid,
+		LinkCount:  1,
+		AccessTime: accessTime,
+		ChangeTime: modTime,
+		ModifyTime: modTime,
+		BirthTime:  modTime,
+	}
 }
 
-var (
-	_ fs.NodeLookuper   = (*Node)(nil)
-	_ fs.NodeReaddirer  = (*Node)(nil)
-	_ fs.NodeGetattrer  = (*Node)(nil)
-	_ fs.NodeOpener     = (*Node)(nil)
-	_ fs.NodeCreater    = (*Node)(nil)
-	_ fs.NodeMkdirer    = (*Node)(nil)
-	_ fs.NodeUnlinker   = (*Node)(nil)
-	_ fs.NodeRmdirer    = (*Node)(nil)
-	_ fs.NodeRenamer    = (*Node)(nil)
-	_ fs.NodeSetattrer  = (*Node)(nil)
-	_ fs.NodeSetxattrer = (*Node)(nil)
-	_ fs.NodeStatfser   = (*Node)(nil)
-)
+var _ fsapi.FileSystem = (*FileSystem)(nil)

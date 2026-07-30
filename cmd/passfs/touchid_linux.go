@@ -8,5 +8,5 @@ import (
 )
 
 func runTouchID([]string, io.Writer, io.Writer) error {
-	return errors.New("Touch ID is available only on macOS")
+	return errors.New("touch ID is available only on macOS")
 }

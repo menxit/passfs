@@ -12,14 +12,6 @@ type platformCapability struct {
 	detail string
 }
 
-func requirePlatformFUSE() error {
-	capability := platformFUSECapability()
-	if capability.ready {
-		return nil
-	}
-	return platformFUSEError(capability)
-}
-
 func newDiagnosticPrompter(settings *passfs.Settings) (passfs.Prompter, error) {
 	if settings != nil {
 		return newServicePrompter(settings)

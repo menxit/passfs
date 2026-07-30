@@ -92,6 +92,7 @@ jobs:
       SIGNING_CERTIFICATES: ${{ secrets.MACOS_SIGNING_CERTIFICATES_P12_BASE64 }}
       SIGNING_CERTIFICATES_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATES_PASSWORD }}
       PROVISIONING_PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE_BASE64 }}
+      FSKIT_PROVISIONING_PROFILE: ${{ secrets.MACOS_FSKIT_PROVISIONING_PROFILE_BASE64 }}
       NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
       NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
       NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
@@ -108,6 +109,7 @@ jobs:
           : "${SIGNING_CERTIFICATES:?missing signing certificates}"
           : "${SIGNING_CERTIFICATES_PASSWORD:?missing signing certificates password}"
           : "${PROVISIONING_PROFILE:?missing provisioning profile}"
+          : "${FSKIT_PROVISIONING_PROFILE:?missing FSKit provisioning profile}"
           : "${NOTARY_KEY:?missing notarization key}"
           : "${NOTARY_KEY_ID:?missing notarization key ID}"
           : "${NOTARY_ISSUER_ID:?missing notarization issuer ID}"
@@ -116,10 +118,12 @@ jobs:
           keychain_password="$(uuidgen)"
           signing_certificates_path="$RUNNER_TEMP/signing-certificates.p12"
           profile_path="$RUNNER_TEMP/passfs.provisionprofile"
+          fskit_profile_path="$RUNNER_TEMP/passfs-fskit.provisionprofile"
           notary_key_path="$RUNNER_TEMP/AuthKey.p8"
 
           printf '%s' "$SIGNING_CERTIFICATES" | base64 -D > "$signing_certificates_path"
           printf '%s' "$PROVISIONING_PROFILE" | base64 -D > "$profile_path"
+          printf '%s' "$FSKIT_PROVISIONING_PROFILE" | base64 -D > "$fskit_profile_path"
           printf '%s' "$NOTARY_KEY" | base64 -D > "$notary_key_path"
 
           security create-keychain -p "$keychain_password" "$keychain_path"
@@ -136,6 +140,7 @@ jobs:
           {
             echo "PASSFS_KEYCHAIN=$keychain_path"
             echo "PASSFS_PROFILE=$profile_path"
+            echo "PASSFS_FSKIT_PROFILE=$fskit_profile_path"
             echo "PASSFS_NOTARY_KEY=$notary_key_path"
           } >> "$GITHUB_ENV"
       - name: Build, sign, and notarize
@@ -145,6 +150,7 @@ jobs:
             RELEASE_BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
             MACOS_ARCHES="amd64 arm64" \
             MACOS_PROVISIONING_PROFILE="$PASSFS_PROFILE" \
+            MACOS_FSKIT_PROVISIONING_PROFILE="$PASSFS_FSKIT_PROFILE" \
             MACOS_APPLICATION_SIGN_IDENTITY=auto \
             MACOS_INSTALLER_SIGN_IDENTITY=auto \
             MACOS_NOTARY_KEY="$PASSFS_NOTARY_KEY" \
@@ -164,6 +170,7 @@ jobs:
           rm -f \
             "$RUNNER_TEMP/signing-certificates.p12" \
             "$RUNNER_TEMP/passfs.provisionprofile" \
+            "$RUNNER_TEMP/passfs-fskit.provisionprofile" \
             "$RUNNER_TEMP/AuthKey.p8"
 
   publish:

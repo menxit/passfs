@@ -3,28 +3,27 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unicode"
 
-	"github.com/hanwen/go-fuse/v2/fs"
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"passfs/internal/passfs"
 )
 
 var version = "0.1.0-dev"
+var errPlatformFilesystemApprovalRequired = errors.New(
+	"platform filesystem approval required",
+)
 
 const (
 	defaultMaxFileSize = 16 * 1024 * 1024
@@ -32,6 +31,16 @@ const (
 )
 
 func main() {
+	if len(os.Args) == 1 {
+		launched, err := launchPlatformApp()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "passfs: %s\n", terminalSafeError(err))
+			os.Exit(1)
+		}
+		if launched {
+			return
+		}
+	}
 	if len(os.Args) > 1 && os.Args[1] == "__touchid-helper" {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
@@ -74,6 +83,12 @@ func terminalSafeError(err error) string {
 	return result.String()
 }
 
+func writeJSON(writer io.Writer, value any) error {
+	encoder := json.NewEncoder(writer)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(value)
+}
+
 func runCLI(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		printUsage(stderr)
@@ -90,6 +105,16 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runUnprotect(args[1:], stdout, stderr)
 	case "edit":
 		return runEdit(args[1:], stdout, stderr)
+	case "scan":
+		return runScan(args[1:], stdout, stderr)
+	case "ignore":
+		return runIgnore(args[1:], false, stdout, stderr)
+	case "unignore":
+		return runIgnore(args[1:], true, stdout, stderr)
+	case "ignored":
+		return runIgnored(args[1:], stdout, stderr)
+	case "protected":
+		return runProtected(args[1:], stdout, stderr)
 	case "mount":
 		return runMount(args[1:], stdout, stderr)
 	case "unmount":
@@ -104,6 +129,8 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runSetup(args[1:], stdout, stderr)
 	case "update":
 		return runUpdate(args[1:], stdout, stderr)
+	case "__update-status":
+		return runCachedUpdateStatus(args[1:], stdout)
 	case "passwd":
 		return runPasswd(args[1:], stdout, stderr)
 	case "config":
@@ -127,24 +154,26 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, `passfs exposes age-encrypted files through one local FUSE filesystem.
+	fmt.Fprintln(writer, `passfs exposes age-encrypted files through one local virtual filesystem.
 
 Usage:
   passfs init [options]
-  passfs mount [options]
+  passfs scan [options] [PATH...]
+  passfs ignore [options] FILE...
+  passfs unignore [options] FILE...
   passfs encrypt [options] FILE...
+  passfs protected [options]
   passfs unprotect [options] [FILE]
   passfs edit [options] FILE
   passfs status [options]
-  passfs unmount [options]
-  passfs reload [options]
-  passfs doctor [options]
-  passfs setup [options]
-  passfs update [options]
-  passfs passwd [options]
   passfs config [options]
   passfs touchid enable|disable|status|verify [options]
+  passfs update [options]
   passfs version
+
+Advanced service and recovery commands:
+  passfs mount|unmount|reload|doctor|setup [options]
+  passfs passwd [options]
 
 Run "passfs COMMAND -h" for command-specific options.
 Machine-readable documentation: https://getpassfs.com/llms.txt`)
@@ -222,6 +251,9 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	var mountPoint string
 	var unlockFor time.Duration
 	var disableTouchID bool
+	var adapterName string
+	var noMount bool
+	var noOpen bool
 	if err := addCommonFlags(flags, &common); err != nil {
 		return err
 	}
@@ -243,73 +275,142 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 		false,
 		"disable the default Touch ID setup on macOS",
 	)
+	flags.StringVar(
+		&adapterName,
+		"adapter",
+		"",
+		`filesystem adapter: "auto", "fskit", or "fuse"`,
+	)
+	flags.BoolVar(
+		&noMount,
+		"no-mount",
+		false,
+		"initialize the vault without starting the filesystem",
+	)
+	flags.BoolVar(
+		&noOpen,
+		"no-open",
+		false,
+		"do not open platform settings while completing setup",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errors.New("usage: passfs init [options]")
 	}
-	if _, err := os.Stat(common.configPath); err == nil {
-		return fmt.Errorf(
-			"passfs is already initialized at %s",
-			terminalPath(common.configPath),
-		)
-	} else if !errors.Is(err, os.ErrNotExist) {
+	requested, err := normalizeFilesystemAdapter(
+		adapterName,
+		platformFilesystemAdapters(),
+	)
+	if err != nil {
 		return err
 	}
 
-	prompter, err := promptOptions.build()
-	if err != nil {
-		return err
-	}
-	settings, err := passfs.NewSettings(
-		common.configPath,
-		vaultPath,
-		mountPoint,
-		unlockFor,
-	)
-	if err != nil {
-		return err
-	}
-	touchIDEnabled, touchIDWarning, err := initVolumeWithPlatformDefaults(
-		context.Background(),
-		settings.Vault,
-		prompter,
-		disableTouchID,
-	)
-	if err != nil {
-		return err
-	}
-	settings.TouchID = touchIDEnabled
-	if err := os.MkdirAll(settings.MountPoint, 0o700); err != nil {
-		return fmt.Errorf("create mount point: %w", err)
-	}
-	if err := settings.Save(); err != nil {
-		return fmt.Errorf("save settings: %w", err)
-	}
-	if touchIDWarning != nil {
-		fmt.Fprintf(stderr, "Warning: Touch ID was not enabled: %v\n", touchIDWarning)
-		fmt.Fprintln(stderr, "passfs will use the volume passphrase for authorization.")
-	}
-
-	fmt.Fprintf(
-		stdout,
-		"Initialized passfs\nConfig:      %s\nVault:       %s\nMount point: %s\n",
-		terminalPath(settings.Path()),
-		terminalPath(settings.Vault),
-		terminalPath(settings.MountPoint),
-	)
-	if unlockFor == 0 {
-		if settings.TouchID {
-			fmt.Fprintln(stdout, "Authorization: Touch ID required for every file open")
-		} else {
-			fmt.Fprintln(stdout, "Authorization: passphrase required for every file open")
+	settings, loadErr := passfs.LoadSettings(common.configPath)
+	switch {
+	case loadErr == nil:
+		var incompatible []string
+		flags.Visit(func(value *flag.Flag) {
+			switch value.Name {
+			case "adapter", "config", "no-mount", "no-open",
+				"pinentry", "prompt":
+			default:
+				incompatible = append(incompatible, "--"+value.Name)
+			}
+		})
+		if len(incompatible) != 0 {
+			return fmt.Errorf(
+				"passfs is already initialized at %s; %s can only be used for a new vault",
+				terminalPath(settings.Path()),
+				strings.Join(incompatible, ", "),
+			)
 		}
-	} else {
-		fmt.Fprintf(stdout, "Per-file authorization: %s\n", unlockFor)
+		if adapterName != "" && settings.Adapter != requested {
+			settings.Adapter = requested
+			if err := settings.Save(); err != nil {
+				return fmt.Errorf("save filesystem adapter: %w", err)
+			}
+		}
+		fmt.Fprintf(
+			stdout,
+			"PassFS is initialized at %s; completing filesystem setup.\n",
+			terminalPath(settings.Path()),
+		)
+	case errors.Is(loadErr, os.ErrNotExist):
+		prompter, err := promptOptions.build()
+		if err != nil {
+			return err
+		}
+		settings, err = passfs.NewSettings(
+			common.configPath,
+			vaultPath,
+			mountPoint,
+			unlockFor,
+		)
+		if err != nil {
+			return err
+		}
+		touchIDEnabled, touchIDWarning, err := initVolumeWithPlatformDefaults(
+			context.Background(),
+			settings.Vault,
+			prompter,
+			disableTouchID,
+		)
+		if err != nil {
+			return err
+		}
+		settings.TouchID = touchIDEnabled
+		if adapterName != "" {
+			settings.Adapter = requested
+		}
+		if err := os.MkdirAll(settings.MountPoint, 0o700); err != nil {
+			return fmt.Errorf("create mount point: %w", err)
+		}
+		if err := settings.Save(); err != nil {
+			return fmt.Errorf("save settings: %w", err)
+		}
+		if touchIDWarning != nil {
+			fmt.Fprintf(stderr, "Warning: Touch ID was not enabled: %v\n", touchIDWarning)
+			fmt.Fprintln(stderr, "passfs will use the volume passphrase for authorization.")
+		}
+
+		fmt.Fprintf(
+			stdout,
+			"Initialized PassFS\nConfig:      %s\nVault:       %s\nMount point: %s\n",
+			terminalPath(settings.Path()),
+			terminalPath(settings.Vault),
+			terminalPath(settings.MountPoint),
+		)
+		if unlockFor == 0 {
+			if settings.TouchID {
+				fmt.Fprintln(stdout, "Authorization: Touch ID required for every file open")
+			} else {
+				fmt.Fprintln(stdout, "Authorization: passphrase required for every file open")
+			}
+		} else {
+			fmt.Fprintf(stdout, "Per-file authorization: %s\n", unlockFor)
+		}
+	default:
+		return loadErr
 	}
-	fmt.Fprintln(stdout, "Run \"passfs mount\" to start the filesystem.")
-	return nil
+
+	if noMount {
+		fmt.Fprintln(stdout, "Vault initialized; filesystem startup was skipped.")
+		return nil
+	}
+	if err := preparePlatformFilesystemForInit(
+		settings,
+		requestedAdapter(settings),
+		stdout,
+	); err != nil {
+		return err
+	}
+	mountArguments := []string{"--config", settings.Path()}
+	if noOpen {
+		mountArguments = append(mountArguments, "--no-open")
+	}
+	return runMount(mountArguments, stdout, stderr)
 }
 
 func runEncrypt(args []string, stdout, stderr io.Writer) error {
@@ -377,7 +478,12 @@ func runEncrypt(args []string, stdout, stderr io.Writer) error {
 	}
 
 	var sessionToken string
-	if len(sourcePaths) > 1 {
+	adapter, err := activeFilesystemAdapter(settings.MountPoint)
+	if err != nil {
+		return err
+	}
+	processSessions := adapter.SupportsProcessSessions()
+	if len(sourcePaths) > 1 && processSessions {
 		sessionToken, err = passfs.BeginEncryptSession(settings.MountPoint)
 		if err != nil {
 			return fmt.Errorf(
@@ -386,12 +492,19 @@ func runEncrypt(args []string, stdout, stderr io.Writer) error {
 				err,
 			)
 		}
+	} else if len(sourcePaths) > 1 {
+		fmt.Fprintln(
+			stderr,
+			"FSKit does not expose caller process IDs; each file requires its own authorization.",
+		)
 	}
 
 	encryptErr := encryptPaths(
 		sourcePaths,
 		settings.MountPoint,
 		maxFileSize,
+		settings,
+		adapter,
 		stdout,
 	)
 	if sessionToken == "" {
@@ -408,10 +521,23 @@ func encryptPaths(
 	sourcePaths []string,
 	mountPoint string,
 	maxFileSize int64,
+	settings *passfs.Settings,
+	adapter filesystemAdapter,
 	stdout io.Writer,
 ) error {
 	for _, sourcePath := range sourcePaths {
-		result, err := passfs.ImportThroughMount(sourcePath, mountPoint, maxFileSize)
+		result, err := passfs.ImportThroughMount(
+			sourcePath,
+			mountPoint,
+			maxFileSize,
+			func(sourcePath, targetPath string) error {
+				return adapter.RegisterProtectedLink(
+					settings,
+					sourcePath,
+					targetPath,
+				)
+			},
+		)
 		if err != nil {
 			return fmt.Errorf("encrypt %s: %w", terminalPath(sourcePath), err)
 		}
@@ -444,6 +570,7 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 	var maxFileSize int64
 	var promptMode string
 	var pinentryPath string
+	var confirmed bool
 	if err := addCommonFlags(flags, &common); err != nil {
 		return err
 	}
@@ -460,11 +587,20 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 		"",
 		"path to an optional pinentry executable",
 	)
+	flags.BoolVar(
+		&confirmed,
+		"yes",
+		false,
+		"confirm unprotecting the specified FILE (for trusted UI clients)",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() > 1 {
 		return errors.New("usage: passfs unprotect [options] [FILE]")
+	}
+	if confirmed && flags.NArg() != 1 {
+		return errors.New("--yes requires exactly one FILE")
 	}
 	if err := validateMaxFileSize(maxFileSize); err != nil {
 		return err
@@ -482,8 +618,10 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 		}
 		sourcePath = filepath.Clean(sourcePath)
 	}
-	if err := confirmUnprotect(stderr, sourcePath); err != nil {
-		return err
+	if !confirmed {
+		if err := confirmUnprotect(stderr, sourcePath); err != nil {
+			return err
+		}
 	}
 
 	var prompter passfs.Prompter
@@ -514,21 +652,23 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 		}
 		restoreService = status.Installed || mount.mounted
 	}
+	restore := func() error {
+		if !restoreService {
+			return nil
+		}
+		return runReload(
+			[]string{"--config", settings.Path()},
+			stdout,
+			stderr,
+		)
+	}
 
 	if err := runUnmount(
 		[]string{"--config", settings.Path()},
 		stdout,
 		stderr,
 	); err != nil {
-		if restoreService {
-			restoreErr := runReload(
-				[]string{"--config", settings.Path()},
-				stdout,
-				stderr,
-			)
-			return errors.Join(err, restoreErr)
-		}
-		return err
+		return errors.Join(err, restore())
 	}
 	report, err := unprotectFiles(
 		settings,
@@ -537,24 +677,9 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 		sourcePath,
 	)
 	if err != nil {
-		if !restoreService {
-			return err
-		}
-		restoreErr := runReload(
-			[]string{"--config", settings.Path()},
-			stdout,
-			stderr,
-		)
-		return errors.Join(err, restoreErr)
+		return errors.Join(err, restore())
 	}
-	var restoreErr error
-	if restoreService {
-		restoreErr = runReload(
-			[]string{"--config", settings.Path()},
-			stdout,
-			stderr,
-		)
-	}
+	restoreErr := restore()
 
 	if report.Err != nil {
 		operationErr := fmt.Errorf(
@@ -786,12 +911,25 @@ func runEdit(args []string, stdout, stderr io.Writer) error {
 	command.Stdout = stdout
 	command.Stderr = stderr
 
-	sessionToken, err := passfs.BeginEditSession(targetPath)
+	adapter, err := activeFilesystemAdapter(settings.MountPoint)
 	if err != nil {
-		return fmt.Errorf(
-			"authorize edit session for %s: %w",
-			terminalPath(sourcePath),
-			err,
+		return err
+	}
+	processSessions := adapter.SupportsProcessSessions()
+	var sessionToken string
+	if processSessions {
+		sessionToken, err = passfs.BeginEditSession(targetPath)
+		if err != nil {
+			return fmt.Errorf(
+				"authorize edit session for %s: %w",
+				terminalPath(sourcePath),
+				err,
+			)
+		}
+	} else {
+		fmt.Fprintln(
+			stderr,
+			"FSKit does not expose caller process IDs; the editor may request authorization more than once.",
 		)
 	}
 	commandErr := command.Run()
@@ -799,8 +937,18 @@ func runEdit(args []string, stdout, stderr io.Writer) error {
 		sourcePath,
 		targetPath,
 		defaultMaxFileSize,
+		func(sourcePath, targetPath string) error {
+			return adapter.RegisterProtectedLink(
+				settings,
+				sourcePath,
+				targetPath,
+			)
+		},
 	)
-	endErr := passfs.EndEditSession(targetPath, sessionToken)
+	var endErr error
+	if sessionToken != "" {
+		endErr = passfs.EndEditSession(targetPath, sessionToken)
+	}
 	if commandErr != nil {
 		commandErr = fmt.Errorf(
 			"edit %s with Vim: %w",
@@ -826,17 +974,50 @@ func runEdit(args []string, stdout, stderr io.Writer) error {
 }
 
 func runMount(args []string, stdout, stderr io.Writer) error {
-	common, err := parseCommonOnlyFlags("mount", args, stderr)
-	if err != nil {
+	flags := flag.NewFlagSet("mount", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var common commonFlags
+	var adapterName string
+	var noOpen bool
+	if err := addCommonFlags(flags, &common); err != nil {
 		return err
+	}
+	flags.StringVar(
+		&adapterName,
+		"adapter",
+		"",
+		`filesystem adapter: "auto", "fskit", or "fuse"`,
+	)
+	flags.BoolVar(
+		&noOpen,
+		"no-open",
+		false,
+		"do not open platform settings while completing setup",
+	)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: passfs mount [options]")
 	}
 
 	settings, err := loadSettings(common.configPath)
 	if err != nil {
 		return err
 	}
-	if err := requirePlatformFUSE(); err != nil {
+	requested := requestedAdapter(settings)
+	if adapterName != "" {
+		requested = strings.ToLower(strings.TrimSpace(adapterName))
+	}
+	adapter, err := selectFilesystemAdapter(requested, settings)
+	if err != nil {
 		return err
+	}
+	if adapterName != "" && settings.Adapter != requested {
+		settings.Adapter = requested
+		if err := settings.Save(); err != nil {
+			return fmt.Errorf("save filesystem adapter: %w", err)
+		}
 	}
 	service, err := queryService()
 	if err != nil {
@@ -860,6 +1041,26 @@ func runMount(args []string, stdout, stderr io.Writer) error {
 					"recover it with:",
 					"  passfs reload",
 				}
+			}
+			active, activeErr := activeFilesystemAdapter(settings.MountPoint)
+			if activeErr == nil && active.Name() != adapter.Name() {
+				fmt.Fprintf(
+					stdout,
+					"Switching filesystem adapter from %s to %s.\n",
+					active.Name(),
+					adapter.Name(),
+				)
+				reloadArguments := []string{
+					"--config",
+					settings.Path(),
+				}
+				if noOpen {
+					reloadArguments = append(
+						reloadArguments,
+						"--no-open",
+					)
+				}
+				return runReload(reloadArguments, stdout, stderr)
 			}
 			fmt.Fprintf(
 				stdout,
@@ -895,24 +1096,61 @@ func runMount(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := installAndStartService(executable, settings.Path()); err != nil {
+	logHint := serviceLogHint(settings.Path())
+	logOffset := serviceLogOffset(logHint)
+	if err := installAndStartService(
+		executable,
+		settings.Path(),
+		adapter.Name(),
+	); err != nil {
 		return err
 	}
-	if err := waitForMountState(settings.MountPoint, true, serviceWaitTimeout); err != nil {
-		return platformMountWaitError(err, serviceLogHint(settings.Path()))
+	if err := waitForFilesystemMount(
+		settings,
+		adapter,
+		logHint,
+		logOffset,
+		!noOpen,
+		stdout,
+	); err != nil {
+		return err
 	}
-	fmt.Fprintf(stdout, "Mounted passfs at %s\n", terminalPath(settings.MountPoint))
+	fmt.Fprintf(
+		stdout,
+		"Mounted passfs at %s using %s\n",
+		terminalPath(settings.MountPoint),
+		adapter.Name(),
+	)
 	fmt.Fprintln(stdout, "The service will start automatically after login.")
 	return nil
 }
 
 func runReload(args []string, stdout, stderr io.Writer) error {
-	common, err := parseCommonOnlyFlags("reload", args, stderr)
-	if err != nil {
+	flags := flag.NewFlagSet("reload", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var common commonFlags
+	var noOpen bool
+	if err := addCommonFlags(flags, &common); err != nil {
 		return err
+	}
+	flags.BoolVar(
+		&noOpen,
+		"no-open",
+		false,
+		"do not open platform settings while completing setup",
+	)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: passfs reload [options]")
 	}
 
 	settings, err := loadSettings(common.configPath)
+	if err != nil {
+		return err
+	}
+	adapter, err := selectFilesystemAdapter(requestedAdapter(settings), settings)
 	if err != nil {
 		return err
 	}
@@ -971,13 +1209,31 @@ func runReload(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := installAndStartService(executable, settings.Path()); err != nil {
+	logHint := serviceLogHint(settings.Path())
+	logOffset := serviceLogOffset(logHint)
+	if err := installAndStartService(
+		executable,
+		settings.Path(),
+		adapter.Name(),
+	); err != nil {
 		return err
 	}
-	if err := waitForMountState(settings.MountPoint, true, serviceWaitTimeout); err != nil {
-		return platformMountWaitError(err, serviceLogHint(settings.Path()))
+	if err := waitForFilesystemMount(
+		settings,
+		adapter,
+		logHint,
+		logOffset,
+		!noOpen,
+		stdout,
+	); err != nil {
+		return err
 	}
-	fmt.Fprintf(stdout, "Reloaded passfs at %s\n", terminalPath(settings.MountPoint))
+	fmt.Fprintf(
+		stdout,
+		"Reloaded passfs at %s using %s\n",
+		terminalPath(settings.MountPoint),
+		adapter.Name(),
+	)
 	return nil
 }
 
@@ -1102,11 +1358,20 @@ func runStatus(args []string, stdout, stderr io.Writer) error {
 	} else if mount.mounted {
 		filesystemDescription = "occupied by another filesystem"
 	}
+	activeAdapter := ""
+	if mount.mounted && mount.passfs {
+		_, activeAdapter, _ = passfs.MountAdapterStatus(settings.MountPoint)
+	}
+	adapterDescription := requestedAdapter(settings)
+	if activeAdapter != "" {
+		adapterDescription += " (mounted with " + activeAdapter + ")"
+	}
 	fmt.Fprintf(
 		stdout,
-		"Service:     %s\nFilesystem:  %s\nMount point: %s\nVault:       %s\n",
+		"Service:     %s\nFilesystem:  %s\nAdapter:     %s\nMount point: %s\nVault:       %s\n",
 		serviceDescription,
 		filesystemDescription,
+		adapterDescription,
 		terminalPath(settings.MountPoint),
 		terminalPath(settings.Vault),
 	)
@@ -1119,11 +1384,18 @@ func runServe(args []string, stderr io.Writer) error {
 	var common commonFlags
 	var maxFileSize int64
 	var debug bool
+	var adapterName string
 	if err := addCommonFlags(flags, &common); err != nil {
 		return err
 	}
 	addMaxFileSizeFlag(flags, &maxFileSize)
 	flags.BoolVar(&debug, "debug", false, "enable verbose FUSE logging")
+	flags.StringVar(
+		&adapterName,
+		"adapter",
+		"",
+		`filesystem adapter: "auto", "fskit", or "fuse"`,
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -1135,6 +1407,14 @@ func runServe(args []string, stderr io.Writer) error {
 	}
 
 	settings, err := loadSettings(common.configPath)
+	if err != nil {
+		return err
+	}
+	requested := requestedAdapter(settings)
+	if adapterName != "" {
+		requested = adapterName
+	}
+	adapter, err := selectFilesystemAdapter(requested, settings)
 	if err != nil {
 		return err
 	}
@@ -1174,103 +1454,7 @@ func runServe(args []string, stderr io.Writer) error {
 		)
 	}
 
-	prompter, err := newServicePrompter(settings)
-	if err != nil {
-		return err
-	}
-	serviceContext, cancelService := context.WithCancel(context.Background())
-	defer cancelService()
-	prompter = passfs.WithCancellation(prompter, serviceContext)
-	unlockFor, err := settings.UnlockDuration()
-	if err != nil {
-		return err
-	}
-	volume, err := passfs.LoadVolume(settings.Vault, prompter, maxFileSize, unlockFor)
-	if err != nil {
-		return err
-	}
-
-	logger := log.New(stderr, "", log.LstdFlags)
-	linkSynchronizer, err := passfs.NewLinkSynchronizer(
-		volume,
-		settings.MountPoint,
-		logger,
-	)
-	if err != nil {
-		return fmt.Errorf("initialize protected link tracking: %w", err)
-	}
-	defer linkSynchronizer.Close()
-	linkSynchronizer.Synchronize()
-
-	zero := time.Duration(0)
-	server, err := fs.Mount(settings.MountPoint, passfs.NewRootNode(volume), &fs.Options{
-		AttrTimeout:     &zero,
-		EntryTimeout:    &zero,
-		NegativeTimeout: &zero,
-		UID:             uint32(os.Getuid()),
-		GID:             uint32(os.Getgid()),
-		MountOptions: fuse.MountOptions{
-			Options:            passfs.PlatformMountOptions(),
-			FsName:             "passfs",
-			Name:               "passfs",
-			DisableReadDirPlus: true,
-			Debug:              debug,
-			Logger:             logger,
-		},
-		Logger: logger,
-	})
-	if err != nil {
-		return fmt.Errorf(
-			"mount passfs at %s: %w",
-			terminalPath(settings.MountPoint),
-			err,
-		)
-	}
-
-	go linkSynchronizer.Run(serviceContext)
-	startUpdateMonitor(serviceContext, logger)
-
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
-	serverDone := make(chan struct{})
-	go func() {
-		server.Wait()
-		close(serverDone)
-	}()
-
-	select {
-	case <-serverDone:
-	case <-signals:
-		cancelService()
-		unmountDone := make(chan error, 1)
-		go func() {
-			unmountDone <- server.Unmount()
-		}()
-		select {
-		case err := <-unmountDone:
-			if err != nil {
-				logger.Printf("unmount: %v", err)
-				if forceErr := passfs.UnmountPath(settings.MountPoint); forceErr != nil {
-					logger.Printf("force unmount: %v", forceErr)
-				}
-			}
-		case <-time.After(2 * time.Second):
-			logger.Printf("filesystem unmount timed out; detaching the mount")
-			if forceErr := passfs.UnmountPath(settings.MountPoint); forceErr != nil {
-				logger.Printf("force unmount: %v", forceErr)
-			}
-		}
-		select {
-		case <-serverDone:
-		case <-time.After(2 * time.Second):
-			logger.Printf("filesystem shutdown timed out; exiting after detaching the mount")
-		}
-	}
-	cancelService()
-	linkSynchronizer.Close()
-	volume.Lock()
-	return nil
+	return adapter.Serve(settings, maxFileSize, debug, stderr)
 }
 
 func runPasswd(args []string, stdout, stderr io.Writer) error {
@@ -1309,11 +1493,18 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 	var common commonFlags
 	var unlockFor string
 	var mountPoint string
+	var adapterName string
 	if err := addCommonFlags(flags, &common); err != nil {
 		return err
 	}
 	flags.StringVar(&unlockFor, "unlock-for", "", "set per-file authorization duration")
 	flags.StringVar(&mountPoint, "mount-point", "", "set the global mount point")
+	flags.StringVar(
+		&adapterName,
+		"adapter",
+		"",
+		`set the filesystem adapter: "auto", "fskit", or "fuse"`,
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -1351,6 +1542,17 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 		}
 		changed = true
 	}
+	if adapterName != "" {
+		normalized, err := normalizeFilesystemAdapter(
+			adapterName,
+			platformFilesystemAdapters(),
+		)
+		if err != nil {
+			return err
+		}
+		settings.Adapter = normalized
+		changed = true
+	}
 	if changed {
 		if err := settings.Save(); err != nil {
 			return err
@@ -1362,16 +1564,24 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintf(
 		stdout,
-		"Config:      %s\nVault:       %s\nMount point: %s\nUnlock for:  %s\n",
+		"Config:      %s\nVault:       %s\nMount point: %s\nUnlock for:  %s\nAdapter:     %s\n",
 		terminalPath(settings.Path()),
 		terminalPath(settings.Vault),
 		terminalPath(settings.MountPoint),
-		duration,
+		formatUnlockDuration(duration),
+		requestedAdapter(settings),
 	)
 	if changed {
 		printReloadNotice(stdout)
 	}
 	return nil
+}
+
+func formatUnlockDuration(duration time.Duration) string {
+	if duration == 0 {
+		return "0m"
+	}
+	return duration.String()
 }
 
 func printReloadNotice(writer io.Writer) {
@@ -1489,6 +1699,61 @@ func waitForMountState(mountPoint string, wantMounted bool, timeout time.Duratio
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func waitForFilesystemMount(
+	settings *passfs.Settings,
+	adapter filesystemAdapter,
+	logHint string,
+	logOffset int64,
+	openSettings bool,
+	writer io.Writer,
+) error {
+	deadline := time.Now().Add(serviceWaitTimeout)
+	for {
+		mount, err := inspectMount(settings.MountPoint)
+		if err != nil {
+			return err
+		}
+		if mount.mounted && !mount.passfs {
+			return fmt.Errorf(
+				"%s was mounted by another filesystem",
+				terminalPath(settings.MountPoint),
+			)
+		}
+		if mount.mounted && mount.passfs && mount.healthy {
+			return nil
+		}
+		if platformFilesystemApprovalRequired(
+			adapter.Name(),
+			logHint,
+			logOffset,
+		) {
+			return completePlatformFilesystemApproval(
+				settings,
+				adapter.Name(),
+				openSettings,
+				writer,
+			)
+		}
+		if time.Now().After(deadline) {
+			err := errors.New("timed out waiting for passfs to mount")
+			return adapter.MountWaitError(
+				err,
+				logHint,
+				settings.MountPoint,
+			)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func serviceLogOffset(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 func pathsOverlap(root, path string) (bool, error) {

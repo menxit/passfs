@@ -16,7 +16,12 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"passfs/internal/fuseadapter"
 )
+
+func registerMarkedTarget(_ string, targetPath string) error {
+	return MarkProtectedLink(targetPath)
+}
 
 func TestFUSEEndToEnd(t *testing.T) {
 	if os.Getenv("PASSFS_FUSE_TEST") != "1" {
@@ -40,19 +45,23 @@ func TestFUSEEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	zero := time.Duration(0)
-	server, err := fs.Mount(mountPoint, NewRootNode(volume), &fs.Options{
-		AttrTimeout:     &zero,
-		EntryTimeout:    &zero,
-		NegativeTimeout: &zero,
-		UID:             uint32(os.Getuid()),
-		GID:             uint32(os.Getgid()),
-		MountOptions: fuse.MountOptions{
-			Options:            PlatformMountOptions(),
-			FsName:             "passfs",
-			Name:               "passfs",
-			DisableReadDirPlus: true,
+	server, err := fs.Mount(
+		mountPoint,
+		fuseadapter.NewRootNode(NewFileSystem(volume)),
+		&fs.Options{
+			AttrTimeout:     &zero,
+			EntryTimeout:    &zero,
+			NegativeTimeout: &zero,
+			UID:             uint32(os.Getuid()),
+			GID:             uint32(os.Getgid()),
+			MountOptions: fuse.MountOptions{
+				Options:            PlatformMountOptions(),
+				FsName:             "passfs",
+				Name:               "passfs",
+				DisableReadDirPlus: true,
+			},
 		},
-	})
+	)
 	if err != nil {
 		t.Fatalf("mount test filesystem: %v", err)
 	}
@@ -82,7 +91,12 @@ func TestFUSEEndToEnd(t *testing.T) {
 		t.Fatalf("begin encrypt session: %v", err)
 	}
 	for _, path := range batchPaths {
-		if _, err := ImportThroughMount(path, mountPoint, 1024*1024); err != nil {
+		if _, err := ImportThroughMount(
+			path,
+			mountPoint,
+			1024*1024,
+			registerMarkedTarget,
+		); err != nil {
 			t.Fatalf("batch ImportThroughMount(%s): %v", path, err)
 		}
 	}
@@ -100,7 +114,12 @@ func TestFUSEEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := ImportThroughMount(sourcePath, mountPoint, 1024*1024)
+	result, err := ImportThroughMount(
+		sourcePath,
+		mountPoint,
+		1024*1024,
+		registerMarkedTarget,
+	)
 	if err != nil {
 		t.Fatalf("ImportThroughMount: %v", err)
 	}
@@ -236,7 +255,12 @@ func TestFUSEEndToEnd(t *testing.T) {
 		t.Fatalf("link marker was not persisted synchronously: %#v", records)
 	}
 
-	repeated, err := ImportThroughMount(sourcePath, mountPoint, 1024*1024)
+	repeated, err := ImportThroughMount(
+		sourcePath,
+		mountPoint,
+		1024*1024,
+		registerMarkedTarget,
+	)
 	if err != nil {
 		t.Fatalf("repeat ImportThroughMount: %v", err)
 	}
@@ -286,7 +310,12 @@ func TestFUSEEndToEnd(t *testing.T) {
 	if err := os.WriteFile(unusualSource, unusualPlaintext, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	unusualResult, err := ImportThroughMount(unusualSource, mountPoint, 1024*1024)
+	unusualResult, err := ImportThroughMount(
+		unusualSource,
+		mountPoint,
+		1024*1024,
+		registerMarkedTarget,
+	)
 	if err != nil {
 		t.Fatalf("import unusual pathname: %v", err)
 	}

@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -27,9 +29,11 @@ func (p *NativePrompter) Prompt(ctx context.Context, request PromptRequest) (str
 	defer p.mu.Unlock()
 
 	const script = `on run argv
-set promptText to item 1 of argv
+set requestText to item 1 of argv
+set iconPath to item 2 of argv
+set promptText to "Enter your PassFS passphrase to authorize this operation." & return & return & requestText & return & return & "Your passphrase is processed only on this Mac and is never stored or transmitted."
 try
-	set response to display dialog promptText default answer "" with hidden answer buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel" with title "passfs"
+	set response to display dialog promptText default answer "" with hidden answer buttons {"Cancel", "Authorize"} default button "Authorize" cancel button "Cancel" with title "PassFS Security" with icon POSIX file iconPath
 	return text returned of response
 on error number -128
 	error number -128
@@ -41,6 +45,7 @@ end run`
 		"-e",
 		script,
 		DescribePrompt(request),
+		passFSDialogIconPath(),
 	)
 	output, err := command.Output()
 	if err != nil {
@@ -60,4 +65,32 @@ end run`
 		return "", ErrPromptCancelled
 	}
 	return passphrase, nil
+}
+
+func passFSDialogIconPath() string {
+	executable, err := os.Executable()
+	if err == nil {
+		if icon := passFSDialogIconPathForExecutable(executable); icon != "" {
+			return icon
+		}
+	}
+	return "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/LockedIcon.icns"
+}
+
+func passFSDialogIconPathForExecutable(executable string) string {
+	directory := filepath.Dir(executable)
+	for range 10 {
+		if filepath.Base(directory) == "Contents" {
+			candidate := filepath.Join(directory, "Resources", "PassFS.icns")
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				return filepath.Clean(candidate)
+			}
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			break
+		}
+		directory = parent
+	}
+	return ""
 }

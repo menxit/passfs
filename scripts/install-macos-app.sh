@@ -59,7 +59,8 @@ if [ -e "$command_path" ] || [ -L "$command_path" ]; then
 	mv "$command_path" "$previous_command"
 	had_command=true
 fi
-if ! ln -s "$destination_app/Contents/MacOS/passfs" "$command_path"; then
+if ! ln -s "$destination_app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli" \
+	"$command_path"; then
 	if [ "$had_command" = true ]; then
 		mv "$previous_command" "$command_path"
 	fi
@@ -72,3 +73,4 @@ fi
 
 printf 'Installed signed app: %s\n' "$destination_app"
 printf 'Installed command:    %s\n' "$command_path"
+/usr/bin/open "$destination_app"

@@ -11,19 +11,30 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"passfs/internal/passfs"
 )
 
 const launchAgentLabel = "com.menxit.passfs"
+const launchAgentTransitionTimeout = 5 * time.Second
 
-func installAndStartService(executable, configPath string) error {
+func installAndStartService(
+	executable,
+	configPath,
+	adapterName string,
+) error {
 	plistPath, err := serviceDefinitionPath()
 	if err != nil {
 		return err
 	}
 	logPath := filepath.Join(filepath.Dir(configPath), "passfs.log")
-	data, err := launchAgentDefinition(executable, configPath, logPath)
+	data, err := launchAgentDefinition(
+		executable,
+		configPath,
+		adapterName,
+		logPath,
+	)
 	if err != nil {
 		return err
 	}
@@ -32,13 +43,38 @@ func installAndStartService(executable, configPath string) error {
 	}
 
 	domain := launchAgentDomain()
-	if status, _ := queryService(); status.Running {
-		_ = runLaunchctl("bootout", domain+"/"+launchAgentLabel)
-	}
-	if err := runLaunchctl("bootstrap", domain, plistPath); err != nil {
+	status, err := queryService()
+	if err != nil {
 		return err
 	}
-	return nil
+	if status.Running {
+		if err := runLaunchctl(
+			"bootout",
+			domain+"/"+launchAgentLabel,
+		); err != nil {
+			current, queryErr := queryService()
+			if queryErr != nil || current.Running {
+				return err
+			}
+		}
+		if err := waitForServiceRunning(
+			false,
+			launchAgentTransitionTimeout,
+		); err != nil {
+			return err
+		}
+	}
+	if err := runLaunchctl("bootstrap", domain, plistPath); err != nil {
+		// Two startup requests can briefly overlap after an application
+		// upgrade. If the other request loaded this same LaunchAgent first,
+		// bootstrap reports EIO even though the desired service is ready.
+		current, queryErr := queryService()
+		if queryErr == nil && current.Running {
+			return nil
+		}
+		return err
+	}
+	return waitForServiceRunning(true, launchAgentTransitionTimeout)
 }
 
 func stopAndRemoveService() error {
@@ -111,6 +147,30 @@ func launchAgentDomain() string {
 	return "gui/" + strconv.Itoa(os.Getuid())
 }
 
+func waitForServiceRunning(wantRunning bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		status, err := queryService()
+		if err != nil {
+			return err
+		}
+		if status.Running == wantRunning {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			state := "start"
+			if !wantRunning {
+				state = "stop"
+			}
+			return fmt.Errorf(
+				"timed out waiting for the passfs LaunchAgent to %s",
+				state,
+			)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func runLaunchctl(arguments ...string) error {
 	output, err := runServiceCommand("/bin/launchctl", arguments...)
 	if err != nil {
@@ -119,14 +179,26 @@ func runLaunchctl(arguments ...string) error {
 	return nil
 }
 
-func launchAgentDefinition(executable, configPath, logPath string) ([]byte, error) {
+func launchAgentDefinition(
+	executable,
+	configPath,
+	adapterName,
+	logPath string,
+) ([]byte, error) {
 	var document bytes.Buffer
 	document.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	document.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
 	document.WriteString(`<plist version="1.0"><dict>` + "\n")
 	writePlistString(&document, "Label", launchAgentLabel)
 	document.WriteString("<key>ProgramArguments</key><array>\n")
-	for _, argument := range []string{executable, "serve", "--config", configPath} {
+	for _, argument := range []string{
+		executable,
+		"serve",
+		"--config",
+		configPath,
+		"--adapter",
+		adapterName,
+	} {
 		document.WriteString("<string>")
 		if err := xml.EscapeText(&document, []byte(argument)); err != nil {
 			return nil, err

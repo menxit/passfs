@@ -11,12 +11,13 @@ GO_BIN_DIR := $(shell $(GO_ENV) $(GO) env GOPATH)/bin
 endif
 MACOS_APP := $(BIN_DIR)/PassFS.app
 MACOS_INSTALL_APP ?= $(HOME)/Applications/PassFS.app
-MACOS_PROVISIONING_PROFILE ?= $(HOME)/Downloads/passfs_Developer_ID.provisionprofile
+MACOS_PROVISIONING_PROFILE ?= $(HOME)/Downloads/passfs_mounter_Developer_ID.provisionprofile
+MACOS_FSKIT_PROVISIONING_PROFILE ?= $(HOME)/Downloads/passfs_filesystem_Developer_ID.provisionprofile
 MACOS_APPLICATION_SIGN_IDENTITY ?= auto
 MACOS_INSTALLER_SIGN_IDENTITY ?= auto
-MACOS_NOTARY_KEY ?=
-MACOS_NOTARY_KEY_ID ?=
-MACOS_NOTARY_ISSUER_ID ?=
+MACOS_NOTARY_KEY ?= $(firstword $(wildcard $(HOME)/Downloads/AuthKey_*.p8))
+MACOS_NOTARY_KEY_ID ?= $(patsubst AuthKey_%.p8,%,$(notdir $(MACOS_NOTARY_KEY)))
+MACOS_NOTARY_ISSUER_ID ?= $(shell security find-generic-password -a "$(USER)" -s "com.menxit.passfs.notary.issuer-id" -w 2>/dev/null)
 MACOS_ARCHES ?= $(shell uname -m)
 RELEASE_VERSION ?= 0.1.0
 RELEASE_BUILD_NUMBER ?= 1
@@ -26,7 +27,7 @@ MACOS_PACKAGE := $(RELEASE_DIR)/PassFS-macos-universal.pkg
 DOCKER ?= docker
 SERVER_TEST_IMAGE ?= passfs-server-test
 
-.PHONY: all build install install-unsigned macos-app macos-package macos-release linux-release release-checksums pages docker-server docker-server-shell test test-scripts test-race vet check clean
+.PHONY: all build install install-unsigned macos-app macos-package macos-release linux-release release-checksums pages docker-server docker-server-shell test test-scripts test-race vet fskit-check check clean
 
 all: build
 
@@ -55,16 +56,12 @@ macos-app:
 	./scripts/build-macos-app.sh \
 		"$(MACOS_PROVISIONING_PROFILE)" \
 		"$(MACOS_APPLICATION_SIGN_IDENTITY)" \
-		$(MACOS_APP)
+		$(MACOS_APP) \
+		"$(MACOS_FSKIT_PROVISIONING_PROFILE)"
 
 macos-package macos-release: MACOS_ARCHES = amd64 arm64
 
-macos-package: macos-app
-	./scripts/build-macos-package.sh \
-		$(MACOS_APP) \
-		"$(MACOS_INSTALLER_SIGN_IDENTITY)" \
-		"$(RELEASE_VERSION)" \
-		$(MACOS_PACKAGE)
+macos-package: macos-release
 
 macos-release: macos-app
 	./scripts/notarize-macos.sh \
@@ -106,12 +103,23 @@ test:
 
 test-scripts:
 	./scripts/test-next-version.sh
+	./scripts/test-macos-uninstaller.sh
 
 test-race:
 	$(GO_ENV) $(GO) test -race ./...
 
 vet:
 	$(GO_ENV) $(GO) vet ./...
+
+ifeq ($(SYSTEM),Darwin)
+fskit-check:
+	./scripts/check-fskit.sh
+
+check: fskit-check
+else
+fskit-check:
+	@echo "FSKit check skipped on $(SYSTEM)"
+endif
 
 check: test test-scripts vet build
 

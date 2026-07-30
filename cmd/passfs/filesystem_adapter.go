@@ -1,0 +1,142 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"strings"
+
+	"passfs/internal/passfs"
+)
+
+const (
+	adapterAuto  = "auto"
+	adapterFUSE  = "fuse"
+	adapterFSKit = "fskit"
+)
+
+// filesystemAdapter owns the platform-specific mount lifecycle. The passfs
+// storage engine remains behind fsapi and never depends on one of these
+// frontends.
+type filesystemAdapter interface {
+	Name() string
+	Capability() platformCapability
+	ValidateSettings(*passfs.Settings) error
+	SupportsProcessSessions() bool
+	RegisterProtectedLink(*passfs.Settings, string, string) error
+	Serve(*passfs.Settings, int64, bool, io.Writer) error
+	UnavailableError(platformCapability) error
+	MountWaitError(error, string, string) error
+}
+
+func activeFilesystemAdapter(mountPoint string) (filesystemAdapter, error) {
+	mounted, name, err := passfs.MountAdapterStatus(mountPoint)
+	if err != nil {
+		return nil, fmt.Errorf("inspect passfs adapter: %w", err)
+	}
+	if !mounted || name == passfs.MountAdapterUnknown {
+		return nil, fmt.Errorf("%s is not a mounted passfs filesystem", mountPoint)
+	}
+	if adapter := filesystemAdapterNamed(
+		platformFilesystemAdapters(),
+		name,
+	); adapter != nil {
+		return adapter, nil
+	}
+	return nil, fmt.Errorf("mounted passfs adapter %q is unsupported", name)
+}
+
+func requestedAdapter(settings *passfs.Settings) string {
+	if settings == nil || strings.TrimSpace(settings.Adapter) == "" {
+		return adapterAuto
+	}
+	return strings.ToLower(strings.TrimSpace(settings.Adapter))
+}
+
+func normalizeFilesystemAdapter(
+	requested string,
+	adapters []filesystemAdapter,
+) (string, error) {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if requested == "" {
+		return adapterAuto, nil
+	}
+	if requested == adapterAuto {
+		return requested, nil
+	}
+	if filesystemAdapterNamed(adapters, requested) != nil {
+		return requested, nil
+	}
+	names := make([]string, 0, len(adapters))
+	for _, adapter := range adapters {
+		names = append(names, adapter.Name())
+	}
+	return "", fmt.Errorf(
+		"unknown filesystem adapter %q (available: auto, %s)",
+		requested,
+		strings.Join(names, ", "),
+	)
+}
+
+func filesystemAdapterNamed(
+	adapters []filesystemAdapter,
+	name string,
+) filesystemAdapter {
+	for _, adapter := range adapters {
+		if adapter.Name() == name {
+			return adapter
+		}
+	}
+	return nil
+}
+
+func selectFilesystemAdapter(
+	requested string,
+	settings *passfs.Settings,
+) (filesystemAdapter, error) {
+	adapters := platformFilesystemAdapters()
+	var err error
+	requested, err = normalizeFilesystemAdapter(requested, adapters)
+	if err != nil {
+		return nil, err
+	}
+	if requested == adapterAuto {
+		var validationErr error
+		for _, adapter := range adapters {
+			if !adapter.Capability().ready {
+				continue
+			}
+			if err := adapter.ValidateSettings(settings); err != nil {
+				if validationErr == nil {
+					validationErr = err
+				}
+				continue
+			}
+			return adapter, nil
+		}
+		if validationErr != nil {
+			return nil, validationErr
+		}
+		var details []string
+		for _, adapter := range adapters {
+			capability := adapter.Capability()
+			details = append(
+				details,
+				fmt.Sprintf("%s: %s", capability.name, capability.detail),
+			)
+		}
+		return nil, actionableError{
+			"no supported filesystem adapter is ready",
+			strings.Join(details, "\n"),
+			"run \"passfs init\" to complete setup and mount the filesystem",
+		}
+	}
+	adapter := filesystemAdapterNamed(adapters, requested)
+	capability := adapter.Capability()
+	if !capability.ready {
+		return nil, adapter.UnavailableError(capability)
+	}
+	if err := adapter.ValidateSettings(settings); err != nil {
+		return nil, err
+	}
+	return adapter, nil
+}

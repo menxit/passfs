@@ -17,17 +17,29 @@ type ImportResult struct {
 	LinkCreated bool
 }
 
+type ProtectedLinkRegistrar func(sourcePath, targetPath string) error
+
 // ImportThroughMount moves a plaintext file into the mounted passfs namespace
 // and replaces its original pathname with a symbolic link to the protected
-// view. All writes to targetPath therefore go through the running FUSE process;
-// the CLI never writes ciphertext or metadata concurrently with it.
+// view. All writes to targetPath therefore go through the mounted filesystem
+// adapter; the CLI never writes ciphertext through the backing store.
 //
 // If the target is already protected and the original pathname is absent, the
 // function only restores the symbolic link. This supports volumes created by
 // passfs versions that removed the original plaintext pathname.
-func ImportThroughMount(sourcePath, mountPoint string, maxFileSize int64) (result ImportResult, err error) {
+// The registrar lets each filesystem adapter choose its control plane for the
+// verified project-side symbolic link.
+func ImportThroughMount(
+	sourcePath string,
+	mountPoint string,
+	maxFileSize int64,
+	register ProtectedLinkRegistrar,
+) (result ImportResult, err error) {
 	if maxFileSize <= 0 {
 		return result, errors.New("maximum file size must be greater than zero")
+	}
+	if register == nil {
+		return result, errors.New("protected link registrar is required")
 	}
 	sourcePath, targetPath, err := resolveImportPaths(sourcePath, mountPoint)
 	if err != nil {
@@ -38,7 +50,7 @@ func ImportThroughMount(sourcePath, mountPoint string, maxFileSize int64) (resul
 	if err != nil {
 		return result, err
 	}
-	if err := MarkProtectedLink(targetPath); err != nil {
+	if err := register(sourcePath, targetPath); err != nil {
 		return result, fmt.Errorf(
 			"protected link is installed but could not be registered with the passfs service: %w\nrestart passfs with:\n  passfs reload\nthen retry the command",
 			err,
@@ -156,9 +168,17 @@ func validateImportTarget(mountPoint, targetPath string) error {
 // it with a regular file during an atomic save. The replacement plaintext is
 // written through the mounted target before the link is atomically restored.
 // A matching protected link needs no reconciliation.
-func ReconcileProtectedEdit(sourcePath, targetPath string, maxFileSize int64) (bool, error) {
+func ReconcileProtectedEdit(
+	sourcePath string,
+	targetPath string,
+	maxFileSize int64,
+	register ProtectedLinkRegistrar,
+) (bool, error) {
 	if maxFileSize <= 0 {
 		return false, errors.New("maximum file size must be greater than zero")
+	}
+	if register == nil {
+		return false, errors.New("protected link registrar is required")
 	}
 	sourcePath, err := filepath.Abs(sourcePath)
 	if err != nil {
@@ -209,7 +229,7 @@ func ReconcileProtectedEdit(sourcePath, targetPath string, maxFileSize int64) (b
 			err,
 		)
 	}
-	if err := MarkProtectedLink(targetPath); err != nil {
+	if err := register(sourcePath, targetPath); err != nil {
 		return true, fmt.Errorf("register restored protected link: %w", err)
 	}
 	return true, nil
@@ -246,12 +266,23 @@ func importFile(sourcePath, targetPath string, maxFileSize int64) (result Import
 		if !targetInfo.Mode().IsRegular() {
 			return result, fmt.Errorf("protected target %s is not a regular file", targetPath)
 		}
-		created, linkErr := EnsureProtectedLink(sourcePath, targetPath)
-		if linkErr != nil {
-			return result, linkErr
+		recovered, recoverErr := recoverInterruptedEmptyImport(
+			sourcePath,
+			targetPath,
+			targetInfo,
+			maxFileSize,
+		)
+		if recoverErr != nil {
+			return result, recoverErr
 		}
-		result.LinkCreated = created
-		return result, nil
+		if !recovered {
+			created, linkErr := EnsureProtectedLink(sourcePath, targetPath)
+			if linkErr != nil {
+				return result, linkErr
+			}
+			result.LinkCreated = created
+			return result, nil
+		}
 	} else if !errors.Is(targetErr, os.ErrNotExist) {
 		return result, fmt.Errorf("check encrypted target: %w", targetErr)
 	}
@@ -316,6 +347,46 @@ func importFile(sourcePath, targetPath string, maxFileSize int64) (result Import
 		return result, err
 	}
 	return result, nil
+}
+
+// recoverInterruptedEmptyImport removes the zero-length target left behind
+// when a filesystem adapter successfully created a protected file but failed
+// before returning its open handle. Recovery is deliberately narrow: the
+// original must still be a nonempty regular file, while the protected target
+// must still be the exact empty file observed by the caller.
+func recoverInterruptedEmptyImport(
+	sourcePath string,
+	targetPath string,
+	targetInfo os.FileInfo,
+	maxFileSize int64,
+) (bool, error) {
+	if targetInfo.Size() != 0 {
+		return false, nil
+	}
+	source, sourceInfo, err := openValidatedSource(sourcePath, maxFileSize)
+	if err != nil {
+		return false, nil
+	}
+	if err := source.Close(); err != nil {
+		return false, fmt.Errorf("close source after interrupted import check: %w", err)
+	}
+	if sourceInfo.Size() == 0 {
+		return false, nil
+	}
+
+	currentTarget, err := os.Lstat(targetPath)
+	if err != nil {
+		return false, fmt.Errorf("recheck interrupted encrypted target: %w", err)
+	}
+	if !sameFileVersion(targetInfo, currentTarget) {
+		return false, errors.New(
+			"protected target changed while recovering an interrupted import",
+		)
+	}
+	if err := os.Remove(targetPath); err != nil {
+		return false, fmt.Errorf("remove interrupted encrypted target: %w", err)
+	}
+	return true, nil
 }
 
 func readSourceFile(sourcePath string, maxFileSize int64) ([]byte, os.FileInfo, error) {

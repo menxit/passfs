@@ -34,7 +34,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) error {
 
 	fmt.Fprintln(stdout, "passfs doctor")
 	fmt.Fprintln(stdout)
-	printCapability(stdout, platformFUSECapability())
+	for _, adapter := range platformFilesystemAdapters() {
+		printCapability(stdout, adapter.Capability())
+	}
 	printCapability(stdout, platformPromptCapability())
 
 	settings, settingsErr := passfs.LoadSettings(common.configPath)
@@ -114,7 +116,9 @@ func printMountDiagnosis(writer io.Writer, settings *passfs.Settings) {
 	description := "not mounted"
 	switch {
 	case mount.mounted && mount.passfs && mount.healthy:
-		description = "mounted — " + terminalPath(settings.MountPoint)
+		_, adapter, _ := passfs.MountAdapterStatus(settings.MountPoint)
+		description = "mounted with " + adapter + " — " +
+			terminalPath(settings.MountPoint)
 	case mount.mounted && mount.passfs:
 		description = "mounted but unavailable — run \"passfs reload\""
 	case mount.mounted:
@@ -135,9 +139,16 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: passfs setup [options]")
 	}
 
-	capability := platformFUSECapability()
-	printCapability(stdout, capability)
-	if capability.ready {
+	adapters := platformFilesystemAdapters()
+	preferredReady := false
+	for index, adapter := range adapters {
+		capability := adapter.Capability()
+		printCapability(stdout, capability)
+		if index == 0 {
+			preferredReady = capability.ready
+		}
+	}
+	if preferredReady {
 		if err := guidePlatformPromptSetup(stdout); err != nil {
 			return err
 		}
@@ -154,7 +165,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stdout, "  passfs mount")
 		return nil
 	}
-	return guidePlatformFUSESetup(stdout, !noOpen)
+	return guidePlatformFilesystemSetup(stdout, !noOpen)
 }
 
 func printCapability(writer io.Writer, capability platformCapability) {
