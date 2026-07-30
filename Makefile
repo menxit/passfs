@@ -27,7 +27,7 @@ MACOS_PACKAGE := $(RELEASE_DIR)/PassFS-macos-universal.pkg
 DOCKER ?= docker
 SERVER_TEST_IMAGE ?= passfs-server-test
 
-.PHONY: all build install install-unsigned macos-app macos-package macos-release linux-release release-checksums pages docker-server docker-server-shell test test-scripts test-race vet fskit-check check clean
+.PHONY: all build install install-unsigned macos-app macos-package macos-release linux-release release-checksums pages docker-server docker-server-shell test test-scripts test-race vet cross-build-linux fskit-check check clean
 
 all: build
 
@@ -111,6 +111,9 @@ test-race:
 vet:
 	$(GO_ENV) $(GO) vet ./...
 
+cross-build-linux:
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO_ENV) $(GO) build ./...
+
 ifeq ($(SYSTEM),Darwin)
 fskit-check:
 	./scripts/check-fskit.sh
@@ -121,7 +124,7 @@ fskit-check:
 	@echo "FSKit check skipped on $(SYSTEM)"
 endif
 
-check: test test-scripts vet build
+check: test test-scripts vet build cross-build-linux
 
 clean:
 	rm -rf $(BINARY) $(MACOS_APP) $(RELEASE_ROOT) .pages
