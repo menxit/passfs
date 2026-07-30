@@ -19,7 +19,7 @@ jobs:
     outputs:
       value: ${{ steps.version.outputs.value }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Calculate semantic version
@@ -37,8 +37,8 @@ jobs:
           - macos-latest
           - ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -52,8 +52,8 @@ jobs:
       - verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -74,7 +74,7 @@ jobs:
           PASSFS_NO_MODIFY_PATH=1 \
             ./install.sh
           "${RUNNER_TEMP}/passfs-bin/passfs" version | grep -Fx "passfs ${VERSION}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: passfs-linux-${{ needs.version.outputs.value }}
           path: release/v${{ needs.version.outputs.value }}/*
@@ -96,8 +96,8 @@ jobs:
       NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
       NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -133,9 +133,11 @@ jobs:
             -s -k "$keychain_password" "$keychain_path"
           security list-keychains -d user -s "$keychain_path"
 
-          echo "PASSFS_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
-          echo "PASSFS_PROFILE=$profile_path" >> "$GITHUB_ENV"
-          echo "PASSFS_NOTARY_KEY=$notary_key_path" >> "$GITHUB_ENV"
+          {
+            echo "PASSFS_KEYCHAIN=$keychain_path"
+            echo "PASSFS_PROFILE=$profile_path"
+            echo "PASSFS_NOTARY_KEY=$notary_key_path"
+          } >> "$GITHUB_ENV"
       - name: Build, sign, and notarize
         run: |
           make macos-release \
@@ -148,7 +150,7 @@ jobs:
             MACOS_NOTARY_KEY="$PASSFS_NOTARY_KEY" \
             MACOS_NOTARY_KEY_ID="$NOTARY_KEY_ID" \
             MACOS_NOTARY_ISSUER_ID="$NOTARY_ISSUER_ID"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: passfs-macos-${{ needs.version.outputs.value }}
           path: release/v${{ needs.version.outputs.value }}/PassFS-macos-universal.pkg
@@ -174,8 +176,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: passfs-*-${{ needs.version.outputs.value }}
           path: release/v${{ needs.version.outputs.value }}
@@ -205,7 +207,7 @@ jobs:
       - publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Download current release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -219,7 +221,7 @@ jobs:
           PASSFS_FETCH_GITHUB_RELEASES: "1"
           PASSFS_VERSION: ${{ needs.version.outputs.value }}
         run: ./scripts/prepare-pages.sh
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: .pages
 
@@ -236,4 +238,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
