@@ -71,18 +71,7 @@ func (fsKitFilesystemAdapter) Capability() platformCapability {
 	}
 }
 
-func (fsKitFilesystemAdapter) ValidateSettings(
-	settings *passfs.Settings,
-) error {
-	if settings != nil && !settings.TouchID {
-		return actionableError{
-			"the native FSKit adapter currently requires Touch ID authorization",
-			"enable Touch ID with:",
-			"  passfs touchid enable",
-			"or use the compatibility adapter:",
-			"  passfs mount --adapter fuse",
-		}
-	}
+func (fsKitFilesystemAdapter) ValidateSettings(*passfs.Settings) error {
 	return nil
 }
 
@@ -193,10 +182,23 @@ func (fsKitFilesystemAdapter) Serve(
 	logger := prepared.logger
 	unlockFor := prepared.unlockFor
 	defer linkSynchronizer.Close()
+	authorization := "touchid"
+	if !settings.TouchID {
+		authorization = "passphrase"
+		broker, err := passfs.StartFSKitPassphraseBroker(
+			settings.Vault,
+			prepared.prompter,
+		)
+		if err != nil {
+			return fmt.Errorf("start FSKit passphrase broker: %w", err)
+		}
+		defer broker.Close()
+	}
 	options := []string{
 		"nobrowse",
 		"max-file-size=" + strconv.FormatInt(maxFileSize, 10),
 		"unlock-duration-ns=" + strconv.FormatInt(int64(unlockFor), 10),
+		"authorization=" + authorization,
 	}
 	if debug {
 		options = append(options, "debug")

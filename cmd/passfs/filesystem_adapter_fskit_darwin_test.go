@@ -6,7 +6,39 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"passfs/internal/passfs"
 )
+
+func TestFSKitAcceptsPassphraseAuthorization(t *testing.T) {
+	if err := (fsKitFilesystemAdapter{}).ValidateSettings(
+		&passfs.Settings{TouchID: false},
+	); err != nil {
+		t.Fatalf("ValidateSettings rejected passphrase authorization: %v", err)
+	}
+}
+
+func TestDarwinAutomaticAdapterUsesFSKitExclusivelyOnMacOS26(t *testing.T) {
+	adapters := []filesystemAdapter{
+		testFilesystemAdapter{name: adapterFSKit},
+		testFilesystemAdapter{name: adapterFUSE, ready: true},
+	}
+	selected := darwinAutomaticFilesystemAdapters(26, adapters)
+	if len(selected) != 1 || selected[0].Name() != adapterFSKit {
+		t.Fatalf("automatic adapters = %#v, want only FSKit", selected)
+	}
+}
+
+func TestDarwinAutomaticAdapterKeepsFUSEFallbackBeforeMacOS26(t *testing.T) {
+	adapters := []filesystemAdapter{
+		testFilesystemAdapter{name: adapterFSKit},
+		testFilesystemAdapter{name: adapterFUSE, ready: true},
+	}
+	selected := darwinAutomaticFilesystemAdapters(15, adapters)
+	if len(selected) != 2 {
+		t.Fatalf("automatic adapters = %#v, want version-compatible fallback", selected)
+	}
+}
 
 func TestParseMacOSMajorVersion(t *testing.T) {
 	for input, expected := range map[string]int{

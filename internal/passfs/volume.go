@@ -65,6 +65,7 @@ type Volume struct {
 	config      PublicConfig
 	recipient   age.Recipient
 	prompter    Prompter
+	prompterMu  sync.RWMutex
 	maxFileSize int64
 	unlockFor   time.Duration
 	uid         uint32
@@ -174,6 +175,27 @@ func (v *Volume) Configure(maxFileSize int64, unlockFor time.Duration) error {
 	v.unlockFor = unlockFor
 	v.cachedIdentity = nil
 	clear(v.authorized)
+	return nil
+}
+
+// ConfigurePrompter changes the authorization backend used by future file
+// opens. Existing cached authorizations are discarded before the new backend
+// becomes observable.
+func (v *Volume) ConfigurePrompter(prompter Prompter) error {
+	if prompter == nil {
+		return errors.New("prompter is required")
+	}
+	v.unlockMu.Lock()
+	if v.unlockTimer != nil {
+		v.unlockTimer.Stop()
+		v.unlockTimer = nil
+	}
+	v.cachedIdentity = nil
+	clear(v.authorized)
+	v.prompterMu.Lock()
+	v.prompter = prompter
+	v.prompterMu.Unlock()
+	v.unlockMu.Unlock()
 	return nil
 }
 
@@ -1056,9 +1078,12 @@ func (v *Volume) requestIdentity(
 	ctx context.Context,
 	request PromptRequest,
 ) (*age.X25519Identity, error) {
+	v.prompterMu.RLock()
+	prompter := v.prompter
+	v.prompterMu.RUnlock()
 	var identity *age.X25519Identity
 	var err error
-	if identityPrompter, ok := v.prompter.(IdentityPrompter); ok {
+	if identityPrompter, ok := prompter.(IdentityPrompter); ok {
 		identity, err = identityPrompter.PromptIdentity(ctx, request)
 		if err != nil {
 			return nil, err
@@ -1068,7 +1093,7 @@ func (v *Volume) requestIdentity(
 			ctx,
 			v.root,
 			v.config,
-			v.prompter,
+			prompter,
 			request,
 		)
 		if unlockErr != nil {

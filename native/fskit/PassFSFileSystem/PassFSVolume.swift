@@ -49,7 +49,8 @@ final class PassFSVolume: FSVolume,
     func configure(_ configuration: PassFSConfiguration) throws {
         try bridge.configure(
             maximumFileSize: configuration.maximumFileSize,
-            unlockDurationNanoseconds: configuration.unlockDurationNanoseconds
+            unlockDurationNanoseconds: configuration.unlockDurationNanoseconds,
+            authorizationMode: configuration.authorizationMode
         )
     }
 

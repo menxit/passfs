@@ -28,8 +28,11 @@ import (
 const maximumCGoBytesLength = uint64(1<<31 - 1)
 
 type mountedFileSystem struct {
-	volume     *passfs.Volume
-	fileSystem fsapi.FileSystem
+	mu                sync.Mutex
+	volume            *passfs.Volume
+	fileSystem        fsapi.FileSystem
+	vault             string
+	authorizationMode uint32
 }
 
 //export passfs_bridge_volume_id
@@ -217,6 +220,7 @@ func passfs_bridge_open_file_system(
 	vaultPath *C.char,
 	maximumFileSize C.int64_t,
 	unlockDuration C.int64_t,
+	authorizationMode C.uint32_t,
 	errorMessage **C.char,
 ) C.uint64_t {
 	vault := cString(vaultPath)
@@ -224,9 +228,10 @@ func passfs_bridge_open_file_system(
 		storeBridgeError(errorMessage, errors.New("vault path is required"))
 		return 0
 	}
-	prompter, err := passfs.NewTouchIDPrompter(vault)
+	mode := uint32(authorizationMode)
+	prompter, err := newFSKitPrompter(vault, mode)
 	if err != nil {
-		storeBridgeError(errorMessage, fmt.Errorf("initialize Touch ID: %w", err))
+		storeBridgeError(errorMessage, fmt.Errorf("initialize FSKit authorization: %w", err))
 		return 0
 	}
 	volume, err := passfs.LoadVolume(
@@ -242,8 +247,10 @@ func passfs_bridge_open_file_system(
 	bridgeRegistry.Lock()
 	identifier := bridgeRegistry.nextIdentifierLocked()
 	bridgeRegistry.fileSystems[identifier] = &mountedFileSystem{
-		volume:     volume,
-		fileSystem: passfs.NewFileSystem(volume),
+		volume:            volume,
+		fileSystem:        passfs.NewFileSystem(volume),
+		vault:             vault,
+		authorizationMode: mode,
 	}
 	bridgeRegistry.Unlock()
 	return C.uint64_t(identifier)
@@ -254,11 +261,25 @@ func passfs_bridge_configure_file_system(
 	identifier C.uint64_t,
 	maximumFileSize C.int64_t,
 	unlockDuration C.int64_t,
+	authorizationMode C.uint32_t,
 	errorMessage **C.char,
 ) C.int {
 	fileSystem, ok := bridgeFileSystem(uint64(identifier))
 	if !ok {
 		return C.int(syscall.EBADF)
+	}
+	fileSystem.mu.Lock()
+	defer fileSystem.mu.Unlock()
+	mode := uint32(authorizationMode)
+	var prompter passfs.Prompter
+	var err error
+	if mode != uint32(C.PASSFS_AUTHORIZATION_UNCHANGED) &&
+		mode != fileSystem.authorizationMode {
+		prompter, err = newFSKitPrompter(fileSystem.vault, mode)
+		if err != nil {
+			storeBridgeError(errorMessage, err)
+			return C.int(syscall.EINVAL)
+		}
 	}
 	if err := fileSystem.volume.Configure(
 		int64(maximumFileSize),
@@ -267,7 +288,25 @@ func passfs_bridge_configure_file_system(
 		storeBridgeError(errorMessage, err)
 		return C.int(syscall.EINVAL)
 	}
+	if prompter != nil {
+		if err := fileSystem.volume.ConfigurePrompter(prompter); err != nil {
+			storeBridgeError(errorMessage, err)
+			return C.int(syscall.EINVAL)
+		}
+		fileSystem.authorizationMode = mode
+	}
 	return 0
+}
+
+func newFSKitPrompter(vault string, authorizationMode uint32) (passfs.Prompter, error) {
+	switch authorizationMode {
+	case uint32(C.PASSFS_AUTHORIZATION_TOUCH_ID):
+		return passfs.NewTouchIDPrompter(vault)
+	case uint32(C.PASSFS_AUTHORIZATION_PASSPHRASE):
+		return passfs.NewFSKitPassphrasePrompter(vault)
+	default:
+		return nil, errors.New("unsupported FSKit authorization mode")
+	}
 }
 
 //export passfs_bridge_close_file_system

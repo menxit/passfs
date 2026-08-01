@@ -81,6 +81,17 @@ else
 		-c "Add :com.apple.security.app-sandbox bool true" \
 		"$entitlements"
 fi
+if /usr/libexec/PlistBuddy \
+	-c "Print :com.apple.security.network.client" \
+	"$entitlements" >/dev/null 2>&1; then
+	/usr/libexec/PlistBuddy \
+		-c "Set :com.apple.security.network.client true" \
+		"$entitlements"
+else
+	/usr/libexec/PlistBuddy \
+		-c "Add :com.apple.security.network.client bool true" \
+		"$entitlements"
+fi
 
 xcode_architectures=$(
 	"$project_root/scripts/build-fskit-bridge.sh" \

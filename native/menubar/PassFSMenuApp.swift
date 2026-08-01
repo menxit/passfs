@@ -20,6 +20,9 @@ struct PassFSMenuApp: App {
                 model: model,
                 open: { tab in
                     appDelegate.showManager(tab: tab)
+                },
+                showAbout: {
+                    appDelegate.showAbout()
                 }
             )
                 .task {
@@ -164,6 +167,7 @@ private struct PassFSStatusIcon: View {
 private struct PassFSMenuControls: View {
     @ObservedObject var model: PassFSModel
     let open: (PassFSTab) -> Void
+    let showAbout: () -> Void
 
     var body: some View {
         Label(
@@ -237,6 +241,10 @@ private struct PassFSMenuControls: View {
 
         Divider()
 
+        Button(action: showAbout) {
+            Label(localized("About PassFS"), systemImage: "info.circle")
+        }
+
         Button {
             NSApplication.shared.terminate(nil)
         } label: {
@@ -249,6 +257,7 @@ private struct PassFSMenuControls: View {
 private final class PassFSAppDelegate: NSObject, NSApplicationDelegate {
     private var setupWindow: NSWindow?
     private var managerWindow: NSWindow?
+    private var aboutWindow: NSWindow?
     private let managerNavigation = PassFSManagerNavigation()
     private weak var model: PassFSModel?
     private var receivedFSKitSetupRequest = false
@@ -394,6 +403,36 @@ private final class PassFSAppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
+    func showAbout() {
+        if let aboutWindow {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            aboutWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let contentSize = PassFSAboutView.contentSize
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: contentSize),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = localized("About PassFS")
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.contentViewController = NSHostingController(
+            rootView: PassFSAboutView()
+        )
+        window.setContentSize(contentSize)
+        window.center()
+        aboutWindow = window
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
     private func keepManagerVisible() {
         guard let managerWindow else {
             showManager()
@@ -449,6 +488,83 @@ private extension Notification.Name {
     static let passFSFilesystemChanged = Notification.Name(
         "com.menxit.passfs.filesystem-changed"
     )
+}
+
+private struct PassFSAboutView: View {
+    static let contentSize = NSSize(width: 560, height: 400)
+
+    private let applicationVersion = PassFSBuildInfo.applicationVersion
+    private let applicationBuild = PassFSBuildInfo.applicationBuild
+    private let backendVersion = PassFSBuildInfo.backendVersion
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(nsImage: NSImage(named: "PassFS") ?? NSApp.applicationIconImage)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 104, height: 104)
+
+            Text("PassFS")
+                .font(.system(size: 30, weight: .bold))
+
+            VStack(spacing: 5) {
+                Text(localizedFormat(
+                    "Application version: %@ (%@)",
+                    applicationVersion,
+                    applicationBuild
+                ))
+                Text(localizedFormat(
+                    "Go backend version: %@",
+                    backendVersion
+                ))
+            }
+            .font(.system(size: 15, weight: .semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .frame(maxWidth: .infinity)
+
+            Text(localized(
+                "Copyright © 2026 passfs contributors. All rights reserved."
+            ))
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 440)
+        }
+        .padding(.horizontal, 48)
+        .padding(.vertical, 34)
+        .frame(
+            width: Self.contentSize.width,
+            height: Self.contentSize.height
+        )
+    }
+}
+
+private enum PassFSBuildInfo {
+    static let applicationVersion = value(
+        in: .main,
+        key: "CFBundleShortVersionString"
+    )
+    static let applicationBuild = value(in: .main, key: "CFBundleVersion")
+    static let backendVersion: String = {
+        let bundle = Bundle(
+            url: Bundle.main.bundleURL
+                .appendingPathComponent("Contents")
+                .appendingPathComponent("Helpers")
+                .appendingPathComponent("PassFSCLI.bundle")
+        )
+        return bundle?.object(
+            forInfoDictionaryKey: "PassFSBackendVersion"
+        ) as? String ?? value(
+            in: bundle,
+            key: "CFBundleShortVersionString"
+        )
+    }()
+
+    private static func value(in bundle: Bundle?, key: String) -> String {
+        bundle?.object(forInfoDictionaryKey: key) as? String ?? "—"
+    }
 }
 
 private struct FSKitSetupView: View {
@@ -802,11 +918,15 @@ private final class FSKitSetupModel: ObservableObject {
         let assessment = await Task.detached(priority: .utility) {
             PassFSCommands.gatekeeperAssessment()
         }.value
+        let buildVersion = Bundle.main.object(
+            forInfoDictionaryKey: "PassFSBackendVersion"
+        ) as? String ?? ""
+        let isDevelopmentBuild = buildVersion.contains("-dev")
         PassFSSetupLog.write(
             "Gatekeeper accepted=\(assessment.accepted); \(assessment.detail)",
-            isError: !assessment.accepted
+            isError: !assessment.accepted && !isDevelopmentBuild
         )
-        if !assessment.accepted {
+        if !assessment.accepted && !isDevelopmentBuild {
             gatekeeperMessage = localized(
                 "This PassFS build is not notarized by Apple. Install a notarized PassFS package before enabling its File System Extension."
             )
@@ -880,23 +1000,6 @@ private final class FSKitSetupModel: ObservableObject {
         hasError = false
         message = nil
         do {
-            let touchIDEnabled = try? await Task.detached(priority: .utility) {
-                try PassFSCommands.loadSnapshot(includeScan: false).touchID
-            }.value
-            if touchIDEnabled == false {
-                PassFSSetupLog.write(
-                    "Touch ID is disabled; enabling it for the native FSKit adapter"
-                )
-                _ = try await Task.detached(priority: .userInitiated) {
-                    try PassFSCommands.run([
-                        "touchid",
-                        "enable",
-                        "--prompt",
-                        "native",
-                    ])
-                }.value
-                PassFSSetupLog.write("Touch ID enabled for FSKit")
-            }
             let output = try await Task.detached(priority: .userInitiated) {
                 try PassFSCommands.run([
                     "init",
@@ -1949,8 +2052,10 @@ private final class PassFSModel: ObservableObject {
         let arguments = enabled
             ? ["touchid", "enable", "--prompt", "native"]
             : ["touchid", "disable"]
-        runOptimisticAction(
-            arguments,
+        let commands = mounted ? [arguments, ["reload"]] : [arguments]
+        performAction(
+            commands,
+            showsProgress: false,
             apply: {
                 self.touchIDEnabled = enabled
             },

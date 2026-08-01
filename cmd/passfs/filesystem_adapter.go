@@ -14,6 +14,7 @@ import (
 type preparedFilesystemService struct {
 	volume       *passfs.Volume
 	synchronizer *passfs.LinkSynchronizer
+	prompter     passfs.Prompter
 	logger       *log.Logger
 	unlockFor    time.Duration
 }
@@ -61,6 +62,7 @@ func prepareFilesystemService(
 	return &preparedFilesystemService{
 		volume:       volume,
 		synchronizer: synchronizer,
+		prompter:     prompter,
 		logger:       logger,
 		unlockFor:    unlockFor,
 	}, nil
@@ -152,6 +154,25 @@ func selectFilesystemAdapter(
 	settings *passfs.Settings,
 ) (filesystemAdapter, error) {
 	adapters := platformFilesystemAdapters()
+	normalized, err := normalizeFilesystemAdapter(requested, adapters)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == adapterAuto {
+		adapters = platformAutomaticFilesystemAdapters(adapters)
+	}
+	return selectFilesystemAdapterFrom(
+		normalized,
+		settings,
+		adapters,
+	)
+}
+
+func selectFilesystemAdapterFrom(
+	requested string,
+	settings *passfs.Settings,
+	adapters []filesystemAdapter,
+) (filesystemAdapter, error) {
 	var err error
 	requested, err = normalizeFilesystemAdapter(requested, adapters)
 	if err != nil {

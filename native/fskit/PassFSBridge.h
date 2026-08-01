@@ -24,6 +24,12 @@ enum {
     PASSFS_SET_MODIFY_TIME = 1u << 5
 };
 
+enum {
+    PASSFS_AUTHORIZATION_UNCHANGED = 0,
+    PASSFS_AUTHORIZATION_TOUCH_ID = 1,
+    PASSFS_AUTHORIZATION_PASSPHRASE = 2
+};
+
 typedef struct passfs_attributes {
     uint32_t item_type;
     uint32_t mode;
@@ -67,6 +73,7 @@ uint64_t passfs_bridge_open_file_system(
     const char *vault_path,
     int64_t maximum_file_size,
     int64_t unlock_duration_ns,
+    uint32_t authorization_mode,
     char **error_message
 );
 
@@ -76,6 +83,7 @@ int passfs_bridge_configure_file_system(
     uint64_t file_system,
     int64_t maximum_file_size,
     int64_t unlock_duration_ns,
+    uint32_t authorization_mode,
     char **error_message
 );
 

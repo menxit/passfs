@@ -91,8 +91,31 @@ func platformFilesystemAdapters() []filesystemAdapter {
 	}
 }
 
+func platformAutomaticFilesystemAdapters(
+	adapters []filesystemAdapter,
+) []filesystemAdapter {
+	major, err := macOSMajorVersion()
+	if err != nil {
+		return adapters
+	}
+	return darwinAutomaticFilesystemAdapters(major, adapters)
+}
+
+func darwinAutomaticFilesystemAdapters(
+	major int,
+	adapters []filesystemAdapter,
+) []filesystemAdapter {
+	if major < 26 {
+		return adapters
+	}
+	if adapter := filesystemAdapterNamed(adapters, adapterFSKit); adapter != nil {
+		return []filesystemAdapter{adapter}
+	}
+	return adapters
+}
+
 func preparePlatformFilesystemForInit(
-	settings *passfs.Settings,
+	_ *passfs.Settings,
 	requested string,
 	writer io.Writer,
 ) error {
@@ -103,22 +126,16 @@ func preparePlatformFilesystemForInit(
 	if err != nil || major < 26 {
 		return nil
 	}
-	if requested == adapterAuto && settings != nil && !settings.TouchID {
-		return nil
-	}
 	extensionPath, extensionErr := embeddedFSKitExtensionPath()
 	if extensionErr == nil {
 		_, extensionErr = os.Stat(extensionPath)
 	}
 	if extensionErr != nil {
-		if requested == adapterFSKit {
-			return actionableError{
-				"the PassFS File System Extension is not installed",
-				"install the signed PassFS package, then rerun:",
-				"  passfs init",
-			}
+		return actionableError{
+			"the PassFS File System Extension is not installed",
+			"install the signed PassFS package, then rerun:",
+			"  passfs init",
 		}
-		return nil
 	}
 	fmt.Fprintln(writer, "Filesystem: Apple FSKit (default)")
 	return nil

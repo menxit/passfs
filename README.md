@@ -270,8 +270,9 @@ file.
 of the age identity is protected by the currently enrolled fingerprints.
 
 On a Mac without Touch ID, initialization continues normally and reports that
-passphrase authorization will be used instead. With `--unlock-for 0`, every
-protected file open then asks for the passphrase.
+passphrase authorization will be used instead. FSKit remains the native
+frontend; macFUSE is not selected merely because Touch ID is disabled. With
+`--unlock-for 0`, every protected file open then asks for the passphrase.
 
 When Touch ID is enabled, the default `--unlock-for 0` requires it for every
 file open. `passfs edit FILE` requires it once for the whole edit session.

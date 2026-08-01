@@ -20,6 +20,12 @@ func platformFilesystemAdapters() []filesystemAdapter {
 	return []filesystemAdapter{fuseFilesystemAdapter{}}
 }
 
+func platformAutomaticFilesystemAdapters(
+	adapters []filesystemAdapter,
+) []filesystemAdapter {
+	return adapters
+}
+
 func preparePlatformFilesystemForInit(
 	_ *passfs.Settings,
 	_ string,

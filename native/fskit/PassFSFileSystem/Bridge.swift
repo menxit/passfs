@@ -75,7 +75,8 @@ final class PassFSBridge {
     init(
         vaultPath: String,
         maximumFileSize: Int64 = 16 * 1024 * 1024,
-        unlockDurationNanoseconds: Int64 = 0
+        unlockDurationNanoseconds: Int64 = 0,
+        authorizationMode: UInt32 = UInt32(PASSFS_AUTHORIZATION_TOUCH_ID)
     ) throws {
         var errorMessage: UnsafeMutablePointer<CChar>?
         identifier = vaultPath.withCString { path in
@@ -83,6 +84,7 @@ final class PassFSBridge {
                 path,
                 maximumFileSize,
                 unlockDurationNanoseconds,
+                authorizationMode,
                 &errorMessage
             )
         }
@@ -136,13 +138,17 @@ final class PassFSBridge {
 
     func configure(
         maximumFileSize: Int64,
-        unlockDurationNanoseconds: Int64
+        unlockDurationNanoseconds: Int64,
+        authorizationMode: UInt32?
     ) throws {
         var errorMessage: UnsafeMutablePointer<CChar>?
         let code = passfs_bridge_configure_file_system(
             identifier,
             maximumFileSize,
             unlockDurationNanoseconds,
+            authorizationMode ?? UInt32(
+                PASSFS_AUTHORIZATION_UNCHANGED
+            ),
             &errorMessage
         )
         guard code == 0 else {

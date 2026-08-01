@@ -3,6 +3,10 @@
 "Start" = "Iniciar";
 "Stop" = "Detener";
 "Quit PassFS App" = "Salir de la app PassFS";
+"About PassFS" = "Acerca de PassFS";
+"Application version: %@ (%@)" = "Versión de la aplicación: %@ (%@)";
+"Go backend version: %@" = "Versión del backend Go: %@";
+"Copyright © 2026 passfs contributors. All rights reserved." = "Copyright © 2026 colaboradores de passfs. Todos los derechos reservados.";
 "Update PassFS to %@…" = "Actualizar PassFS a la versión %@…";
 "PassFS is up to date" = "PassFS está actualizado";
 "PassFS couldn’t start the protected filesystem" = "PassFS no pudo iniciar el sistema de archivos protegido";

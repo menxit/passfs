@@ -79,7 +79,10 @@ final class PassFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
             let bridge = try PassFSBridge(
                 vaultPath: pathResource.url.path,
                 maximumFileSize: configuration.maximumFileSize,
-                unlockDurationNanoseconds: configuration.unlockDurationNanoseconds
+                unlockDurationNanoseconds: configuration.unlockDurationNanoseconds,
+                authorizationMode: configuration.authorizationMode ?? UInt32(
+                    PASSFS_AUTHORIZATION_TOUCH_ID
+                )
             )
             let volume = try PassFSVolume(
                 bridge: bridge,
@@ -161,6 +164,7 @@ private func passFSVolumeUUID(at vault: URL) -> UUID? {
 struct PassFSConfiguration {
     var maximumFileSize: Int64 = 16 * 1024 * 1024
     var unlockDurationNanoseconds: Int64 = 0
+    var authorizationMode: UInt32?
 }
 
 func passFSConfiguration(
@@ -201,6 +205,22 @@ func passFSConfiguration(
                 throw POSIXError(.EINVAL)
             }
             configuration.unlockDurationNanoseconds = duration
+        case "authorization":
+            guard parts.count == 2 else {
+                throw POSIXError(.EINVAL)
+            }
+            switch parts[1] {
+            case "touchid":
+                configuration.authorizationMode = UInt32(
+                    PASSFS_AUTHORIZATION_TOUCH_ID
+                )
+            case "passphrase":
+                configuration.authorizationMode = UInt32(
+                    PASSFS_AUTHORIZATION_PASSPHRASE
+                )
+            default:
+                throw POSIXError(.EINVAL)
+            }
         case "debug", "nobrowse", "rw":
             break
         case "ro", "rdonly":

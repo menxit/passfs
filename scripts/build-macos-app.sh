@@ -124,10 +124,16 @@ plist_version=${release_version%%-*}
 	-c "Set :CFBundleVersion $build_number" \
 	"$staged_app/Contents/Info.plist"
 /usr/libexec/PlistBuddy \
+	-c "Add :PassFSBackendVersion string $release_version" \
+	"$staged_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy \
 	-c "Set :CFBundleShortVersionString $plist_version" \
 	"$cli_bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy \
 	-c "Set :CFBundleVersion $build_number" \
+	"$cli_bundle/Contents/Info.plist"
+/usr/libexec/PlistBuddy \
+	-c "Add :PassFSBackendVersion string $release_version" \
 	"$cli_bundle/Contents/Info.plist"
 binary_count=0
 for architecture in $architectures; do

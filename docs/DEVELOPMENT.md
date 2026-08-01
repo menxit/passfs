@@ -72,10 +72,13 @@ registration. Native types must not leak into `internal/passfs`.
 The FSKit extension is sandboxed to its path resource. Its adapter therefore
 validates project-side links in the CLI and updates vault metadata under
 `metadata.lock`; every `Volume` metadata mutation takes the same inter-process
-lock and merges the latest on-disk state. Continuous project-side link
+lock and merges the latest on-disk state. When Touch ID is disabled, the
+extension forwards passphrase requests to the supervised CLI through a private
+Unix socket in the extension container. Both peers validate UID, code
+signature, Team ID, and bundle identifier before exchanging a prompt.
+Continuous project-side link
 move/deletion tracking is still FUSE-only because safely coordinating backing
-file namespace operations across the service and extension requires a
-dedicated companion control channel.
+file namespace operations requires a broader companion control channel.
 
 On macOS, `make install` is a maintainer-oriented target because a Touch
 ID-capable app must be signed with the passfs Developer ID identity and

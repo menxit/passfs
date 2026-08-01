@@ -446,6 +446,49 @@ func TestIdentityPrompterUnlocksWithoutRequestingPassphrase(t *testing.T) {
 	}
 }
 
+func TestConfigurePrompterChangesAuthorizationBackend(t *testing.T) {
+	const passphrase = "replacement authorization passphrase"
+	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)
+	objectID, err := newObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage, err := objectStoragePath(objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext := []byte("TOKEN=reconfigured\n")
+	createTestFile(t, volume, storage, plaintext)
+
+	original := &recordingPrompter{fallback: "wrong passphrase"}
+	reader, err := LoadVolume(volume.root, original, 1024*1024, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := &recordingPrompter{fallback: passphrase}
+	if err := reader.ConfigurePrompter(replacement); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := reader.openFile(t.Context(), storage, syscall.O_RDONLY)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close(t.Context())
+	if got := readOpenFile(t, handle); !bytes.Equal(got, plaintext) {
+		t.Fatalf("plaintext = %q, want %q", got, plaintext)
+	}
+	if original.requestCount() != 0 || replacement.requestCount() != 1 {
+		t.Fatalf(
+			"prompt counts = original %d, replacement %d; want 0, 1",
+			original.requestCount(),
+			replacement.requestCount(),
+		)
+	}
+	if err := reader.ConfigurePrompter(nil); err == nil {
+		t.Fatal("ConfigurePrompter accepted a nil prompter")
+	}
+}
+
 func TestUnlockWindowReusesIdentityAcrossFilesInMemory(t *testing.T) {
 	const passphrase = "cached password"
 	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)

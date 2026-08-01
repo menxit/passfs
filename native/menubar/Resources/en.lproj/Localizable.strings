@@ -3,6 +3,10 @@
 "Start" = "Start";
 "Stop" = "Stop";
 "Quit PassFS App" = "Quit PassFS App";
+"About PassFS" = "About PassFS";
+"Application version: %@ (%@)" = "Application version: %@ (%@)";
+"Go backend version: %@" = "Go backend version: %@";
+"Copyright © 2026 passfs contributors. All rights reserved." = "Copyright © 2026 passfs contributors. All rights reserved.";
 "Update PassFS to %@…" = "Update PassFS to %@…";
 "PassFS is up to date" = "PassFS is up to date";
 "PassFS couldn’t start the protected filesystem" = "PassFS couldn’t start the protected filesystem";
