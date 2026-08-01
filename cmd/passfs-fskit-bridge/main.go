@@ -221,6 +221,7 @@ func passfs_bridge_open_file_system(
 	vaultPath *C.char,
 	maximumFileSize C.int64_t,
 	unlockDuration C.int64_t,
+	unlockScope C.uint32_t,
 	authorizationMode C.uint32_t,
 	errorMessage **C.char,
 ) C.uint64_t {
@@ -235,11 +236,17 @@ func passfs_bridge_open_file_system(
 		storeBridgeError(errorMessage, fmt.Errorf("initialize FSKit authorization: %w", err))
 		return 0
 	}
-	volume, err := passfs.LoadVolume(
+	scope, err := bridgeUnlockScope(uint32(unlockScope))
+	if err != nil {
+		storeBridgeError(errorMessage, err)
+		return 0
+	}
+	volume, err := passfs.LoadVolumeWithScope(
 		vault,
 		prompter,
 		int64(maximumFileSize),
 		time.Duration(unlockDuration),
+		scope,
 	)
 	if err != nil {
 		storeBridgeError(errorMessage, err)
@@ -272,6 +279,7 @@ func passfs_bridge_configure_file_system(
 	identifier C.uint64_t,
 	maximumFileSize C.int64_t,
 	unlockDuration C.int64_t,
+	unlockScope C.uint32_t,
 	authorizationMode C.uint32_t,
 	errorMessage **C.char,
 ) C.int {
@@ -292,9 +300,15 @@ func passfs_bridge_configure_file_system(
 			return C.int(syscall.EINVAL)
 		}
 	}
-	if err := fileSystem.volume.Configure(
+	scope, err := bridgeUnlockScope(uint32(unlockScope))
+	if err != nil {
+		storeBridgeError(errorMessage, err)
+		return C.int(syscall.EINVAL)
+	}
+	if err := fileSystem.volume.ConfigureAuthorization(
 		int64(maximumFileSize),
 		time.Duration(unlockDuration),
+		scope,
 	); err != nil {
 		storeBridgeError(errorMessage, err)
 		return C.int(syscall.EINVAL)
@@ -307,6 +321,21 @@ func passfs_bridge_configure_file_system(
 		fileSystem.authorizationMode = mode
 	}
 	return 0
+}
+
+func bridgeUnlockScope(value uint32) (passfs.UnlockScope, error) {
+	switch value {
+	case uint32(C.PASSFS_UNLOCK_ONCE):
+		return passfs.UnlockOnce, nil
+	case uint32(C.PASSFS_UNLOCK_FILE):
+		return passfs.UnlockFile, nil
+	case uint32(C.PASSFS_UNLOCK_PROCESS):
+		return passfs.UnlockProcess, nil
+	case uint32(C.PASSFS_UNLOCK_VAULT):
+		return passfs.UnlockVault, nil
+	default:
+		return "", errors.New("unsupported authorization cache scope")
+	}
 }
 
 func newFSKitPrompter(vault string, authorizationMode uint32) (passfs.Prompter, error) {

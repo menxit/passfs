@@ -50,6 +50,7 @@ final class PassFSVolume: FSVolume,
         try bridge.configure(
             maximumFileSize: configuration.maximumFileSize,
             unlockDurationNanoseconds: configuration.unlockDurationNanoseconds,
+            unlockScope: configuration.unlockScope,
             authorizationMode: configuration.authorizationMode
         )
     }

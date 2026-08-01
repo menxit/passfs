@@ -7,6 +7,54 @@ import (
 	"path/filepath"
 )
 
+// retireProtectedLink removes exactly the PassFS symlink that was moved aside
+// by an atomic save. The pathname is first renamed to a private same-directory
+// staging area, so a concurrent replacement is validated and restored instead
+// of being accidentally unlinked.
+func retireProtectedLink(path, storage string) (resultErr error) {
+	parent := filepath.Dir(path)
+	staging, err := os.MkdirTemp(parent, ".passfs-retire-*")
+	if err != nil {
+		return err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(staging)
+		}
+	}()
+	displaced := filepath.Join(staging, "link")
+	if err := os.Rename(path, displaced); err != nil {
+		return err
+	}
+	restore := func(cause error) error {
+		if err := renameNoReplace(displaced, path); err != nil {
+			cleanup = false
+			return errors.Join(
+				cause,
+				fmt.Errorf("restore concurrent replacement: %w", err),
+				fmt.Errorf("the displaced entry was preserved at %s", displaced),
+			)
+		}
+		return errors.Join(cause, syncDirectory(parent))
+	}
+	link, err := inspectProtectedLink(displaced)
+	if err != nil {
+		return restore(err)
+	}
+	if !link.isSymlink || !targetMatchesStorage(link.target, storage) {
+		return restore(errors.New("moved entry is no longer the expected PassFS link"))
+	}
+	if err := os.Remove(displaced); err != nil {
+		return restore(err)
+	}
+	if err := os.Remove(staging); err != nil {
+		return err
+	}
+	cleanup = false
+	return syncDirectory(parent)
+}
+
 // exchangePathWithSymlink atomically installs a symlink and validates the
 // displaced entry before deleting it. If validation fails, the original entry
 // is swapped back. A failed rollback preserves the displaced entry for manual

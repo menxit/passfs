@@ -198,6 +198,7 @@ func (fsKitFilesystemAdapter) Serve(
 		"nobrowse",
 		"max-file-size=" + strconv.FormatInt(maxFileSize, 10),
 		"unlock-duration-ns=" + strconv.FormatInt(int64(unlockFor), 10),
+		"unlock-scope=" + string(prepared.unlockScope),
 		"authorization=" + authorization,
 	}
 	if debug {

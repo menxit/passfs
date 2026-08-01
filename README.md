@@ -188,19 +188,30 @@ Running `passfs encrypt FILE` again is safe. If an older passfs version already
 encrypted the file but removed its original pathname, the command recreates the
 missing link without re-encrypting the data.
 
-Deleting the symbolic link deletes its encrypted file shortly afterward. If the
-service observes the deletion, deleting a directory containing protected links
-has the same effect. Renaming a protected link, moving it to another directory,
-or renaming one of its parent directories is tracked automatically while
-passfs is running, as long as the move stays on the same filesystem.
+Deleting the symbolic link never deletes its encrypted file. PassFS moves the
+object into its recovery state after a short race-settling window. Renaming a
+protected link, moving it to another directory, or renaming one of its parent
+directories is tracked automatically while passfs is running, as long as the
+move stays on the same filesystem.
 
 When passfs starts, it reconciles protected links that were renamed, moved, or
 deleted while the filesystem was stopped. A moved link keeps its original
-contents at the new pathname; a deleted link also removes its encrypted copy,
-so the old pathname can immediately be reused and protected again.
+contents at the new pathname; a deleted link remains recoverable.
 
-Do not replace a protected link with a regular file. Some editors implement
-atomic saves by replacing the pathname and can therefore bypass the link.
+If an editor performs an atomic save by replacing the symbolic link, PassFS
+records an explicit conflict and preserves the previous ciphertext. The new
+regular file is never overwritten automatically. Inspect and resolve these
+states with:
+
+```sh
+passfs recovery list
+passfs recovery restore OBJECT_ID
+# irreversible and accepted only while unmounted
+passfs recovery purge --yes OBJECT_ID
+```
+
+For a conflict, move the replacement file aside before restoring the old link,
+or run `passfs encrypt FILE` to explicitly accept the replacement contents.
 
 If a command reports an unavailable mount, recover it with:
 
@@ -238,24 +249,25 @@ automatic startup is disabled.
 
 ## Passphrase frequency
 
-The default is:
+The default is one authorization per open:
 
 ```sh
-passfs config --unlock-for 0
+passfs config --unlock-for 0 --unlock-scope once
 ```
 
-Every open asks for Touch ID on macOS or the passphrase on Linux. To keep the
-vault unlocked for five minutes after a successful authorization:
+Every open asks for Touch ID on macOS or the passphrase on Linux. To reuse an
+authorization for the same file for five minutes:
 
 ```sh
-passfs config --unlock-for 5m
+passfs config --unlock-for 5m --unlock-scope file
 ```
 
-The cache applies to the whole vault and exists only in the passfs process
-memory. On macOS it is cleared whenever the computer sleeps or wakes, so the
-next protected-file open always requires a new authorization. If the filesystem
-is running, `passfs config` restarts it automatically so the new duration takes
-effect immediately.
+Available scopes are `once`, `file`, `process`, and `vault`. `process` reuses an
+authorization only for requests from the same process; `vault` is the broadest
+and should be selected deliberately. A request without a protected object path
+is never cached. The identity exists only in passfs process memory. On macOS the
+cache is cleared whenever the computer sleeps or wakes. If the filesystem is
+running, `passfs config` restarts it automatically so changes take effect.
 
 Change the global passphrase with:
 
@@ -351,46 +363,89 @@ The original pathname is kept only in protected metadata. Renaming or moving
 the symbolic link does not rename or move the encrypted object. Existing
 vaults using the previous path-based layout are migrated automatically.
 
-## Backup
+## Backup and restore
 
-The age private identity is stored at:
+On macOS, open **Settings > Backup and Restore** in the PassFS manager to
+create and verify a backup, verify an existing backup, or restore into a new
+vault. Creating a backup temporarily stops an active filesystem and restores
+its previous state afterward. Restore asks whether the new vault should remain
+inactive or replace the active vault; activation rolls back to the previous
+vault if PassFS cannot restart.
 
-```text
-~/.passfs/vault/.passfs/identity.age
-```
-
-Copy it to a secure offline location:
+Stop PassFS before taking a consistent backup, then create and cryptographically
+verify every encrypted object with one authorization:
 
 ```sh
-cp ~/.passfs/vault/.passfs/identity.age /path/to/secure-backup/identity.age
+passfs unmount
+passfs backup create /path/to/passfs-backup
+passfs backup verify /path/to/passfs-backup
+passfs vault verify
 ```
 
-`identity.age` is encrypted with the passphrase chosen during `passfs init`.
-Store that passphrase separately in a password manager. The device-local Touch
-ID copy is not a substitute for this backup.
+For the same automatic stop/restart behavior used by the macOS UI, pass
+`--restart-service` to `passfs backup create`.
 
-## Security limitations
+The backup contains the encrypted vault plus a versioned SHA-256 manifest. Both
+checksum verification and successful age decryption are required. Restore only
+to a new directory; PassFS never overwrites an existing vault:
 
-passfs does not write decrypted protected-file contents to its own backing
-storage, but it cannot hide plaintext from the application that opens a file.
-Plaintext exists in the passfs process memory and is delivered to the requesting
-process.
+```sh
+passfs backup restore --vault /path/to/new-vault /path/to/passfs-backup
+```
 
-Applications may copy secrets into logs, caches, crash dumps, or other files.
-The initial import removes the live plaintext pathname but cannot securely erase
-previous SSD blocks, snapshots, or backups. Software running as the same OS user
-may also inspect processes or access a file while it is authorized.
-During a `passfs edit` session, this includes other processes running as the
-same user that open the file being edited.
+Add `--activate` to make the restored vault active. PassFS preserves whether
+the filesystem was running and restores the previous vault selection if the
+new vault cannot be mounted.
 
-A process that can write to the protected file's parent directory can remove its
-symbolic link and thereby delete the ciphertext. If it replaces the link with a
-new entry, passfs preserves the ciphertext and refuses to overwrite that entry,
-but it cannot prevent an unprotected plaintext file from occupying the original
-pathname. Use `passfs edit` or software known to preserve symbolic links.
+Store the recovery passphrase separately in a password manager. The
+device-local Touch ID identity is tied to one Mac and is not a backup.
 
-Use full-disk encryption, trusted applications, restricted permissions, and an
-appropriate backup policy as additional protections.
+## Threat model and security limitations
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting, audit status,
+component trust boundaries, and the checks performed on signed releases.
+
+PassFS is designed to protect secrets at rest when the vault, a disk, or a
+backup is copied without the recovery passphrase or authorized device identity.
+It provides authenticated age encryption for file contents, transactional
+writes, explicit authorization scopes, non-destructive link recovery, and
+backup integrity checks.
+
+PassFS does **not** protect against root, malware or untrusted software running
+as the same OS user, a process authorized to read the secret, screen/keyboard
+capture, or an application that copies plaintext into logs, caches, crash dumps,
+swap, another file, or a network request. Plaintext necessarily exists in the
+PassFS process memory and in the requesting process. During `passfs edit`, the
+authorized edit session also permits related editor processes to access that
+one file.
+
+Original pathnames, sizes and timestamps are metadata and are not encrypted.
+The initial import cannot securely erase old SSD blocks, filesystem snapshots,
+cloud history or pre-existing backups. Full-disk encryption and an appropriate
+retention policy are still required.
+
+On macOS, the menu application and FSKit extension run in App Sandbox. The UI
+does not read the home directory or secret files directly: a separately signed
+background agent returns paths, presentation metadata and masked previews
+through a mode-0600 App Group socket. That agent remains outside App Sandbox
+because the scanner must inspect likely credential locations across the user's
+home. It verifies the peer UID, Team ID, code signature and exact bundle ID,
+then accepts a closed set of typed operations rather than CLI arguments.
+Passphrases are exchanged only by the dedicated FSKit authorization broker and
+are not written to the App Group container.
+
+A writer to a protected file's parent directory can delete or replace its
+symbolic link. PassFS preserves the ciphertext as `trash` or `conflict` and
+never overwrites the replacement automatically, but it cannot stop plaintext
+from occupying the original pathname. Absolute protected-link targets must also
+be visible inside containers or sandboxed applications; a project-only Docker
+bind mount does not automatically expose the PassFS mount.
+
+The SHA-256 backup manifest detects accidental corruption and files omitted or
+added after creation. Verification additionally authenticates every ciphertext
+by decrypting it with age. The manifest itself is not a signature against an
+attacker who can rewrite the entire backup and already possesses the volume's
+public recipient, so protect backup storage permissions as well.
 
 ## License
 

@@ -30,6 +30,7 @@ const (
 	authorizationBrokerTimeout         = 50 * time.Second
 	passFSCLIIdentifier                = "com.menxit.passfs"
 	passFSFSKitIdentifier              = "com.menxit.passfs.filesystem"
+	passFSAppGroupIdentifier           = "3943PK2P39.com.menxit.passfs.shared"
 )
 
 type authorizationBrokerRequest struct {
@@ -49,8 +50,9 @@ type authorizationBrokerResponse struct {
 type authorizationPeerValidator func(*net.UnixConn, string) error
 
 // PassphraseBroker presents native passphrase dialogs outside the sandboxed
-// FSKit extension. The socket lives in the extension's private container, and
-// both peers verify the other process before any prompt or secret is exchanged.
+// FSKit extension. The socket lives in the shared PassFS app-group container,
+// and both peers verify the other process before any prompt or secret is
+// exchanged. No passphrase is persisted in that container.
 type PassphraseBroker struct {
 	listener *net.UnixListener
 	prompter Prompter
@@ -411,14 +413,19 @@ func authorizationBrokerRuntimeDirectory(create bool) (string, error) {
 		passFSFSKitIdentifier,
 		"Data",
 	)
-	containerData := filepath.Join(home, containerSuffix)
 	if strings.HasSuffix(filepath.Clean(home), containerSuffix) {
-		containerData = filepath.Clean(home)
+		home = strings.TrimSuffix(filepath.Clean(home), containerSuffix)
+		home = strings.TrimSuffix(home, string(os.PathSeparator))
 	}
-	runtimeDirectory := filepath.Join(containerData, ".passfs")
+	runtimeDirectory := filepath.Join(
+		home,
+		"Library",
+		"Group Containers",
+		passFSAppGroupIdentifier,
+		"Authorization",
+	)
 	if create {
-		if err := os.Mkdir(runtimeDirectory, 0o700); err != nil &&
-			!errors.Is(err, os.ErrExist) {
+		if err := os.MkdirAll(runtimeDirectory, 0o700); err != nil {
 			return "", fmt.Errorf("create PassFS authorization directory: %w", err)
 		}
 	}
@@ -510,4 +517,14 @@ func validateAuthorizationPeer(
 		return errors.New("PassFS authorization peer has invalid credentials")
 	}
 	return validateSignedPassFSProcess(peerPID, expectedIdentifier)
+}
+
+// ValidateSignedLocalPeer verifies that a Unix-socket peer has the current
+// user's credentials and a valid PassFS signature from the same developer
+// team as this process.
+func ValidateSignedLocalPeer(
+	connection *net.UnixConn,
+	expectedIdentifier string,
+) error {
+	return validateAuthorizationPeer(connection, expectedIdentifier)
 }

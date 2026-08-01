@@ -18,6 +18,7 @@ type preparedFilesystemService struct {
 	prompter     passfs.Prompter
 	logger       *log.Logger
 	unlockFor    time.Duration
+	unlockScope  passfs.UnlockScope
 }
 
 func prepareFilesystemService(
@@ -37,11 +38,16 @@ func prepareFilesystemService(
 	if err != nil {
 		return nil, err
 	}
-	volume, err := passfs.LoadVolume(
+	unlockScope, err := settings.AuthorizationScope()
+	if err != nil {
+		return nil, err
+	}
+	volume, err := passfs.LoadVolumeWithScope(
 		settings.Vault,
 		prompter,
 		maxFileSize,
 		unlockFor,
+		unlockScope,
 	)
 	if err != nil {
 		return nil, err
@@ -73,6 +79,7 @@ func prepareFilesystemService(
 		prompter:     prompter,
 		logger:       logger,
 		unlockFor:    unlockFor,
+		unlockScope:  unlockScope,
 	}, nil
 }
 

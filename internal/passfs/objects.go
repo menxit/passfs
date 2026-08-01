@@ -11,12 +11,13 @@ import (
 )
 
 const (
-	metadataFormatVersion       = 2
-	legacyMetadataFormatVersion = 1
-	objectStorageDirectory      = "objects"
-	objectNamespaceDirectory    = "by-id"
-	objectIDLength              = 36
-	objectIDCompactLength       = 32
+	metadataFormatVersion         = 3
+	previousMetadataFormatVersion = 2
+	legacyMetadataFormatVersion   = 1
+	objectStorageDirectory        = "objects"
+	objectNamespaceDirectory      = "by-id"
+	objectIDLength                = 36
+	objectIDCompactLength         = 32
 )
 
 // newObjectID returns an RFC 4122 version-4 identifier. Object identifiers are

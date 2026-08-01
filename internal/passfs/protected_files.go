@@ -26,7 +26,8 @@ func ProtectedFiles(vault string) ([]ProtectedFile, error) {
 		result = make([]ProtectedFile, 0, len(metadata.Files))
 		for key, file := range metadata.Files {
 			path, registered := metadata.Links[key]
-			if !registered || path == "" || metadata.Orphaned[key] != 0 {
+			if !registered || path == "" || metadata.Orphaned[key] != 0 ||
+				metadata.Recovery[key].State != "" {
 				continue
 			}
 			link, err := inspectProtectedLink(path)

@@ -166,6 +166,9 @@ func TestConfigChangePrintsReloadCommand(t *testing.T) {
 	if duration, err := loaded.UnlockDuration(); err != nil || duration != time.Minute {
 		t.Fatalf("unlock duration = %s, %v", duration, err)
 	}
+	if scope, err := loaded.AuthorizationScope(); err != nil || scope != passfs.UnlockFile {
+		t.Fatalf("unlock scope = %q, %v; want file", scope, err)
+	}
 }
 
 func TestUnprotectConfirmationRequiresExactToken(t *testing.T) {

@@ -6,6 +6,8 @@ app_bundle_id="com.menxit.passfs"
 extension_bundle_id="com.menxit.passfs.filesystem"
 package_id="com.menxit.passfs.pkg"
 launch_agent_label="com.menxit.passfs"
+control_agent_label="com.menxit.passfs.control-agent"
+app_group_identifier="3943PK2P39.com.menxit.passfs.shared"
 purge_data=false
 authorized=false
 config_path=""
@@ -15,9 +17,9 @@ usage()
 	cat <<'EOF'
 Usage: uninstall-passfs.sh [--purge-data] [--config PATH]
 
-Removes the installed PassFS application, command-line link, LaunchAgent,
-FSKit registration and enablement state, package receipt, preferences, and
-sandbox container.
+Removes the installed PassFS application, command-line link, agents, FSKit
+registration and enablement state, package receipt, preferences, sandbox
+containers, and non-secret shared runtime state.
 
 The PassFS vault under ~/.passfs is preserved by default. Use
 --purge-data only when you also want to move that vault to the Trash.
@@ -179,6 +181,12 @@ launch_agent="$user_home/Library/LaunchAgents/$launch_agent_label.plist"
 	/usr/bin/sudo -H -u "$console_user" \
 	/bin/launchctl remove "$launch_agent_label.postinstall" \
 	>/dev/null 2>&1 || true
+/bin/launchctl bootout "gui/$user_id/$control_agent_label" \
+	>/dev/null 2>&1 || true
+/bin/launchctl asuser "$user_id" \
+	/usr/bin/sudo -H -u "$console_user" \
+	/bin/launchctl remove "$control_agent_label" \
+	>/dev/null 2>&1 || true
 
 if [ "$purge_data" = true ] &&
 	[ -x "$cli_binary" ] &&
@@ -266,6 +274,12 @@ done
 move_to_trash \
 	"$user_home/Library/Containers/$extension_bundle_id" \
 	"$extension_bundle_id"
+move_to_trash \
+	"$user_home/Library/Containers/$app_bundle_id" \
+	"$app_bundle_id"
+move_to_trash \
+	"$user_home/Library/Group Containers/$app_group_identifier" \
+	"$app_group_identifier"
 
 if [ "$purge_data" = true ]; then
 	config_directory=$(dirname "$config_path")

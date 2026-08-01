@@ -78,6 +78,7 @@ func RegisterProtectedLinkInVault(
 		}
 		metadata.Links[key] = filepath.Clean(source)
 		delete(metadata.Orphaned, key)
+		delete(metadata.Recovery, key)
 		delete(metadata.LegacyTargets, key)
 		return saveMetadata(root, metadata)
 	})

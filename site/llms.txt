@@ -23,8 +23,8 @@ calling internal commands.
   token `UNPROTECT` from a real terminal. Do not bypass this confirmation.
 - Do not edit `~/.passfs/config.json`, the vault metadata, ciphertext, or
   protected symbolic links directly.
-- Never replace a protected symbolic link with a regular file. Prefer
-  `passfs edit FILE` for editors that use atomic replacement.
+- If an editor replaces a protected symbolic link, PassFS preserves the old
+  ciphertext as an explicit conflict. Prefer `passfs edit FILE`.
 
 ## Install
 
@@ -140,11 +140,13 @@ protected link correctly.
 
 While PassFS is running, a rename or move to another directory on the same
 filesystem is tracked automatically, including a renamed parent directory.
-Deleting the link deletes its ciphertext shortly afterward.
+Deleting the link moves its ciphertext into recoverable trash; it is never
+purged implicitly.
 
 When PassFS starts, it reconciles protected links renamed, moved, or deleted
 while the filesystem was stopped. Moved links retain their contents at the new
-pathname; deleted links also remove their encrypted copies.
+pathname; deleted links remain recoverable with `passfs recovery list` and
+`passfs recovery restore OBJECT_ID`.
 
 ## Remove protection from one file
 
@@ -181,17 +183,18 @@ and automatic startup is disabled.
 Require authorization for every file open:
 
 ```sh
-passfs config --unlock-for 0
+passfs config --unlock-for 0 --unlock-scope once
 ```
 
-Keep the vault unlocked for five minutes in PassFS process memory:
+Reuse authorization for the same file for five minutes:
 
 ```sh
-passfs config --unlock-for 5m
+passfs config --unlock-for 5m --unlock-scope file
 ```
 
-The cache applies to the whole vault and is never stored on disk. A running
-filesystem is restarted automatically so the new duration applies immediately.
+Scopes are `once`, `file`, `process`, and `vault`; broad vault caching must be
+selected explicitly. The cache is never stored on disk. A running filesystem
+is restarted automatically so the new settings apply immediately.
 
 ## Service and diagnostics
 
@@ -226,15 +229,17 @@ Touch ID is device-local and is not a recovery key.
 
 ## Backup
 
-Back up this file to secure offline storage:
-
-```text
-~/.passfs/vault/.passfs/identity.age
+```sh
+passfs unmount
+passfs backup create /path/to/passfs-backup
+passfs backup verify /path/to/passfs-backup
+passfs vault verify
+passfs backup restore --vault /path/to/new-vault /path/to/passfs-backup
 ```
 
-It is the single age private identity needed to recover every protected file.
-It is encrypted with the PassFS passphrase. Store that passphrase separately in
-a password manager. Do not treat the Touch ID copy as a backup.
+Creation stores the encrypted vault with a versioned SHA-256 manifest and
+verifies every ciphertext with one authorization. Restore refuses to overwrite
+an existing vault. Store the passphrase separately; Touch ID is not a backup.
 
 ## Updates
 

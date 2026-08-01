@@ -27,6 +27,31 @@ const (
 
 var ErrFileTooLarge = errors.New("plaintext file exceeds the configured maximum size")
 
+type UnlockScope string
+
+const (
+	UnlockOnce    UnlockScope = "once"
+	UnlockFile    UnlockScope = "file"
+	UnlockProcess UnlockScope = "process"
+	UnlockVault   UnlockScope = "vault"
+)
+
+func (scope UnlockScope) Validate() error {
+	switch scope {
+	case UnlockOnce, UnlockFile, UnlockProcess, UnlockVault:
+		return nil
+	default:
+		return fmt.Errorf("invalid authorization scope %q", scope)
+	}
+}
+
+func defaultUnlockScope(duration time.Duration) UnlockScope {
+	if duration > 0 {
+		return UnlockFile
+	}
+	return UnlockOnce
+}
+
 type FileMeta struct {
 	Size  uint64 `json:"size"`
 	Mode  uint32 `json:"mode"`
@@ -35,15 +60,30 @@ type FileMeta struct {
 	Inode uint64 `json:"inode,omitempty"`
 }
 
+type RecoveryState string
+
+const (
+	RecoveryTrash    RecoveryState = "trash"
+	RecoveryConflict RecoveryState = "conflict"
+)
+
+type RecoveryEntry struct {
+	Path             string        `json:"path"`
+	State            RecoveryState `json:"state"`
+	Reason           string        `json:"reason,omitempty"`
+	ObservedUnixNano int64         `json:"observedUnixNano"`
+}
+
 type Metadata struct {
 	Version int                 `json:"version"`
 	Files   map[string]FileMeta `json:"files"`
 	// Links maps an immutable object storage key to its current project-side
 	// pathname. The symlink target is derived from the object ID and mount
 	// point, so moving a link never moves ciphertext.
-	Links         map[string]string `json:"links,omitempty"`
-	Orphaned      map[string]int64  `json:"orphaned,omitempty"`
-	LegacyTargets map[string]string `json:"legacyTargets,omitempty"`
+	Links         map[string]string        `json:"links,omitempty"`
+	Orphaned      map[string]int64         `json:"orphaned,omitempty"`
+	Recovery      map[string]RecoveryEntry `json:"recovery,omitempty"`
+	LegacyTargets map[string]string        `json:"legacyTargets,omitempty"`
 	// DisplacedLinks is decoded only while migrating v1 metadata. New vaults
 	// never write it.
 	DisplacedLinks map[string]string `json:"displacedLinks,omitempty"`
@@ -68,6 +108,7 @@ type Volume struct {
 	prompterMu  sync.RWMutex
 	maxFileSize int64
 	unlockFor   time.Duration
+	unlockScope UnlockScope
 	uid         uint32
 	gid         uint32
 
@@ -109,6 +150,18 @@ func LoadVolume(
 	maxFileSize int64,
 	unlockFor time.Duration,
 ) (*Volume, error) {
+	return LoadVolumeWithScope(
+		cipherDir, prompter, maxFileSize, unlockFor, defaultUnlockScope(unlockFor),
+	)
+}
+
+func LoadVolumeWithScope(
+	cipherDir string,
+	prompter Prompter,
+	maxFileSize int64,
+	unlockFor time.Duration,
+	unlockScope UnlockScope,
+) (*Volume, error) {
 	if prompter == nil {
 		return nil, errors.New("prompter is required")
 	}
@@ -117,6 +170,9 @@ func LoadVolume(
 	}
 	if unlockFor < 0 {
 		return nil, errors.New("unlock duration cannot be negative")
+	}
+	if err := unlockScope.Validate(); err != nil {
+		return nil, err
 	}
 
 	root, err := filepath.Abs(cipherDir)
@@ -144,6 +200,7 @@ func LoadVolume(
 		prompter:        prompter,
 		maxFileSize:     maxFileSize,
 		unlockFor:       unlockFor,
+		unlockScope:     unlockScope,
 		uid:             uint32(os.Getuid()),
 		gid:             uint32(os.Getgid()),
 		authorized:      make(map[string]time.Time),
@@ -157,11 +214,22 @@ func LoadVolume(
 }
 
 func (v *Volume) Configure(maxFileSize int64, unlockFor time.Duration) error {
+	return v.ConfigureAuthorization(maxFileSize, unlockFor, defaultUnlockScope(unlockFor))
+}
+
+func (v *Volume) ConfigureAuthorization(
+	maxFileSize int64,
+	unlockFor time.Duration,
+	unlockScope UnlockScope,
+) error {
 	if maxFileSize <= 0 {
 		return errors.New("maximum file size must be greater than zero")
 	}
 	if unlockFor < 0 {
 		return errors.New("unlock duration cannot be negative")
+	}
+	if err := unlockScope.Validate(); err != nil {
+		return err
 	}
 	v.namespaceMu.Lock()
 	defer v.namespaceMu.Unlock()
@@ -173,6 +241,7 @@ func (v *Volume) Configure(maxFileSize int64, unlockFor time.Duration) error {
 	}
 	v.maxFileSize = maxFileSize
 	v.unlockFor = unlockFor
+	v.unlockScope = unlockScope
 	v.cachedIdentity = nil
 	clear(v.authorized)
 	return nil
@@ -227,6 +296,7 @@ func readMetadata(root string) (Metadata, error) {
 		Files:         make(map[string]FileMeta),
 		Links:         make(map[string]string),
 		Orphaned:      make(map[string]int64),
+		Recovery:      make(map[string]RecoveryEntry),
 		LegacyTargets: make(map[string]string),
 	}
 	file, err := os.Open(filepath.Join(root, internalDirName, metadataFileName))
@@ -245,7 +315,8 @@ func readMetadata(root string) (Metadata, error) {
 		}
 		return migrated, nil
 	}
-	if metadata.Version != metadataFormatVersion {
+	if metadata.Version != previousMetadataFormatVersion &&
+		metadata.Version != metadataFormatVersion {
 		return metadata, fmt.Errorf("unsupported metadata format version %d", metadata.Version)
 	}
 	if metadata.Files == nil {
@@ -256,6 +327,17 @@ func readMetadata(root string) (Metadata, error) {
 	}
 	if metadata.Orphaned == nil {
 		metadata.Orphaned = make(map[string]int64)
+	}
+	if metadata.Recovery == nil {
+		metadata.Recovery = make(map[string]RecoveryEntry)
+	}
+	for key, recovery := range metadata.Recovery {
+		if recovery.State != RecoveryTrash && recovery.State != RecoveryConflict {
+			return metadata, fmt.Errorf("invalid recovery state %q for %s", recovery.State, key)
+		}
+		if recovery.Path == "" || !filepath.IsAbs(recovery.Path) {
+			return metadata, fmt.Errorf("invalid recovery path for %s", key)
+		}
 	}
 	if metadata.LegacyTargets == nil {
 		metadata.LegacyTargets = make(map[string]string)
@@ -269,6 +351,7 @@ func cloneMetadata(metadata Metadata) Metadata {
 		Files:          maps.Clone(metadata.Files),
 		Links:          maps.Clone(metadata.Links),
 		Orphaned:       maps.Clone(metadata.Orphaned),
+		Recovery:       maps.Clone(metadata.Recovery),
 		LegacyTargets:  maps.Clone(metadata.LegacyTargets),
 		DisplacedLinks: maps.Clone(metadata.DisplacedLinks),
 	}
@@ -659,6 +742,7 @@ func deleteFileMetadata(metadata *Metadata, key string) {
 	delete(metadata.Files, key)
 	delete(metadata.Links, key)
 	delete(metadata.Orphaned, key)
+	delete(metadata.Recovery, key)
 	delete(metadata.LegacyTargets, key)
 	delete(metadata.DisplacedLinks, key)
 }
@@ -668,6 +752,7 @@ type linkRecord struct {
 	sourcePath   string
 	protected    bool
 	orphanedAt   int64
+	recovery     RecoveryEntry
 	legacyTarget string
 }
 
@@ -683,6 +768,7 @@ func (v *Volume) linkRecords() []linkRecord {
 		record.protected = true
 		record.sourcePath = v.metadata.Links[key]
 		record.orphanedAt = v.metadata.Orphaned[key]
+		record.recovery = v.metadata.Recovery[key]
 		record.legacyTarget = v.metadata.LegacyTargets[key]
 		recordsByKey[key] = record
 	}
@@ -724,6 +810,7 @@ func (v *Volume) setLinkSource(relative, source string) error {
 		}
 		metadata.Links[key] = source
 		delete(metadata.Orphaned, key)
+		delete(metadata.Recovery, key)
 		delete(metadata.LegacyTargets, key)
 		return nil
 	})
@@ -751,10 +838,47 @@ func (v *Volume) clearLinkOrphan(relative string) error {
 	key := metadataKey(relative)
 	v.metadataMu.Lock()
 	defer v.metadataMu.Unlock()
-	if v.metadata.Orphaned[key] == 0 && v.metadata.LegacyTargets[key] == "" {
+	if v.metadata.Orphaned[key] == 0 && v.metadata.LegacyTargets[key] == "" &&
+		v.metadata.Recovery[key].State == "" {
 		return nil
 	}
 	return v.updateMetadataLocked(func(metadata *Metadata) error {
+		delete(metadata.Orphaned, key)
+		delete(metadata.Recovery, key)
+		delete(metadata.LegacyTargets, key)
+		return nil
+	})
+}
+
+func (v *Volume) markLinkRecovery(
+	relative string,
+	state RecoveryState,
+	reason string,
+	when time.Time,
+) error {
+	if state != RecoveryTrash && state != RecoveryConflict {
+		return fmt.Errorf("invalid recovery state %q", state)
+	}
+	key := metadataKey(relative)
+	v.metadataMu.Lock()
+	defer v.metadataMu.Unlock()
+	return v.updateMetadataLocked(func(metadata *Metadata) error {
+		if _, protected := metadata.Files[key]; !protected {
+			return os.ErrNotExist
+		}
+		path := metadata.Links[key]
+		if existing := metadata.Recovery[key]; existing.Path != "" {
+			path = existing.Path
+		}
+		if path == "" || !filepath.IsAbs(path) {
+			return errors.New("protected object has no absolute recovery path")
+		}
+		metadata.Recovery[key] = RecoveryEntry{
+			Path:             filepath.Clean(path),
+			State:            state,
+			Reason:           reason,
+			ObservedUnixNano: when.UnixNano(),
+		}
 		delete(metadata.Orphaned, key)
 		delete(metadata.LegacyTargets, key)
 		return nil
@@ -1046,17 +1170,14 @@ func (v *Volume) unlockIdentityForRequest(
 		v.unlockMu.Unlock()
 		return identity, nil
 	}
-	cacheLocked := v.unlockFor > 0
+	authorizationKey := v.authorizationKey(cacheKey, ownerPID)
+	cacheLocked := v.unlockFor > 0 && authorizationKey != ""
 	if cacheLocked {
 		defer v.unlockMu.Unlock()
 		now := time.Now()
 		v.removeExpiredAuthorizationsLocked(now)
-		if v.cachedIdentity != nil {
-			for _, until := range v.authorized {
-				if now.Before(until) {
-					return v.cachedIdentity, nil
-				}
-			}
+		if until, authorized := v.authorized[authorizationKey]; v.cachedIdentity != nil && authorized && now.Before(until) {
+			return v.cachedIdentity, nil
 		}
 	} else {
 		v.unlockMu.Unlock()
@@ -1068,10 +1189,68 @@ func (v *Volume) unlockIdentityForRequest(
 	}
 	if cacheLocked {
 		v.cachedIdentity = identity
-		v.authorized[cacheKey] = time.Now().Add(v.unlockFor)
+		until := time.Now().Add(v.unlockFor)
+		v.authorized[authorizationKey] = until
 		v.scheduleIdentityExpiryLocked()
+		if v.unlockScope == UnlockProcess {
+			go v.expireProcessAuthorization(authorizationKey, ownerPID, until)
+		}
 	}
 	return identity, nil
+}
+
+func (v *Volume) expireProcessAuthorization(
+	authorizationKey string,
+	ownerPID uint32,
+	until time.Time,
+) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(time.Until(until))
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return
+		case <-ticker.C:
+			v.unlockMu.Lock()
+			if v.authorized[authorizationKey] != until {
+				v.unlockMu.Unlock()
+				return
+			}
+			if processAlive(ownerPID) {
+				v.unlockMu.Unlock()
+				continue
+			}
+			delete(v.authorized, authorizationKey)
+			if len(v.authorized) == 0 {
+				v.cachedIdentity = nil
+			}
+			v.scheduleIdentityExpiryLocked()
+			v.unlockMu.Unlock()
+			return
+		}
+	}
+}
+
+func (v *Volume) authorizationKey(cacheKey string, ownerPID uint32) string {
+	// A missing object key must never become an accidental vault-wide grant.
+	if cacheKey == "" {
+		return ""
+	}
+	switch v.unlockScope {
+	case UnlockFile:
+		return "file:" + cacheKey
+	case UnlockProcess:
+		if ownerPID == 0 {
+			return ""
+		}
+		return fmt.Sprintf("process:%d", ownerPID)
+	case UnlockVault:
+		return "vault"
+	default:
+		return ""
+	}
 }
 
 func (v *Volume) requestIdentity(

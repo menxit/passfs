@@ -30,6 +30,16 @@ password-protected `.p12`. Back up that `.p12`, its password, the provisioning
 profile, and the notarization key in encrypted maintainer storage. Never commit
 them to the repository.
 
+The app, embedded CLI/control agent, and FSKit extension also share the macOS
+App Group `3943PK2P39.com.menxit.passfs.shared`. Its Team-ID-prefixed form is
+validated from the Developer ID signature and does not require a separately
+registered App Group profile. The app build must keep App Sandbox on the UI and
+extension, off the control agent, and must not add network access to the FSKit
+extension. `make check` verifies these packaging invariants.
+Every signed app build also runs `scripts/verify-macos-app.sh` on the final
+bundle. Unlike the source-template checks, it reads identifiers, Team IDs,
+hardened-runtime flags, and entitlements from the actual nested signatures.
+
 ## GitHub configuration
 
 Set GitHub Pages to use **GitHub Actions**. Create a `release` environment,

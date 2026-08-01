@@ -107,6 +107,7 @@ test:
 test-scripts:
 	./scripts/test-next-version.sh
 	./scripts/test-macos-uninstaller.sh
+	./scripts/test-macos-sandbox.sh
 
 test-race:
 	$(GO_ENV) $(GO) test -race ./...

@@ -18,14 +18,19 @@ import (
 )
 
 const (
-	formatVersion    = 1
-	internalDirName  = ".passfs"
-	publicConfigName = "config.json"
-	identityFileName = "identity.age"
-	metadataFileName = "metadata.json"
+	formatVersion                        = 1
+	internalDirName                      = ".passfs"
+	publicConfigName                     = "config.json"
+	identityFileName                     = "identity.age"
+	metadataFileName                     = "metadata.json"
+	productionPassphraseScryptWorkFactor = 18
 )
 
 var ErrAuthentication = errors.New("incorrect passphrase")
+
+// Tests lower this before any vault is created. Production has no flag or
+// environment variable that can weaken recovery-passphrase derivation.
+var passphraseScryptWorkFactor = productionPassphraseScryptWorkFactor
 
 type PublicConfig struct {
 	Version   int    `json:"version"`
@@ -136,6 +141,7 @@ func initVolume(
 		Files:         make(map[string]FileMeta),
 		Links:         make(map[string]string),
 		Orphaned:      make(map[string]int64),
+		Recovery:      make(map[string]RecoveryEntry),
 		LegacyTargets: make(map[string]string),
 	}
 	if err := WriteJSONFileAtomic(
@@ -306,6 +312,7 @@ func writePassphraseEncryptedFile(path string, plaintext []byte, passphrase stri
 	if err != nil {
 		return err
 	}
+	recipient.SetWorkFactor(passphraseScryptWorkFactor)
 
 	var ciphertext bytes.Buffer
 	writer, err := age.Encrypt(&ciphertext, recipient)

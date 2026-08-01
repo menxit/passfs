@@ -434,6 +434,13 @@ func synchronizeOpaqueLinksOnce(
 			}
 			continue
 		}
+		if record.recovery.State != "" {
+			// Recovery states are terminal until the user restores the original
+			// link or explicitly replaces/purges the encrypted object. A correct
+			// link above clears the state automatically; every other pathname is
+			// deliberately left untouched.
+			continue
+		}
 
 		movedPath := ""
 		tracked := false
@@ -461,7 +468,12 @@ func synchronizeOpaqueLinksOnce(
 				continue
 			}
 			if link.exists {
-				_ = volume.markLinkOrphan(record.relative, time.Now())
+				_ = volume.markLinkRecovery(
+					record.relative,
+					RecoveryConflict,
+					"protected pathname was replaced",
+					time.Now(),
+				)
 				issues[sourcePath] = errors.New(
 					"protected pathname was replaced; encrypted data was preserved",
 				)
@@ -473,15 +485,13 @@ func synchronizeOpaqueLinksOnce(
 				issues[sourcePath] = syscall.EBUSY
 				continue
 			}
-			// A live O_PATH/O_SYMLINK reference has reported the entry unlinked
-			// across the grace window. This is stronger evidence than a bounded
-			// filesystem scan and keeps ordinary deletes both safe and cheap.
-			if err := volume.removeProtectedFile(record.relative); err != nil &&
-				!errors.Is(err, os.ErrNotExist) {
-				issues[sourcePath] = fmt.Errorf(
-					"remove deleted protected object: %w",
-					err,
-				)
+			if err := volume.markLinkRecovery(
+				record.relative,
+				RecoveryTrash,
+				"protected link was deleted",
+				time.Now(),
+			); err != nil && !errors.Is(err, os.ErrNotExist) {
+				issues[sourcePath] = fmt.Errorf("move deleted protected object to recovery: %w", err)
 				continue
 			}
 			tracker.forget(record.relative)
@@ -509,7 +519,40 @@ func synchronizeOpaqueLinksOnce(
 				(!targetMatchesStorage(movedLink.target, record.relative) &&
 					movedLink.target != filepath.Clean(record.legacyTarget)) {
 				issues[movedPath] = errors.New("moved protected link changed target; encrypted data was preserved")
-				_ = volume.markLinkOrphan(record.relative, time.Now())
+				_ = volume.markLinkRecovery(
+					record.relative,
+					RecoveryConflict,
+					"moved protected link changed target",
+					time.Now(),
+				)
+				continue
+			}
+			if link.exists {
+				// Common atomic-save implementations first move the old pathname
+				// aside and then install a regular file at the original pathname.
+				// Treat that as a conflict, not as a user rename: retaining the
+				// editor's moved symlink would silently change which filename owns
+				// the encrypted contents and block explicit replacement recovery.
+				if err := retireProtectedLink(movedPath, record.relative); err != nil &&
+					!errors.Is(err, os.ErrNotExist) {
+					issues[movedPath] = fmt.Errorf("retire displaced protected link: %w", err)
+					continue
+				}
+				if err := volume.markLinkRecovery(
+					record.relative,
+					RecoveryConflict,
+					"atomic save replaced the protected pathname",
+					time.Now(),
+				); err != nil {
+					issues[sourcePath] = fmt.Errorf("record atomic-save conflict: %w", err)
+					continue
+				}
+				if tracker != nil {
+					tracker.forget(record.relative)
+				}
+				issues[sourcePath] = errors.New(
+					"atomic save replaced the protected pathname; encrypted data was preserved",
+				)
 				continue
 			}
 			if movedLink.target != filepath.Clean(expectedTarget) {
@@ -534,7 +577,12 @@ func synchronizeOpaqueLinksOnce(
 		}
 
 		if link.exists {
-			_ = volume.markLinkOrphan(record.relative, time.Now())
+			_ = volume.markLinkRecovery(
+				record.relative,
+				RecoveryConflict,
+				"protected pathname was replaced",
+				time.Now(),
+			)
 			issues[sourcePath] = errors.New("protected pathname was replaced; encrypted data was preserved")
 			continue
 		}
@@ -557,9 +605,13 @@ func synchronizeOpaqueLinksOnce(
 			issues[sourcePath] = errIncompleteLinkSearch
 			continue
 		}
-		if err := volume.removeProtectedFile(record.relative); err != nil &&
-			!errors.Is(err, os.ErrNotExist) {
-			issues[sourcePath] = fmt.Errorf("remove deleted protected object: %w", err)
+		if err := volume.markLinkRecovery(
+			record.relative,
+			RecoveryTrash,
+			"protected link was deleted",
+			time.Now(),
+		); err != nil && !errors.Is(err, os.ErrNotExist) {
+			issues[sourcePath] = fmt.Errorf("move deleted protected object to recovery: %w", err)
 			continue
 		}
 		if tracker != nil {

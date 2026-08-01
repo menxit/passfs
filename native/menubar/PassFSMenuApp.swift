@@ -1,5 +1,4 @@
 import AppKit
-import CoreServices
 import Darwin
 import Dispatch
 import Foundation
@@ -7,6 +6,11 @@ import FSKit
 import OSLog
 import ServiceManagement
 import SwiftUI
+
+private let passFSAppGroupIdentifier =
+    "3943PK2P39.com.menxit.passfs.shared"
+private let passFSControlAgentPlistName =
+    "com.menxit.passfs.control-agent.plist"
 
 @main
 struct PassFSMenuApp: App {
@@ -76,17 +80,10 @@ private enum PassFSSetupLog {
 
     static var url: URL {
         let manager = FileManager.default
-        let home = manager.homeDirectoryForCurrentUser
-        let current = home.appendingPathComponent(".passfs", isDirectory: true)
-        let legacy = home
-            .appendingPathComponent(".config", isDirectory: true)
-            .appendingPathComponent("passfs", isDirectory: true)
-        let currentConfig = current.appendingPathComponent("config.json")
-        let legacyConfig = legacy.appendingPathComponent("config.json")
-        let directory = manager.fileExists(atPath: currentConfig.path) ||
-            !manager.fileExists(atPath: legacyConfig.path)
-            ? current
-            : legacy
+        let directory = manager.containerURL(
+            forSecurityApplicationGroupIdentifier: passFSAppGroupIdentifier
+        )?.appendingPathComponent("Logs", isDirectory: true) ?? manager
+            .urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return directory
             .appendingPathComponent("setup.log", isDirectory: false)
     }
@@ -1043,6 +1040,7 @@ private enum PassFSMenuIcon {
 private enum PassFSTab: String, CaseIterable, Identifiable {
     case unprotected = "Unprotected Secrets"
     case protected = "Protected Files"
+    case recovery = "Recovery"
     case ignored = "Ignored"
     case settings = "Settings"
 
@@ -1054,6 +1052,8 @@ private enum PassFSTab: String, CaseIterable, Identifiable {
             return "exclamationmark.shield.fill"
         case .protected:
             return "lock.shield.fill"
+        case .recovery:
+            return "arrow.uturn.backward.circle.fill"
         case .ignored:
             return "eye.slash.fill"
         case .settings:
@@ -1090,6 +1090,7 @@ private struct PassFSPanel: View {
     @ObservedObject var navigation: PassFSManagerNavigation
     @State private var search = ""
     @State private var pendingUnprotect: PassFSFile?
+    @State private var pendingRecoveryPurge: PassFSFile?
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1145,6 +1146,15 @@ private struct PassFSPanel: View {
                         actionTitle: "Unprotect",
                         action: { pendingUnprotect = $0 }
                     )
+                case .recovery:
+                    fileList(
+                        files: model.filtered(model.recovery, search: search),
+                        emptyText: "No files need recovery",
+                        actionTitle: "Restore link",
+                        action: { model.restoreRecovery($0) },
+                        secondaryActionTitle: "Purge",
+                        secondaryAction: { pendingRecoveryPurge = $0 }
+                    )
                 case .ignored:
                     fileList(
                         files: model.filtered(model.ignored, search: search),
@@ -1179,6 +1189,25 @@ private struct PassFSPanel: View {
             }
         } message: { file in
             Text("The plaintext file will replace its protected link. PassFS authorization is still required.")
+        }
+        .alert(
+            localizedFormat(
+                "Permanently purge %@?",
+                pendingRecoveryPurge?.title ?? localized("file")
+            ),
+            isPresented: Binding(
+                get: { pendingRecoveryPurge != nil },
+                set: { if !$0 { pendingRecoveryPurge = nil } }
+            ),
+            presenting: pendingRecoveryPurge
+        ) { file in
+            Button("Cancel", role: .cancel) {}
+            Button("Purge", role: .destructive) {
+                model.purgeRecovery(file)
+                pendingRecoveryPurge = nil
+            }
+        } message: { _ in
+            Text("This permanently deletes the encrypted copy. Stop PassFS first. This action cannot be undone.")
         }
         .alert(
             "PassFS",
@@ -1262,7 +1291,9 @@ private struct PassFSPanel: View {
                         ? "PassFS scans likely credential and project locations."
                         : navigation.tab == .protected
                             ? "Protect a detected file to see it here."
-                            : "Ignored files can be restored to future scans."
+                            : navigation.tab == .recovery
+                                ? "Deleted and replaced links remain encrypted until you restore or explicitly purge them."
+                                : "Ignored files can be restored to future scans."
                 ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1313,6 +1344,8 @@ private struct PassFSPanel: View {
             return "checkmark.shield.fill"
         case .protected:
             return "lock.shield.fill"
+        case .recovery:
+            return "arrow.uturn.backward.circle.fill"
         case .ignored:
             return "eye.slash.fill"
         case .settings:
@@ -1326,6 +1359,8 @@ private struct PassFSPanel: View {
             return .green
         case .protected:
             return .blue
+        case .recovery:
+            return .orange
         case .ignored, .settings:
             return Color(nsColor: .secondaryLabelColor)
         }
@@ -1644,6 +1679,28 @@ private struct SettingsView: View {
 
                     Divider()
 
+                    HStack(alignment: .center, spacing: 12) {
+                        settingLabel(
+                            "Authorization scope",
+                            detail: "Limit which subsequent opens reuse an authorization."
+                        )
+                        Spacer()
+                        Picker("", selection: $model.unlockScope) {
+                            Text("Once").tag("once")
+                            Text("File").tag("file")
+                            Text("Process").tag("process")
+                            Text("Vault").tag("vault")
+                        }
+                        .labelsHidden()
+                        .frame(width: 120)
+                        Button("Apply") {
+                            model.applyUnlockDuration()
+                        }
+                    }
+                    .padding(.vertical, 12)
+
+                    Divider()
+
                     HStack {
                         settingLabel(
                             "Recovery passphrase",
@@ -1655,6 +1712,78 @@ private struct SettingsView: View {
                         }
                     }
                     .padding(.vertical, 12)
+                }
+                .padding(.horizontal, 14)
+                .background(
+                    .quaternary.opacity(0.45),
+                    in: RoundedRectangle(cornerRadius: 12)
+                )
+                .disabled(!model.initialized || model.busy)
+
+                Text("Backup and Restore")
+                    .font(.headline)
+
+                VStack(spacing: 0) {
+                    HStack(alignment: .center, spacing: 12) {
+                        settingLabel(
+                            "Create backup",
+                            detail: "Temporarily stops PassFS, copies the encrypted vault, verifies every file, then restores its previous state."
+                        )
+                        Spacer()
+                        Button("Create…") {
+                            model.createBackup()
+                        }
+                    }
+                    .padding(.vertical, 12)
+
+                    Divider()
+
+                    HStack(alignment: .center, spacing: 12) {
+                        settingLabel(
+                            "Verify backup",
+                            detail: "Checks the manifest, checksums, and decryption without changing the backup."
+                        )
+                        Spacer()
+                        Button("Verify…") {
+                            model.verifyBackup()
+                        }
+                    }
+                    .padding(.vertical, 12)
+
+                    Divider()
+
+                    HStack(alignment: .center, spacing: 12) {
+                        settingLabel(
+                            "Restore backup",
+                            detail: "Restores only into a new directory and can make the restored vault active."
+                        )
+                        Spacer()
+                        Button("Restore…") {
+                            model.restoreBackup()
+                        }
+                    }
+                    .padding(.vertical, 12)
+
+                    if let operation = model.backupOperation {
+                        Divider()
+                        HStack(spacing: 9) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(operation)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(.vertical, 12)
+                    } else if let message = model.backupStatusMessage {
+                        Divider()
+                        Label(message, systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 12)
+                    }
                 }
                 .padding(.horizontal, 14)
                 .background(
@@ -1742,35 +1871,47 @@ private struct PassFSFile: Identifiable {
             ignored: ignored
         )
     }
+
 }
 
-private struct ProtectedRecord: Decodable {
+private struct UIFileRecord: Decodable {
     let path: String
+    let project: String
+    let size: Int64
+    let lastOpenedUnixNano: Int64
+    let preview: String?
+}
+
+private struct RecoveryRecord: Decodable {
+    let path: String
+    let project: String
+    let state: String
+    let observedUnixNano: Int64
     let size: UInt64
-    let modifiedUnixNano: Int64
-    let accessedUnixNano: Int64?
 }
 
 private struct UISnapshotRecord: Decodable {
-    let unprotected: [String]?
-    let protected: [ProtectedRecord]
-    let ignored: [String]
+    let unprotected: [UIFileRecord]?
+    let protected: [UIFileRecord]
+    let recovery: [RecoveryRecord]
+    let ignored: [UIFileRecord]
     let touchID: Bool
     let unlockDurationNanoseconds: Int64
+    let unlockScope: String
     let initialized: Bool
     let mounted: Bool
     let availableUpdate: String?
-    let stateDirectory: String?
-    let vaultMetadataDirectory: String?
 }
 
 @MainActor
 private final class PassFSModel: ObservableObject {
     @Published var unprotected: [PassFSFile] = []
     @Published var protected: [PassFSFile] = []
+    @Published var recovery: [PassFSFile] = []
     @Published var ignored: [PassFSFile] = []
     @Published var touchIDEnabled = true
     @Published var unlockMinutes = 0
+    @Published var unlockScope = "once"
     @Published var initialized = false
     @Published var mounted = false
     @Published var availableUpdate: String?
@@ -1779,28 +1920,22 @@ private final class PassFSModel: ObservableObject {
     @Published var showsBusyIndicator = false
     @Published var refreshing = false
     @Published var errorMessage: String?
+    @Published var backupOperation: String?
+    @Published var backupStatusMessage: String?
     private var lastRefresh: Date?
     private var refreshInProgress = false
     private var queuedRefresh = false
     private var queuedScan = false
-    private var watchedDirectories = Set<String>()
-    private var requestedWatchDirectories = Set<String>()
     private var managerVisible = false
     private var managerScanTask: Task<Void, Never>?
-    private var filesystemWatchers: [DispatchSourceFileSystemObject] = []
-    private var filesystemRefreshTask: Task<Void, Never>?
     var keepManagerVisible: (() -> Void)?
 
     private static let openRefreshMaximumAge: TimeInterval = 60
     private static let managerScanInterval = Duration.milliseconds(2_500)
 
     init() {
-        let bundlePath = Bundle.main.bundleURL.standardizedFileURL.path
-        let userApplications = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Applications")
-            .path + "/"
-        let installed = bundlePath.hasPrefix("/Applications/") ||
-            bundlePath.hasPrefix(userApplications)
+        PassFSCommands.registerControlAgentIfNeeded()
+        let installed = Bundle.main.bundleURL.pathExtension == "app"
         if installed && SMAppService.mainApp.status == .notRegistered {
             try? SMAppService.mainApp.register()
         }
@@ -1869,18 +2004,14 @@ private final class PassFSModel: ObservableObject {
                 unprotected = refreshedUnprotected
             }
             protected = snapshot.protected
+            recovery = snapshot.recovery
             ignored = snapshot.ignored
             touchIDEnabled = snapshot.touchID
             unlockMinutes = snapshot.unlockMinutes
+            unlockScope = snapshot.unlockScope
             initialized = snapshot.initialized
             mounted = snapshot.mounted
             availableUpdate = snapshot.availableUpdate
-            configureFilesystemWatchers(
-                directories: [
-                    snapshot.stateDirectory,
-                    snapshot.vaultMetadataDirectory,
-                ].compactMap { $0 }
-            )
             lastRefresh = Date()
             if !silent { errorMessage = nil }
         } catch {
@@ -1890,20 +2021,9 @@ private final class PassFSModel: ObservableObject {
         }
     }
 
-    private func configureFilesystemWatchers(
-        directories: [String]
-    ) {
-        let requested = Set(directories.map {
-            URL(fileURLWithPath: $0).standardizedFileURL.path
-        })
-        requestedWatchDirectories = requested
-        rebuildFilesystemWatchers()
-    }
-
     func setManagerVisible(_ visible: Bool) {
         managerVisible = visible
         updateManagerScanLoop()
-        rebuildFilesystemWatchers()
     }
 
     private func updateManagerScanLoop() {
@@ -1929,50 +2049,6 @@ private final class PassFSModel: ObservableObject {
                 // sync while the window remains open.
                 await self.refresh(silent: true)
             }
-        }
-    }
-
-    private func rebuildFilesystemWatchers() {
-        let requested = managerVisible ? requestedWatchDirectories : []
-        guard requested != watchedDirectories else { return }
-
-        filesystemRefreshTask?.cancel()
-        filesystemRefreshTask = nil
-        filesystemWatchers.forEach { $0.cancel() }
-        filesystemWatchers.removeAll()
-        watchedDirectories = requested
-
-        for directory in requested.sorted() {
-            let descriptor = open(directory, O_EVTONLY)
-            guard descriptor >= 0 else { continue }
-            let source = DispatchSource.makeFileSystemObjectSource(
-                fileDescriptor: descriptor,
-                eventMask: [.write, .delete, .rename],
-                queue: .global(qos: .utility)
-            )
-            source.setEventHandler { [weak self] in
-                Task { @MainActor [weak self] in
-                    self?.scheduleFilesystemRefresh()
-                }
-            }
-            source.setCancelHandler {
-                close(descriptor)
-            }
-            source.resume()
-            filesystemWatchers.append(source)
-        }
-    }
-
-    private func scheduleFilesystemRefresh() {
-        filesystemRefreshTask?.cancel()
-        filesystemRefreshTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .milliseconds(300))
-            } catch {
-                return
-            }
-            guard let self, !Task.isCancelled else { return }
-            await self.refresh(silent: true, includeScan: false)
         }
     }
 
@@ -2047,6 +2123,32 @@ private final class PassFSModel: ObservableObject {
         )
     }
 
+    func restoreRecovery(_ file: PassFSFile) {
+        let previous = recovery
+        runOptimisticAction(
+            ["recovery", "restore", file.path],
+            apply: {
+                self.recovery.removeAll { $0.path == file.path }
+            },
+            rollback: {
+                self.recovery = previous
+            }
+        )
+    }
+
+    func purgeRecovery(_ file: PassFSFile) {
+        let previous = recovery
+        runOptimisticAction(
+            ["recovery", "purge", "--yes", file.path],
+            apply: {
+                self.recovery.removeAll { $0.path == file.path }
+            },
+            rollback: {
+                self.recovery = previous
+            }
+        )
+    }
+
     func setTouchID(_ enabled: Bool) {
         let previous = touchIDEnabled
         let arguments = enabled
@@ -2070,6 +2172,7 @@ private final class PassFSModel: ObservableObject {
         unlockMinutes = minutes
         let commands = [[
             "config", "--unlock-for", "\(minutes)m",
+            "--unlock-scope", minutes == 0 ? "once" : unlockScope,
         ]]
         performAction(
             commands,
@@ -2077,6 +2180,167 @@ private final class PassFSModel: ObservableObject {
             apply: {},
             rollback: {}
         )
+    }
+
+    func createBackup() {
+        guard !busy, initialized else { return }
+        let panel = NSSavePanel()
+        panel.title = localized("Create PassFS Backup")
+        panel.prompt = localized("Create Backup")
+        panel.canCreateDirectories = true
+        let date = String(
+            ISO8601DateFormatter().string(from: Date()).prefix(10)
+        )
+        panel.nameFieldStringValue = localizedFormat(
+            "PassFS Backup %@",
+            date
+        )
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            return
+        }
+        performBackupAction(
+            [
+                "backup", "create", "--prompt", "native",
+                "--restart-service", destination.path,
+            ],
+            progress: "Creating and verifying backup…",
+            success: localizedFormat(
+                "Backup created and verified at %@.",
+                destination.path
+            )
+        )
+    }
+
+    func verifyBackup() {
+        guard !busy, initialized,
+              let backup = chooseBackupDirectory(
+                  title: "Verify PassFS Backup",
+                  prompt: "Verify Backup"
+              ) else { return }
+        performBackupAction(
+            ["backup", "verify", "--prompt", "native", backup.path],
+            progress: "Verifying backup…",
+            success: localizedFormat(
+                "Backup %@ was verified successfully.",
+                backup.path
+            )
+        )
+    }
+
+    func restoreBackup() {
+        guard !busy, initialized,
+              let backup = chooseBackupDirectory(
+                  title: "Restore PassFS Backup",
+                  prompt: "Choose Backup"
+              ) else { return }
+
+        let destinationPanel = NSSavePanel()
+        destinationPanel.title = localized("Choose a New Vault Directory")
+        destinationPanel.prompt = localized("Choose")
+        destinationPanel.canCreateDirectories = true
+        destinationPanel.nameFieldStringValue = localized(
+            "PassFS Restored Vault"
+        )
+        guard destinationPanel.runModal() == .OK,
+              let destination = destinationPanel.url else { return }
+
+        let choice = restoredVaultChoice(destination: destination)
+        guard choice != .cancel else { return }
+        let activate = choice == .restoreAndUse
+        var arguments = [
+            "backup", "restore", "--prompt", "native",
+            "--vault", destination.path,
+        ]
+        if activate {
+            arguments.append("--activate")
+        }
+        arguments.append(backup.path)
+        performBackupAction(
+            arguments,
+            progress: "Verifying and restoring backup…",
+            success: activate
+                ? localizedFormat(
+                    "Backup restored to %@ and made active.",
+                    destination.path
+                )
+                : localizedFormat(
+                    "Backup restored to %@.",
+                    destination.path
+                )
+        )
+    }
+
+    private enum RestoredVaultChoice {
+        case restoreAndUse
+        case restoreOnly
+        case cancel
+    }
+
+    private func chooseBackupDirectory(
+        title: String,
+        prompt: String
+    ) -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = localized(title)
+        panel.prompt = localized(prompt)
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        guard panel.runModal() == .OK else { return nil }
+        return panel.url
+    }
+
+    private func restoredVaultChoice(
+        destination: URL
+    ) -> RestoredVaultChoice {
+        let alert = NSAlert()
+        alert.messageText = localized("Use the restored vault?")
+        alert.informativeText = localizedFormat(
+            "PassFS will restore the backup to %@. You can make it active now or leave the current vault unchanged.",
+            destination.path
+        )
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: localized("Restore and Use"))
+        alert.addButton(withTitle: localized("Restore Only"))
+        alert.addButton(withTitle: localized("Cancel"))
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return .restoreAndUse
+        case .alertSecondButtonReturn:
+            return .restoreOnly
+        default:
+            return .cancel
+        }
+    }
+
+    private func performBackupAction(
+        _ arguments: [String],
+        progress: String,
+        success: String
+    ) {
+        guard !busy else { return }
+        busy = true
+        showsBusyIndicator = true
+        errorMessage = nil
+        backupStatusMessage = nil
+        backupOperation = localized(progress)
+        keepManagerVisible?()
+        Task {
+            do {
+                _ = try await Task.detached(priority: .userInitiated) {
+                    try PassFSCommands.run(arguments)
+                }.value
+                backupStatusMessage = success
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            backupOperation = nil
+            busy = false
+            showsBusyIndicator = false
+            await refresh(silent: true, includeScan: false)
+            keepManagerVisible?()
+        }
     }
 
     func stop() {
@@ -2205,14 +2469,14 @@ private final class PassFSModel: ObservableObject {
 private struct PassFSSnapshot {
     let unprotected: [PassFSFile]?
     let protected: [PassFSFile]
+    let recovery: [PassFSFile]
     let ignored: [PassFSFile]
     let touchID: Bool
     let unlockMinutes: Int
+    let unlockScope: String
     let initialized: Bool
     let mounted: Bool
     let availableUpdate: String?
-    let stateDirectory: String?
-    let vaultMetadataDirectory: String?
 }
 
 private final class PassFSPipeReader: @unchecked Sendable {
@@ -2233,6 +2497,71 @@ private final class PassFSPipeReader: @unchecked Sendable {
 }
 
 private enum PassFSCommands {
+    private enum AgentOperation: String, Encodable {
+        case uiSnapshot = "ui-snapshot"
+        case gatekeeperAssessment = "gatekeeper-assessment"
+        case reload
+        case unmount
+        case update
+        case initialize
+        case initializeNative = "initialize-native"
+        case initializeSetup = "initialize-setup"
+        case touchIDEnable = "touch-id-enable"
+        case touchIDDisable = "touch-id-disable"
+        case changePassphrase = "change-passphrase"
+        case configureUnlock = "configure-unlock"
+        case encrypt
+        case ignore
+        case unignore
+        case unprotect
+        case recoveryRestore = "recovery-restore"
+        case recoveryPurge = "recovery-purge"
+        case backupCreate = "backup-create"
+        case backupVerify = "backup-verify"
+        case backupRestore = "backup-restore"
+    }
+
+    private struct AgentRequest: Encodable {
+        let version = 3
+        let operation: AgentOperation
+        let path: String?
+        let destination: String?
+        let duration: String?
+        let scope: String?
+        let includeScan: Bool?
+        let activate: Bool?
+
+        init(
+            operation: AgentOperation,
+            path: String? = nil,
+            destination: String? = nil,
+            duration: String? = nil,
+            scope: String? = nil,
+            includeScan: Bool? = nil,
+            activate: Bool? = nil
+        ) {
+            self.operation = operation
+            self.path = path
+            self.destination = destination
+            self.duration = duration
+            self.scope = scope
+            self.includeScan = includeScan
+            self.activate = activate
+        }
+    }
+
+    private struct AgentResponse: Decodable {
+        let version: Int
+        let success: Bool
+        let output: String?
+        let error: String?
+    }
+
+    private struct GatekeeperRecord: Decodable {
+        let accepted: Bool
+        let detail: String
+    }
+
     static var executable: URL {
         Bundle.main.bundleURL
             .appendingPathComponent("Contents")
@@ -2243,7 +2572,53 @@ private enum PassFSCommands {
             .appendingPathComponent("passfs-cli")
     }
 
+    private static var usesControlAgent: Bool {
+        FileManager.default.fileExists(
+            atPath: Bundle.main.bundleURL
+                .appendingPathComponent("Contents")
+                .appendingPathComponent("Library")
+                .appendingPathComponent("LaunchAgents")
+                .appendingPathComponent(passFSControlAgentPlistName)
+                .path
+        )
+    }
+
+    static func registerControlAgentIfNeeded() {
+        guard usesControlAgent else { return }
+        let service = SMAppService.agent(
+            plistName: passFSControlAgentPlistName
+        )
+        let defaultsKey = "PassFSRegisteredControlAgentBuild"
+        let build = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String ?? "unknown"
+        do {
+            if service.status == .enabled,
+               UserDefaults.standard.string(forKey: defaultsKey) != build {
+                try service.unregister()
+            }
+            if service.status == .notRegistered {
+                try service.register()
+            }
+            if service.status == .enabled {
+                UserDefaults.standard.set(build, forKey: defaultsKey)
+            }
+        } catch {
+            Logger(
+                subsystem: "com.menxit.passfs",
+                category: "ControlAgent"
+            ).error("Unable to register control agent: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     static func run(_ arguments: [String]) throws -> String {
+        if usesControlAgent {
+            return try runThroughControlAgent(arguments)
+        }
+        return try runDirectly(arguments)
+    }
+
+    private static func runDirectly(_ arguments: [String]) throws -> String {
         let process = Process()
         let output = Pipe()
         let errors = Pipe()
@@ -2277,6 +2652,333 @@ private enum PassFSCommands {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    private static func runThroughControlAgent(
+        _ arguments: [String]
+    ) throws -> String {
+        let service = SMAppService.agent(
+            plistName: passFSControlAgentPlistName
+        )
+        if service.status == .notRegistered {
+            do {
+                try service.register()
+            } catch {
+                throw PassFSCommandError(
+                    detail: "Could not register the PassFS control agent: \(error.localizedDescription)"
+                )
+            }
+        }
+        switch service.status {
+        case .enabled:
+            break
+        case .requiresApproval:
+            throw PassFSCommandError(
+                detail: "Allow PassFS under System Settings > General > Login Items, then try again."
+            )
+        case .notFound:
+            throw PassFSCommandError(
+                detail: "The PassFS control agent is missing from the application bundle."
+            )
+        case .notRegistered:
+            throw PassFSCommandError(
+                detail: "The PassFS control agent is not registered."
+            )
+        @unknown default:
+            throw PassFSCommandError(
+                detail: "The PassFS control agent has an unknown status."
+            )
+        }
+
+        guard let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: passFSAppGroupIdentifier
+        ) else {
+            throw PassFSCommandError(
+                detail: "The PassFS shared container is unavailable. Reinstall the signed application."
+            )
+        }
+        let socketPath = container
+            .appendingPathComponent("Control", isDirectory: true)
+            .appendingPathComponent("agent.sock", isDirectory: false)
+            .path
+        let descriptor = try connectToControlAgent(socketPath)
+        defer { Darwin.close(descriptor) }
+
+        var noSignal: Int32 = 1
+        _ = withUnsafePointer(to: &noSignal) {
+            setsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                $0,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+        }
+        var request = try JSONEncoder().encode(
+            agentRequest(for: arguments)
+        )
+        request.append(0x0a)
+        try writeAll(request, to: descriptor)
+        _ = shutdown(descriptor, SHUT_WR)
+        let responseData = try readAll(from: descriptor)
+        let response = try JSONDecoder().decode(
+            AgentResponse.self,
+            from: responseData
+        )
+        guard response.version == 3 else {
+            throw PassFSCommandError(
+                detail: "The PassFS control agent uses an unsupported protocol."
+            )
+        }
+        guard response.success else {
+            throw PassFSCommandError(
+                detail: response.error ?? "PassFS command failed"
+            )
+        }
+        return response.output ?? ""
+    }
+
+    // The UI may keep CLI-shaped commands for the unsigned development
+    // fallback, but the privileged boundary is a closed typed protocol. No
+    // executable name or flag is serialized to the control agent.
+    private static func agentRequest(
+        for arguments: [String]
+    ) throws -> AgentRequest {
+        switch arguments {
+        case ["__ui-status"]:
+            return AgentRequest(
+                operation: .uiSnapshot,
+                includeScan: true
+            )
+        case ["__ui-status", "--no-scan"]:
+            return AgentRequest(
+                operation: .uiSnapshot,
+                includeScan: false
+            )
+        case ["__gatekeeper-assessment"]:
+            return AgentRequest(operation: .gatekeeperAssessment)
+        case ["reload"]:
+            return AgentRequest(operation: .reload)
+        case ["unmount"]:
+            return AgentRequest(operation: .unmount)
+        case ["update"]:
+            return AgentRequest(operation: .update)
+        case ["init"]:
+            return AgentRequest(operation: .initialize)
+        case ["init", "--prompt", "native"]:
+            return AgentRequest(operation: .initializeNative)
+        case ["init", "--prompt", "native", "--no-open"]:
+            return AgentRequest(operation: .initializeSetup)
+        case ["touchid", "enable", "--prompt", "native"]:
+            return AgentRequest(operation: .touchIDEnable)
+        case ["touchid", "disable"]:
+            return AgentRequest(operation: .touchIDDisable)
+        case ["passwd", "--prompt", "native"]:
+            return AgentRequest(operation: .changePassphrase)
+        default:
+            break
+        }
+
+        if arguments.count == 2 {
+            let path = arguments[1]
+            switch arguments[0] {
+            case "encrypt":
+                return AgentRequest(operation: .encrypt, path: path)
+            case "ignore":
+                return AgentRequest(operation: .ignore, path: path)
+            case "unignore":
+                return AgentRequest(operation: .unignore, path: path)
+            default:
+                break
+            }
+        }
+        if arguments.count == 5,
+           arguments[0] == "config",
+           arguments[1] == "--unlock-for",
+           arguments[3] == "--unlock-scope" {
+            return AgentRequest(
+                operation: .configureUnlock,
+                duration: arguments[2],
+                scope: arguments[4]
+            )
+        }
+        if arguments.count == 5,
+           Array(arguments[0..<4]) == [
+               "unprotect", "--yes", "--prompt", "native",
+           ] {
+            return AgentRequest(
+                operation: .unprotect,
+                path: arguments[4]
+            )
+        }
+        if arguments.count == 6,
+           Array(arguments[0..<5]) == [
+               "unprotect", "--yes", "--prompt", "native", "--",
+           ] {
+            return AgentRequest(
+                operation: .unprotect,
+                path: arguments[5]
+            )
+        }
+        if arguments.count == 3,
+           arguments[0] == "recovery",
+           arguments[1] == "restore" {
+            return AgentRequest(
+                operation: .recoveryRestore,
+                path: arguments[2]
+            )
+        }
+        if arguments.count == 4,
+           arguments[0] == "recovery",
+           arguments[1] == "purge",
+           arguments[2] == "--yes" {
+            return AgentRequest(
+                operation: .recoveryPurge,
+                path: arguments[3]
+            )
+        }
+        if arguments.count == 6,
+           Array(arguments[0..<5]) == [
+               "backup", "create", "--prompt", "native",
+               "--restart-service",
+           ] {
+            return AgentRequest(
+                operation: .backupCreate,
+                path: arguments[5]
+            )
+        }
+        if arguments.count == 5,
+           Array(arguments[0..<4]) == [
+               "backup", "verify", "--prompt", "native",
+           ] {
+            return AgentRequest(
+                operation: .backupVerify,
+                path: arguments[4]
+            )
+        }
+        if arguments.count == 7,
+           Array(arguments[0..<5]) == [
+               "backup", "restore", "--prompt", "native", "--vault",
+           ] {
+            return AgentRequest(
+                operation: .backupRestore,
+                path: arguments[6],
+                destination: arguments[5],
+                activate: false
+            )
+        }
+        if arguments.count == 8,
+           Array(arguments[0..<5]) == [
+               "backup", "restore", "--prompt", "native", "--vault",
+           ],
+           arguments[6] == "--activate" {
+            return AgentRequest(
+                operation: .backupRestore,
+                path: arguments[7],
+                destination: arguments[5],
+                activate: true
+            )
+        }
+        throw PassFSCommandError(
+            detail: "This operation is not available through the PassFS control agent."
+        )
+    }
+
+    private static func connectToControlAgent(
+        _ path: String
+    ) throws -> Int32 {
+        let pathBytes = Array(path.utf8)
+        let sample = sockaddr_un()
+        guard pathBytes.count < MemoryLayout.size(ofValue: sample.sun_path)
+        else {
+            throw PassFSCommandError(
+                detail: "The PassFS control socket path is too long."
+            )
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        var lastError = ENOENT
+        repeat {
+            let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+            if descriptor < 0 {
+                lastError = errno
+                break
+            }
+            var address = sockaddr_un()
+            address.sun_family = sa_family_t(AF_UNIX)
+            address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+            withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+                buffer.initializeMemory(as: UInt8.self, repeating: 0)
+                buffer.copyBytes(from: pathBytes)
+            }
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(
+                        descriptor,
+                        $0,
+                        socklen_t(MemoryLayout<sockaddr_un>.size)
+                    )
+                }
+            }
+            if result == 0 {
+                return descriptor
+            }
+            lastError = errno
+            Darwin.close(descriptor)
+            if lastError != ENOENT && lastError != ECONNREFUSED {
+                break
+            }
+            usleep(50_000)
+        } while Date() < deadline
+        throw PassFSCommandError(
+            detail: "Could not connect to the PassFS control agent: \(String(cString: strerror(lastError)))"
+        )
+    }
+
+    private static func writeAll(
+        _ data: Data,
+        to descriptor: Int32
+    ) throws {
+        try data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    bytes.count - offset
+                )
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw PassFSCommandError(
+                        detail: "Could not send a command to PassFS: \(String(cString: strerror(errno)))"
+                    )
+                }
+                offset += count
+            }
+        }
+    }
+
+    private static func readAll(from descriptor: Int32) throws -> Data {
+        let maximumSize = 16 * 1024 * 1024
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count == 0 { return result }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw PassFSCommandError(
+                    detail: "Could not read the PassFS response: \(String(cString: strerror(errno)))"
+                )
+            }
+            guard result.count + count <= maximumSize else {
+                throw PassFSCommandError(
+                    detail: "The PassFS response is too large."
+                )
+            }
+            result.append(contentsOf: buffer.prefix(count))
+        }
+    }
+
     static func fsKitFilesystemMounted() -> Bool {
         (try? loadSnapshot(includeScan: false).mounted) ?? false
     }
@@ -2285,34 +2987,18 @@ private enum PassFSCommands {
         accepted: Bool,
         detail: String
     ) {
-        let process = Process()
-        let output = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/spctl")
-        process.arguments = [
-            "--assess",
-            "--type",
-            "execute",
-            "--verbose=4",
-            Bundle.main.bundleURL.path,
-        ]
-        process.standardOutput = output
-        process.standardError = output
         do {
-            try process.run()
+            let record = try JSONDecoder().decode(
+                GatekeeperRecord.self,
+                from: Data(try run(["__gatekeeper-assessment"]).utf8)
+            )
+            return (record.accepted, record.detail)
         } catch {
             return (
                 false,
                 "unable to run Gatekeeper assessment: \(error.localizedDescription)"
             )
         }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let detail = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (
-            process.terminationStatus == 0,
-            detail?.isEmpty == false ? detail! : "no assessment details"
-        )
     }
 
     static func loadSnapshot(includeScan: Bool) throws -> PassFSSnapshot {
@@ -2327,40 +3013,40 @@ private enum PassFSCommands {
         )
         let unprotected = snapshot.unprotected?.map {
             makeFile(
-                path: $0,
+                record: $0,
                 protected: false,
-                ignored: false,
-                size: nil,
-                modified: nil,
-                accessed: nil
+                ignored: false
             )
         }
         let ignored = snapshot.ignored.map {
             makeFile(
-                path: $0,
+                record: $0,
                 protected: false,
-                ignored: true,
-                size: nil,
-                modified: nil,
-                accessed: nil
+                ignored: true
             )
         }
         let protected = snapshot.protected.map {
             makeFile(
-                path: $0.path,
+                record: $0,
                 protected: true,
-                ignored: false,
-                size: Int64(clamping: $0.size),
-                modified: Date(
-                    timeIntervalSince1970: Double($0.modifiedUnixNano) / 1_000_000_000
+                ignored: false
+            )
+        }
+        let recovery = snapshot.recovery.map { record in
+            PassFSFile(
+                path: record.path,
+                title: URL(fileURLWithPath: record.path).lastPathComponent,
+                project: record.project,
+                size: Int64(clamping: record.size),
+                lastOpened: Date(
+                    timeIntervalSince1970:
+                        Double(record.observedUnixNano) / 1_000_000_000
                 ),
-                accessed: $0.accessedUnixNano.flatMap {
-                    $0 > 0
-                        ? Date(
-                            timeIntervalSince1970: Double($0) / 1_000_000_000
-                        )
-                        : nil
-                }
+                preview: record.state == "conflict"
+                    ? localized("Conflicting file replaced the protected link")
+                    : localized("Protected link was deleted"),
+                protected: true,
+                ignored: false
             )
         }
         let newestFirst: (PassFSFile, PassFSFile) -> Bool = {
@@ -2369,173 +3055,46 @@ private enum PassFSCommands {
         return PassFSSnapshot(
             unprotected: unprotected?.sorted(by: newestFirst),
             protected: protected.sorted(by: newestFirst),
+            recovery: recovery.sorted(by: newestFirst),
             ignored: ignored.sorted(by: newestFirst),
             touchID: snapshot.touchID,
             unlockMinutes: max(
                 0,
                 Int(snapshot.unlockDurationNanoseconds / 60_000_000_000)
             ),
+            unlockScope: snapshot.unlockScope,
             initialized: snapshot.initialized,
             mounted: snapshot.mounted,
-            availableUpdate: snapshot.availableUpdate,
-            stateDirectory: snapshot.stateDirectory,
-            vaultMetadataDirectory: snapshot.vaultMetadataDirectory
+            availableUpdate: snapshot.availableUpdate
         )
     }
 
     private static func makeFile(
-        path: String,
+        record: UIFileRecord,
         protected: Bool,
-        ignored: Bool,
-        size: Int64?,
-        modified: Date?,
-        accessed: Date?
+        ignored: Bool
     ) -> PassFSFile {
-        let url = URL(fileURLWithPath: path)
-        let values = protected
-            ? nil
-            : try? url.resourceValues(forKeys: [
-                .fileSizeKey,
-                .contentAccessDateKey,
-                .contentModificationDateKey,
-            ])
-        let lastOpened: Date
-        if protected {
-            lastOpened = accessed ?? modified ?? .distantPast
-        } else {
-            lastOpened = spotlightLastUsed(path) ??
-                values?.contentAccessDate ??
-                modified ??
-                values?.contentModificationDate ??
-                .distantPast
-        }
+        let url = URL(fileURLWithPath: record.path)
+        let lastOpened = record.lastOpenedUnixNano > 0
+            ? Date(
+                timeIntervalSince1970:
+                    Double(record.lastOpenedUnixNano) / 1_000_000_000
+            )
+            : .distantPast
         return PassFSFile(
-            path: path,
+            path: record.path,
             title: url.lastPathComponent,
-            project: projectName(for: url),
-            size: size ?? Int64(values?.fileSize ?? 0),
+            project: record.project,
+            size: record.size,
             lastOpened: lastOpened,
             preview: protected
                 ? localized("Encrypted by PassFS")
                 : ignored
                     ? localized("Ignored by the secret scanner")
-                    : maskedPreview(url),
+                    : record.preview ?? localized("Secret-bearing file"),
             protected: protected,
             ignored: ignored
         )
-    }
-
-    private static func spotlightLastUsed(_ path: String) -> Date? {
-        guard let item = MDItemCreate(kCFAllocatorDefault, path as CFString),
-              let value = MDItemCopyAttribute(item, kMDItemLastUsedDate as CFString)
-        else {
-            return nil
-        }
-        return value as? Date
-    }
-
-    private static func projectName(for file: URL) -> String {
-        var directory = file.deletingLastPathComponent()
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        while directory.path != "/" && directory.path.count >= home.path.count {
-            let git = directory.appendingPathComponent(".git")
-            if FileManager.default.fileExists(atPath: git.path) {
-                return repositoryName(root: directory, git: git)
-            }
-            directory.deleteLastPathComponent()
-        }
-        let parent = file.deletingLastPathComponent().lastPathComponent
-        if parent.hasPrefix(".") {
-            return localized("Personal credentials")
-        }
-        return parent.isEmpty ? localized("Personal files") : parent
-    }
-
-    private static func repositoryName(root: URL, git: URL) -> String {
-        var config = git.appendingPathComponent("config")
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(
-            atPath: git.path,
-            isDirectory: &isDirectory
-        ), !isDirectory.boolValue,
-           let pointer = try? String(contentsOf: git, encoding: .utf8),
-           let gitDirectory = pointer
-            .split(separator: "\n")
-            .first(where: { $0.hasPrefix("gitdir:") })
-            .map({ $0.dropFirst("gitdir:".count) })
-        {
-            let path = gitDirectory.trimmingCharacters(in: .whitespaces)
-            config = URL(
-                fileURLWithPath: path,
-                relativeTo: root
-            )
-            .standardizedFileURL
-            .appendingPathComponent("config")
-        }
-        guard let text = try? String(contentsOf: config, encoding: .utf8)
-        else {
-            return root.lastPathComponent
-        }
-        var inOrigin = false
-        for rawLine in text.split(
-            separator: "\n",
-            omittingEmptySubsequences: false
-        ) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("[") {
-                inOrigin = line == "[remote \"origin\"]"
-                continue
-            }
-            guard inOrigin, line.hasPrefix("url"),
-                  let separator = line.firstIndex(of: "=")
-            else {
-                continue
-            }
-            let remote = line[line.index(after: separator)...]
-                .trimmingCharacters(in: .whitespaces)
-            let normalized = remote.replacingOccurrences(of: "\\", with: "/")
-            let component = normalized
-                .split(whereSeparator: { $0 == "/" || $0 == ":" })
-                .last
-                .map(String.init) ?? ""
-            let name = component.hasSuffix(".git")
-                ? String(component.dropLast(4))
-                : component
-            if !name.isEmpty {
-                return name
-            }
-        }
-        return root.lastPathComponent
-    }
-
-    private static func maskedPreview(_ url: URL) -> String {
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return "Secret-bearing file"
-        }
-        defer { try? handle.close() }
-        let data = (try? handle.read(upToCount: 16 * 1024)) ?? Data()
-        guard let text = String(data: data, encoding: .utf8) else {
-            return "Binary credential or private key"
-        }
-        if text.contains("PRIVATE KEY-----") {
-            return "Private key material"
-        }
-        var keys: [String] = []
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.hasPrefix("#") else { continue }
-            let separators = ["=", ":"]
-            if let separator = separators.compactMap({ line.firstIndex(of: Character($0)) }).min(),
-               separator != line.startIndex {
-                let key = line[..<separator]
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
-                if !key.isEmpty {
-                    keys.append("\(key)=••••••")
-                }
-            }
-            if keys.count == 2 { break }
-        }
-        return keys.isEmpty ? "Secret token detected" : keys.joined(separator: "  ")
     }
 }
 

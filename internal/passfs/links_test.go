@@ -2,7 +2,6 @@ package passfs
 
 import (
 	"bytes"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,7 +146,7 @@ func TestOfflineParentMoveUpdatesOnlyLinkIndex(t *testing.T) {
 	}
 }
 
-func TestDeletedProtectedLinkDeletesObjectAfterGlobalConfirmation(t *testing.T) {
+func TestDeletedProtectedLinkMovesObjectToRecoveryAfterGlobalConfirmation(t *testing.T) {
 	volume, sourcePath, storage, mountPoint := initializeLinkedTestFile(t)
 	synchronizer := newGlobalTestSynchronizer(t, volume, mountPoint)
 	if err := os.Remove(sourcePath); err != nil {
@@ -161,10 +160,11 @@ func TestDeletedProtectedLinkDeletesObjectAfterGlobalConfirmation(t *testing.T) 
 		t.Fatal("settled deletion unexpectedly requested another retry")
 	}
 	cipherPath, _ := volume.encryptedPath(storage)
-	if _, err := os.Lstat(cipherPath); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(cipherPath); err != nil {
 		t.Fatalf("ciphertext after link deletion: %v", err)
 	}
-	if records := volume.linkRecords(); len(records) != 0 {
+	if records := volume.linkRecords(); len(records) != 1 ||
+		records[0].recovery.State != RecoveryTrash {
 		t.Fatalf("records after deletion = %#v", records)
 	}
 }
@@ -184,7 +184,7 @@ func TestRegularReplacementPreservesObjectAsOrphan(t *testing.T) {
 		t.Fatalf("replacement removed ciphertext: %v", err)
 	}
 	records := volume.linkRecords()
-	if len(records) != 1 || records[0].orphanedAt == 0 {
+	if len(records) != 1 || records[0].recovery.State != RecoveryConflict {
 		t.Fatalf("replacement records = %#v", records)
 	}
 }

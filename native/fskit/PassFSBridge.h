@@ -16,6 +16,13 @@ enum {
 };
 
 enum {
+    PASSFS_UNLOCK_ONCE = 0,
+    PASSFS_UNLOCK_FILE = 1,
+    PASSFS_UNLOCK_PROCESS = 2,
+    PASSFS_UNLOCK_VAULT = 3
+};
+
+enum {
     PASSFS_SET_SIZE = 1u << 0,
     PASSFS_SET_MODE = 1u << 1,
     PASSFS_SET_UID = 1u << 2,
@@ -73,6 +80,7 @@ uint64_t passfs_bridge_open_file_system(
     const char *vault_path,
     int64_t maximum_file_size,
     int64_t unlock_duration_ns,
+    uint32_t unlock_scope,
     uint32_t authorization_mode,
     char **error_message
 );
@@ -83,6 +91,7 @@ int passfs_bridge_configure_file_system(
     uint64_t file_system,
     int64_t maximum_file_size,
     int64_t unlock_duration_ns,
+    uint32_t unlock_scope,
     uint32_t authorization_mode,
     char **error_message
 );

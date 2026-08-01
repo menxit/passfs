@@ -61,6 +61,7 @@ previous_app="$build_directory/PreviousPassFS.app"
 profile_plist="$build_directory/profile.plist"
 profile_certificate="$build_directory/profile-certificate.der"
 entitlements="$build_directory/passfs.entitlements"
+helper_entitlements="$build_directory/passfs-helper.entitlements"
 binary_directory="$build_directory/binaries"
 
 cleanup()
@@ -82,10 +83,17 @@ signing_identity=$(passfs_resolve_signing_identity \
 
 sed "s/__TEAM_IDENTIFIER__/$team_identifier/g" \
 	"$project_root/packaging/macos/passfs.entitlements.in" >"$entitlements"
-plutil -lint "$project_root/packaging/macos/Info.plist" "$entitlements" >/dev/null
+sed "s/__TEAM_IDENTIFIER__/$team_identifier/g" \
+	"$project_root/packaging/macos/passfs-helper.entitlements.in" >"$helper_entitlements"
+plutil -lint \
+	"$project_root/packaging/macos/Info.plist" \
+	"$project_root/packaging/macos/com.menxit.passfs.control-agent.plist" \
+	"$entitlements" \
+	"$helper_entitlements" >/dev/null
 
 mkdir -p \
 	"$staged_app/Contents/Helpers" \
+	"$staged_app/Contents/Library/LaunchAgents" \
 	"$staged_app/Contents/MacOS" \
 	"$staged_app/Contents/Extensions" \
 	"$staged_app/Contents/Resources" \
@@ -103,6 +111,8 @@ cp \
 	"$staged_app/Contents/Resources/"
 cp "$project_root/packaging/macos/uninstall-passfs.sh" \
 	"$staged_app/Contents/Resources/uninstall-passfs.sh"
+cp "$project_root/packaging/macos/com.menxit.passfs.control-agent.plist" \
+	"$staged_app/Contents/Library/LaunchAgents/"
 chmod 0755 "$staged_app/Contents/Resources/uninstall-passfs.sh"
 for localization in "$project_root"/native/menubar/Resources/*.lproj; do
 	cp -R "$localization" "$staged_app/Contents/Resources/"
@@ -216,7 +226,7 @@ codesign \
 	--identifier "$bundle_id" \
 	--options runtime \
 	--timestamp \
-	--entitlements "$entitlements" \
+	--entitlements "$helper_entitlements" \
 	--sign "$signing_identity" \
 	"$cli_bundle"
 
@@ -228,7 +238,7 @@ codesign \
 	--entitlements "$entitlements" \
 	--sign "$signing_identity" \
 	"$staged_app"
-codesign --verify --deep --strict --verbose=2 "$staged_app"
+"$project_root/scripts/verify-macos-app.sh" "$staged_app"
 
 had_previous=false
 if [ -e "$output" ] || [ -L "$output" ]; then

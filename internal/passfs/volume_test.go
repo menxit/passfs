@@ -179,6 +179,31 @@ func TestInitVolumeOptionalIdentityFailureKeepsRecoveryVolume(t *testing.T) {
 	}
 }
 
+func TestLoadVolumeMigratesPreviousMetadataVersion(t *testing.T) {
+	const passphrase = "metadata version migration password"
+	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)
+	metadata := cloneMetadata(volume.metadata)
+	metadata.Version = previousMetadataFormatVersion
+	if err := saveMetadata(volume.root, metadata); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadVolume(
+		volume.root,
+		&recordingPrompter{fallback: passphrase},
+		1024*1024,
+		0,
+	); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := readMetadata(volume.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.Version != metadataFormatVersion {
+		t.Fatalf("metadata version = %d, want %d", migrated.Version, metadataFormatVersion)
+	}
+}
+
 func TestInitVolumeOptionalIdentitySuccessIsConfigured(t *testing.T) {
 	const passphrase = "optional identity success password"
 	prompter := &recordingPrompter{
@@ -515,8 +540,8 @@ func TestUnlockWindowReusesIdentityAcrossFilesInMemory(t *testing.T) {
 		t.Fatalf("open other file: %v", err)
 	}
 	_ = otherHandle.Close(context.Background())
-	if got := prompter.requestCount(); got != 1 {
-		t.Fatalf("prompts for a different path within unlock window = %d, want 1", got)
+	if got := prompter.requestCount(); got != 2 {
+		t.Fatalf("prompts for a different path within file-scoped unlock window = %d, want 2", got)
 	}
 
 	cachedVolume.Lock()
@@ -525,8 +550,67 @@ func TestUnlockWindowReusesIdentityAcrossFilesInMemory(t *testing.T) {
 		t.Fatalf("openFile after Lock: %v", err)
 	}
 	_ = handle.Close(context.Background())
+	if got := prompter.requestCount(); got != 3 {
+		t.Fatalf("prompts after Lock = %d, want 3", got)
+	}
+}
+
+func TestVaultUnlockScopeReusesAuthorizationAcrossFiles(t *testing.T) {
+	const passphrase = "vault scoped cache password"
+	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)
+	createTestFile(t, volume, "first.env", []byte("A=1\n"))
+	createTestFile(t, volume, "second.env", []byte("B=2\n"))
+	prompter := &recordingPrompter{fallback: passphrase}
+	cached, err := LoadVolumeWithScope(
+		volume.root, prompter, 1024*1024, time.Minute, UnlockVault,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"first.env", "second.env"} {
+		handle, err := cached.openFile(context.Background(), path, syscall.O_RDONLY)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = handle.Close(context.Background())
+	}
+	if got := prompter.requestCount(); got != 1 {
+		t.Fatalf("vault-scoped prompts = %d, want 1", got)
+	}
+}
+
+func TestProcessUnlockScopeDoesNotAuthorizeAnotherProcess(t *testing.T) {
+	const passphrase = "process scoped cache password"
+	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)
+	createTestFile(t, volume, "first.env", []byte("A=1\n"))
+	createTestFile(t, volume, "second.env", []byte("B=2\n"))
+	prompter := &recordingPrompter{fallback: passphrase}
+	cached, err := LoadVolumeWithScope(
+		volume.root, prompter, 1024*1024, time.Minute, UnlockProcess,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerPID := uint32(os.Getpid())
+	owner := fsapi.WithCaller(context.Background(), fsapi.Caller{PID: ownerPID})
+	other := fsapi.WithCaller(context.Background(), fsapi.Caller{PID: ownerPID + 1_000_000})
+	for _, path := range []string{"first.env", "second.env"} {
+		handle, err := cached.openFile(owner, path, syscall.O_RDONLY)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = handle.Close(owner)
+	}
+	if got := prompter.requestCount(); got != 1 {
+		t.Fatalf("same-process prompts = %d, want 1", got)
+	}
+	handle, err := cached.openFile(other, "first.env", syscall.O_RDONLY)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = handle.Close(other)
 	if got := prompter.requestCount(); got != 2 {
-		t.Fatalf("prompts after Lock = %d, want 2", got)
+		t.Fatalf("cross-process prompts = %d, want 2", got)
 	}
 }
 

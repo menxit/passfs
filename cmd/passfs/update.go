@@ -179,8 +179,9 @@ func printCachedUpdateNotice(command string, writer io.Writer) {
 		return
 	}
 	switch command {
-	case "update", "serve", "__touchid-helper", "help", "--help", "-h",
-		"version", "--version", "-version", "__update-status", "__ui-status":
+	case "update", "serve", "__touchid-helper", "__app-agent",
+		"__gatekeeper-assessment", "help", "--help", "-h", "version",
+		"--version", "-version", "__update-status", "__ui-status":
 		return
 	}
 	path, err := updateStatePath()

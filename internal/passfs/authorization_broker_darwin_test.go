@@ -89,6 +89,35 @@ func newBrokerTestRuntimeDirectory(t *testing.T) string {
 	return runtimeDirectory
 }
 
+func TestAuthorizationBrokerUsesSharedAppGroupFromExtensionHome(t *testing.T) {
+	userHome := t.TempDir()
+	extensionHome := filepath.Join(
+		userHome,
+		"Library",
+		"Containers",
+		passFSFSKitIdentifier,
+		"Data",
+	)
+	if err := os.MkdirAll(extensionHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", extensionHome)
+	runtimeDirectory, err := authorizationBrokerRuntimeDirectory(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(
+		userHome,
+		"Library",
+		"Group Containers",
+		passFSAppGroupIdentifier,
+		"Authorization",
+	)
+	if runtimeDirectory != want {
+		t.Fatalf("runtime directory = %q, want %q", runtimeDirectory, want)
+	}
+}
+
 func TestFSKitPassphraseBrokerRoundTrip(t *testing.T) {
 	vault := newBrokerTestVault(t)
 	runtimeDirectory := newBrokerTestRuntimeDirectory(t)

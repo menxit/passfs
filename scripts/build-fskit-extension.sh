@@ -85,13 +85,22 @@ if /usr/libexec/PlistBuddy \
 	-c "Print :com.apple.security.network.client" \
 	"$entitlements" >/dev/null 2>&1; then
 	/usr/libexec/PlistBuddy \
-		-c "Set :com.apple.security.network.client true" \
-		"$entitlements"
-else
-	/usr/libexec/PlistBuddy \
-		-c "Add :com.apple.security.network.client bool true" \
+		-c "Delete :com.apple.security.network.client" \
 		"$entitlements"
 fi
+if /usr/libexec/PlistBuddy \
+	-c "Print :com.apple.security.application-groups" \
+	"$entitlements" >/dev/null 2>&1; then
+	/usr/libexec/PlistBuddy \
+		-c "Delete :com.apple.security.application-groups" \
+		"$entitlements"
+fi
+/usr/libexec/PlistBuddy \
+	-c "Add :com.apple.security.application-groups array" \
+	"$entitlements"
+/usr/libexec/PlistBuddy \
+	-c "Add :com.apple.security.application-groups:0 string $team_identifier.com.menxit.passfs.shared" \
+	"$entitlements"
 
 xcode_architectures=$(
 	"$project_root/scripts/build-fskit-bridge.sh" \

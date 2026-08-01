@@ -80,6 +80,7 @@ final class PassFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
                 vaultPath: pathResource.url.path,
                 maximumFileSize: configuration.maximumFileSize,
                 unlockDurationNanoseconds: configuration.unlockDurationNanoseconds,
+                unlockScope: configuration.unlockScope,
                 authorizationMode: configuration.authorizationMode ?? UInt32(
                     PASSFS_AUTHORIZATION_TOUCH_ID
                 )
@@ -164,6 +165,7 @@ private func passFSVolumeUUID(at vault: URL) -> UUID? {
 struct PassFSConfiguration {
     var maximumFileSize: Int64 = 16 * 1024 * 1024
     var unlockDurationNanoseconds: Int64 = 0
+    var unlockScope: UInt32 = UInt32(PASSFS_UNLOCK_ONCE)
     var authorizationMode: UInt32?
 }
 
@@ -205,6 +207,22 @@ func passFSConfiguration(
                 throw POSIXError(.EINVAL)
             }
             configuration.unlockDurationNanoseconds = duration
+        case "unlock-scope":
+            guard parts.count == 2 else {
+                throw POSIXError(.EINVAL)
+            }
+            switch parts[1] {
+            case "once":
+                configuration.unlockScope = UInt32(PASSFS_UNLOCK_ONCE)
+            case "file":
+                configuration.unlockScope = UInt32(PASSFS_UNLOCK_FILE)
+            case "process":
+                configuration.unlockScope = UInt32(PASSFS_UNLOCK_PROCESS)
+            case "vault":
+                configuration.unlockScope = UInt32(PASSFS_UNLOCK_VAULT)
+            default:
+                throw POSIXError(.EINVAL)
+            }
         case "authorization":
             guard parts.count == 2 else {
                 throw POSIXError(.EINVAL)

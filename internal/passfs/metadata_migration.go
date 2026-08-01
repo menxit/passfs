@@ -33,6 +33,7 @@ func migrateLegacyMetadata(root string, legacy Metadata) (Metadata, error) {
 		Files:         make(map[string]FileMeta, len(legacy.Files)),
 		Links:         make(map[string]string, len(legacy.Links)),
 		Orphaned:      make(map[string]int64),
+		Recovery:      make(map[string]RecoveryEntry),
 		LegacyTargets: make(map[string]string),
 	}
 	now := time.Now().UnixNano()
@@ -224,17 +225,28 @@ func reconcileMetadata(root string, metadata *Metadata) (bool, error) {
 		metadata.Orphaned = make(map[string]int64)
 		changed = true
 	}
+	if metadata.Recovery == nil {
+		metadata.Recovery = make(map[string]RecoveryEntry)
+		changed = true
+	}
 	if metadata.LegacyTargets == nil {
 		metadata.LegacyTargets = make(map[string]string)
 		changed = true
 	}
 	for key, meta := range metadata.Files {
 		if _, exists := actual[key]; !exists {
-			delete(metadata.Files, key)
-			delete(metadata.Links, key)
-			delete(metadata.Orphaned, key)
-			delete(metadata.LegacyTargets, key)
-			changed = true
+			if _, err := objectIDFromStoragePath(filepath.FromSlash(key)); err != nil {
+				delete(metadata.Files, key)
+				delete(metadata.Links, key)
+				delete(metadata.Orphaned, key)
+				delete(metadata.Recovery, key)
+				delete(metadata.LegacyTargets, key)
+				changed = true
+				continue
+			}
+			// Never erase the only record of an expected encrypted object during
+			// startup reconciliation. `passfs vault verify` must be able to report
+			// missing ciphertext, and an operator may still recover it from backup.
 			continue
 		}
 		if meta.Inode < 2 {
@@ -258,6 +270,17 @@ func reconcileMetadata(root string, metadata *Metadata) (bool, error) {
 	}
 	for key := range metadata.Orphaned {
 		if _, exists := metadata.Files[key]; !exists {
+			delete(metadata.Orphaned, key)
+			changed = true
+		}
+	}
+	for key := range metadata.Recovery {
+		if _, exists := metadata.Files[key]; !exists {
+			delete(metadata.Recovery, key)
+			changed = true
+			continue
+		}
+		if metadata.Orphaned[key] != 0 {
 			delete(metadata.Orphaned, key)
 			changed = true
 		}

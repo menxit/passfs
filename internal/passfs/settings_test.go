@@ -188,6 +188,67 @@ func TestSettingsRoundTripHasNoProjects(t *testing.T) {
 	if duration, err := loaded.UnlockDuration(); err != nil || duration != 5*time.Minute {
 		t.Fatalf("unlock duration = %s, %v", duration, err)
 	}
+	if scope, err := loaded.AuthorizationScope(); err != nil || scope != UnlockFile {
+		t.Fatalf("unlock scope = %q, %v; want file", scope, err)
+	}
+}
+
+func TestSettingsSetVaultValidatesAndPersists(t *testing.T) {
+	base := t.TempDir()
+	settings, err := NewSettings(
+		filepath.Join(base, "config.json"),
+		filepath.Join(base, "old-vault"),
+		filepath.Join(base, "mnt"),
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newVault := filepath.Join(base, "restored-vault")
+	if err := settings.SetVault(newVault); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.Save(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadSettings(settings.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Vault != newVault {
+		t.Fatalf("vault = %q, want %q", loaded.Vault, newVault)
+	}
+	if err := loaded.SetVault(filepath.Join(loaded.MountPoint, "vault")); err == nil {
+		t.Fatal("SetVault accepted a vault inside the mount point")
+	}
+}
+
+func TestSettingsWithoutScopeUseSafeCompatibleDefault(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "config.json")
+	data := []byte(`{
+  "version": 2,
+  "vault": "` + filepath.Join(base, "vault") + `",
+  "mountPoint": "` + filepath.Join(base, "mnt") + `",
+  "unlockFor": "5m"
+}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := LoadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope, err := settings.AuthorizationScope(); err != nil || scope != UnlockFile {
+		t.Fatalf("legacy scope = %q, %v; want file", scope, err)
+	}
+	migrated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(migrated), `"version": 3`) {
+		t.Fatalf("settings were not migrated to v3: %s", migrated)
+	}
 }
 
 func TestAbsolutePathMappings(t *testing.T) {

@@ -113,6 +113,12 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runIgnored(args[1:], stdout, stderr)
 	case "protected":
 		return runProtected(args[1:], stdout, stderr)
+	case "recovery":
+		return runRecovery(args[1:], stdout, stderr)
+	case "backup":
+		return runBackup(args[1:], stdout, stderr)
+	case "vault":
+		return runVault(args[1:], stdout, stderr)
 	case "mount":
 		return runMount(args[1:], stdout, stderr)
 	case "unmount":
@@ -131,6 +137,10 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runCachedUpdateStatus(args[1:], stdout)
 	case "__ui-status":
 		return runUISnapshot(args[1:], stdout, stderr)
+	case "__app-agent":
+		return runPlatformAppAgent(stderr)
+	case "__gatekeeper-assessment":
+		return runGatekeeperAssessment(args[1:], stdout)
 	case "passwd":
 		return runPasswd(args[1:], stdout, stderr)
 	case "config":
@@ -164,6 +174,9 @@ Usage:
   passfs ignored [options]
   passfs encrypt [options] FILE...
   passfs protected [options]
+  passfs recovery list|restore|purge [options]
+  passfs backup create|verify|restore [options]
+  passfs vault verify [options]
   passfs unprotect [options] [FILE]
   passfs edit [options] FILE
   passfs status [options]
@@ -275,6 +288,7 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	var vaultPath string
 	var mountPoint string
 	var unlockFor time.Duration
+	var unlockScope string
 	var disableTouchID bool
 	var adapterName string
 	var noMount bool
@@ -294,6 +308,7 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	flags.StringVar(&vaultPath, "vault", defaultVault, "directory that stores encrypted data")
 	flags.StringVar(&mountPoint, "mount-point", defaultMountPoint, "directory where passfs is mounted")
 	flags.DurationVar(&unlockFor, "unlock-for", 0, "authorization cache duration")
+	flags.StringVar(&unlockScope, "unlock-scope", "", `authorization cache scope: "once", "file", "process", or "vault"`)
 	flags.BoolVar(
 		&disableTouchID,
 		"no-touchid",
@@ -376,6 +391,11 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if unlockScope != "" {
+			if err := settings.SetAuthorizationScope(passfs.UnlockScope(unlockScope)); err != nil {
+				return err
+			}
+		}
 		touchIDEnabled, touchIDWarning, err := initVolumeWithPlatformDefaults(
 			context.Background(),
 			settings.Vault,
@@ -407,14 +427,22 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 			terminalPath(settings.Vault),
 			terminalPath(settings.MountPoint),
 		)
-		if unlockFor == 0 {
+		effectiveUnlockFor, durationErr := settings.UnlockDuration()
+		if durationErr != nil {
+			return durationErr
+		}
+		if effectiveUnlockFor == 0 {
 			if settings.TouchID {
 				fmt.Fprintln(stdout, "Authorization: Touch ID required for every file open")
 			} else {
 				fmt.Fprintln(stdout, "Authorization: passphrase required for every file open")
 			}
 		} else {
-			fmt.Fprintf(stdout, "Per-file authorization: %s\n", unlockFor)
+			scope, scopeErr := settings.AuthorizationScope()
+			if scopeErr != nil {
+				return scopeErr
+			}
+			fmt.Fprintf(stdout, "Authorization cache: %s (%s scope)\n", effectiveUnlockFor, scope)
 		}
 	default:
 		return loadErr
@@ -1723,12 +1751,14 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	var common commonFlags
 	var unlockFor string
+	var unlockScope string
 	var mountPoint string
 	var adapterName string
 	if err := addCommonFlags(flags, &common); err != nil {
 		return err
 	}
 	flags.StringVar(&unlockFor, "unlock-for", "", "set authorization cache duration")
+	flags.StringVar(&unlockScope, "unlock-scope", "", `set cache scope: "once", "file", "process", or "vault"`)
 	flags.StringVar(&mountPoint, "mount-point", "", "set the global mount point")
 	flags.StringVar(
 		&adapterName,
@@ -1753,6 +1783,12 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("invalid --unlock-for value %q", unlockFor)
 		}
 		if err := settings.SetUnlockDuration(duration); err != nil {
+			return err
+		}
+		changed = true
+	}
+	if unlockScope != "" {
+		if err := settings.SetAuthorizationScope(passfs.UnlockScope(unlockScope)); err != nil {
 			return err
 		}
 		changed = true
@@ -1793,13 +1829,18 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	scope, err := settings.AuthorizationScope()
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(
 		stdout,
-		"Config:      %s\nVault:       %s\nMount point: %s\nUnlock for:  %s\nAdapter:     %s\n",
+		"Config:       %s\nVault:        %s\nMount point:  %s\nUnlock for:   %s\nUnlock scope: %s\nAdapter:      %s\n",
 		terminalPath(settings.Path()),
 		terminalPath(settings.Vault),
 		terminalPath(settings.MountPoint),
 		formatUnlockDuration(duration),
+		scope,
 		requestedAdapter(settings),
 	)
 	if changed {

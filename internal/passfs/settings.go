@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const settingsVersion = 2
+const (
+	settingsVersion         = 3
+	previousSettingsVersion = 2
+)
 
 const (
 	defaultHomeName = ".passfs"
@@ -17,12 +20,13 @@ const (
 )
 
 type Settings struct {
-	Version    int    `json:"version"`
-	Vault      string `json:"vault"`
-	MountPoint string `json:"mountPoint"`
-	UnlockFor  string `json:"unlockFor"`
-	TouchID    bool   `json:"touchId,omitempty"`
-	Adapter    string `json:"adapter,omitempty"`
+	Version     int         `json:"version"`
+	Vault       string      `json:"vault"`
+	MountPoint  string      `json:"mountPoint"`
+	UnlockFor   string      `json:"unlockFor"`
+	UnlockScope UnlockScope `json:"unlockScope,omitempty"`
+	TouchID     bool        `json:"touchId,omitempty"`
+	Adapter     string      `json:"adapter,omitempty"`
 
 	path string
 }
@@ -145,6 +149,7 @@ func MigrateLegacyHome() (bool, error) {
 	}
 	currentSettings.TouchID = legacySettings.TouchID
 	currentSettings.Adapter = legacySettings.Adapter
+	currentSettings.UnlockScope = legacySettings.UnlockScope
 	if err := currentSettings.Save(); err != nil {
 		rollback()
 		return false, fmt.Errorf("rewrite migrated passfs settings: %w", err)
@@ -204,11 +209,12 @@ func NewSettings(
 		return nil, err
 	}
 	return &Settings{
-		Version:    settingsVersion,
-		Vault:      absoluteVault,
-		MountPoint: absoluteMountPoint,
-		UnlockFor:  unlockFor.String(),
-		path:       absolutePath,
+		Version:     settingsVersion,
+		Vault:       absoluteVault,
+		MountPoint:  absoluteMountPoint,
+		UnlockFor:   unlockFor.String(),
+		UnlockScope: defaultUnlockScope(unlockFor),
+		path:        absolutePath,
 	}, nil
 }
 
@@ -227,7 +233,7 @@ func LoadSettings(path string) (*Settings, error) {
 	if err := decodeBoundedJSON(file, 4*1024*1024, &disk); err != nil {
 		return nil, fmt.Errorf("parse passfs settings: %w", err)
 	}
-	if disk.Version != settingsVersion {
+	if disk.Version != previousSettingsVersion && disk.Version != settingsVersion {
 		return nil, fmt.Errorf("unsupported settings version %d", disk.Version)
 	}
 	if disk.Vault == "" {
@@ -242,10 +248,19 @@ func LoadSettings(path string) (*Settings, error) {
 		return nil, err
 	}
 	settings.UnlockFor = disk.UnlockFor
+	settings.UnlockScope = disk.UnlockScope
 	settings.TouchID = disk.TouchID
 	settings.Adapter = disk.Adapter
 	if _, err := settings.UnlockDuration(); err != nil {
 		return nil, err
+	}
+	if _, err := settings.AuthorizationScope(); err != nil {
+		return nil, err
+	}
+	if disk.Version == previousSettingsVersion {
+		if err := settings.Save(); err != nil {
+			return nil, fmt.Errorf("migrate passfs settings: %w", err)
+		}
 	}
 	return settings, nil
 }
@@ -255,6 +270,9 @@ func (settings *Settings) Save() error {
 		return errors.New("settings path is not configured")
 	}
 	settings.Version = settingsVersion
+	if _, err := settings.AuthorizationScope(); err != nil {
+		return err
+	}
 	if err := WriteJSONFileAtomic(settings.path, settings, 0o600); err != nil {
 		return err
 	}
@@ -281,6 +299,40 @@ func (settings *Settings) SetUnlockDuration(duration time.Duration) error {
 		return errors.New("unlock duration cannot be negative")
 	}
 	settings.UnlockFor = duration.String()
+	if duration == 0 {
+		settings.UnlockScope = UnlockOnce
+	} else if settings.UnlockScope == "" || settings.UnlockScope == UnlockOnce {
+		settings.UnlockScope = UnlockFile
+	}
+	return nil
+}
+
+func (settings *Settings) AuthorizationScope() (UnlockScope, error) {
+	duration, err := settings.UnlockDuration()
+	if err != nil {
+		return "", err
+	}
+	scope := settings.UnlockScope
+	if scope == "" {
+		scope = defaultUnlockScope(duration)
+	}
+	if err := scope.Validate(); err != nil {
+		return "", err
+	}
+	if duration == 0 {
+		return UnlockOnce, nil
+	}
+	return scope, nil
+}
+
+func (settings *Settings) SetAuthorizationScope(scope UnlockScope) error {
+	if err := scope.Validate(); err != nil {
+		return err
+	}
+	settings.UnlockScope = scope
+	if scope == UnlockOnce {
+		settings.UnlockFor = "0s"
+	}
 	return nil
 }
 
@@ -293,6 +345,18 @@ func (settings *Settings) SetMountPoint(mountPoint string) error {
 		return err
 	}
 	settings.MountPoint = absolute
+	return nil
+}
+
+func (settings *Settings) SetVault(vault string) error {
+	absolute, err := filepath.Abs(vault)
+	if err != nil {
+		return err
+	}
+	if err := validateVaultAndMountPoint(absolute, settings.MountPoint); err != nil {
+		return err
+	}
+	settings.Vault = absolute
 	return nil
 }
 
