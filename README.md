@@ -252,8 +252,10 @@ passfs config --unlock-for 5m
 ```
 
 The cache applies to the whole vault and exists only in the passfs process
-memory. If the filesystem is running, `passfs config` restarts it automatically
-so the new duration takes effect immediately.
+memory. On macOS it is cleared whenever the computer sleeps or wakes, so the
+next protected-file open always requires a new authorization. If the filesystem
+is running, `passfs config` restarts it automatically so the new duration takes
+effect immediately.
 
 Change the global passphrase with:
 

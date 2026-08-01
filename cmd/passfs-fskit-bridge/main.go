@@ -33,6 +33,7 @@ type mountedFileSystem struct {
 	fileSystem        fsapi.FileSystem
 	vault             string
 	authorizationMode uint32
+	sleepMonitor      *passfs.SystemSleepMonitor
 }
 
 //export passfs_bridge_volume_id
@@ -244,6 +245,15 @@ func passfs_bridge_open_file_system(
 		storeBridgeError(errorMessage, err)
 		return 0
 	}
+	sleepMonitor, err := passfs.NewSystemSleepMonitor(volume)
+	if err != nil {
+		volume.Lock()
+		storeBridgeError(
+			errorMessage,
+			fmt.Errorf("monitor system sleep: %w", err),
+		)
+		return 0
+	}
 	bridgeRegistry.Lock()
 	identifier := bridgeRegistry.nextIdentifierLocked()
 	bridgeRegistry.fileSystems[identifier] = &mountedFileSystem{
@@ -251,6 +261,7 @@ func passfs_bridge_open_file_system(
 		fileSystem:        passfs.NewFileSystem(volume),
 		vault:             vault,
 		authorizationMode: mode,
+		sleepMonitor:      sleepMonitor,
 	}
 	bridgeRegistry.Unlock()
 	return C.uint64_t(identifier)
@@ -327,6 +338,7 @@ func passfs_bridge_close_file_system(identifier C.uint64_t) C.int {
 		}
 	}
 	bridgeRegistry.Unlock()
+	_ = fileSystem.sleepMonitor.Close()
 	for _, handle := range handles {
 		_ = handle.Close(context.Background())
 	}

@@ -12,12 +12,20 @@ import (
 	"passfs/internal/passfs"
 )
 
+type noSystemSleepMonitor struct{}
+
+func (noSystemSleepMonitor) Close() error { return nil }
+
 func launchPlatformApp() (bool, error) {
 	return false, nil
 }
 
 func platformFilesystemAdapters() []filesystemAdapter {
 	return []filesystemAdapter{fuseFilesystemAdapter{}}
+}
+
+func newPlatformSystemSleepMonitor(*passfs.Volume) (io.Closer, error) {
+	return noSystemSleepMonitor{}, nil
 }
 
 func platformAutomaticFilesystemAdapters(

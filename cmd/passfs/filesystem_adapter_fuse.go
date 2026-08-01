@@ -81,7 +81,7 @@ func (fuseFilesystemAdapter) Serve(
 	volume := prepared.volume
 	linkSynchronizer := prepared.synchronizer
 	logger := prepared.logger
-	defer linkSynchronizer.Close()
+	defer prepared.Close()
 
 	zero := time.Duration(0)
 	server, err := fs.Mount(

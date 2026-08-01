@@ -14,6 +14,7 @@ import (
 type preparedFilesystemService struct {
 	volume       *passfs.Volume
 	synchronizer *passfs.LinkSynchronizer
+	sleepMonitor io.Closer
 	prompter     passfs.Prompter
 	logger       *log.Logger
 	unlockFor    time.Duration
@@ -45,6 +46,10 @@ func prepareFilesystemService(
 	if err != nil {
 		return nil, err
 	}
+	sleepMonitor, err := newPlatformSystemSleepMonitor(volume)
+	if err != nil {
+		return nil, fmt.Errorf("monitor system sleep: %w", err)
+	}
 	logger := log.New(stderr, "", log.LstdFlags)
 	synchronizer, err := passfs.NewLinkSynchronizer(
 		volume,
@@ -52,20 +57,31 @@ func prepareFilesystemService(
 		logger,
 	)
 	if err != nil {
+		_ = sleepMonitor.Close()
 		return nil, fmt.Errorf("initialize protected link tracking: %w", err)
 	}
 	synchronizer.EnableGlobalMoveSearch()
 	if err := synchronizer.Prepare(); err != nil {
 		synchronizer.Close()
+		_ = sleepMonitor.Close()
 		return nil, fmt.Errorf("prepare protected link tracking: %w", err)
 	}
 	return &preparedFilesystemService{
 		volume:       volume,
 		synchronizer: synchronizer,
+		sleepMonitor: sleepMonitor,
 		prompter:     prompter,
 		logger:       logger,
 		unlockFor:    unlockFor,
 	}, nil
+}
+
+func (prepared *preparedFilesystemService) Close() {
+	if prepared == nil {
+		return
+	}
+	prepared.synchronizer.Close()
+	_ = prepared.sleepMonitor.Close()
 }
 
 const (

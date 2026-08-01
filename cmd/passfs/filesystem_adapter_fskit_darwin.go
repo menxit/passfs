@@ -181,7 +181,7 @@ func (fsKitFilesystemAdapter) Serve(
 	linkSynchronizer := prepared.synchronizer
 	logger := prepared.logger
 	unlockFor := prepared.unlockFor
-	defer linkSynchronizer.Close()
+	defer prepared.Close()
 	authorization := "touchid"
 	if !settings.TouchID {
 		authorization = "passphrase"

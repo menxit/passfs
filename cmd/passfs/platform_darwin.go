@@ -91,6 +91,12 @@ func platformFilesystemAdapters() []filesystemAdapter {
 	}
 }
 
+func newPlatformSystemSleepMonitor(
+	volume *passfs.Volume,
+) (io.Closer, error) {
+	return passfs.NewSystemSleepMonitor(volume)
+}
+
 func platformAutomaticFilesystemAdapters(
 	adapters []filesystemAdapter,
 ) []filesystemAdapter {
