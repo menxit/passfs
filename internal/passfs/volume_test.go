@@ -300,6 +300,52 @@ func TestEncryptedFileRoundTripPromptsOnEveryOpen(t *testing.T) {
 	}
 }
 
+func TestOpenPromptUsesRegisteredAliasAfterExternalMetadataUpdate(t *testing.T) {
+	const passphrase = "alias prompt password"
+	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)
+	objectID, err := newObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage, err := objectStoragePath(objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createTestFile(t, volume, storage, []byte("TOKEN=value\n"))
+
+	// Load the reader before the CLI-side registration to reproduce a mounted
+	// adapter whose in-memory metadata predates the protected link.
+	prompter := &recordingPrompter{fallback: passphrase}
+	reader, err := LoadVolume(volume.root, prompter, 1024*1024, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := t.TempDir()
+	alias := filepath.Join(project, ".env")
+	if err := volume.setLinkSource(storage, alias); err != nil {
+		t.Fatal(err)
+	}
+	alias, err = ResolvePathEntry(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handle, err := reader.openFile(t.Context(), storage, syscall.O_RDONLY)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errno := handle.Close(t.Context()); errno != 0 {
+		t.Fatal(errno)
+	}
+	if got := prompter.requestCount(); got != 1 {
+		t.Fatalf("prompts = %d, want 1", got)
+	}
+	request := prompter.requests[0]
+	if request.Path != alias || request.Operation != "read" {
+		t.Fatalf("prompt = %#v, want alias %q", request, alias)
+	}
+}
+
 func TestWrongPassphraseCannotOpenFile(t *testing.T) {
 	volume, _ := initializeTestVolume(t, "right password", 1024*1024)
 	createTestFile(t, volume, "secret.env", []byte("PASSWORD=hunter2\n"))
@@ -326,7 +372,16 @@ func TestIdentityPrompterUnlocksWithoutRequestingPassphrase(t *testing.T) {
 	const passphrase = "Touch ID recovery passphrase"
 	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)
 	plaintext := []byte("TOKEN=biometric\n")
-	createTestFile(t, volume, "touchid.env", plaintext)
+	objectID, err := newObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage, err := objectStoragePath(objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createTestFile(t, volume, storage, plaintext)
+	alias := filepath.Join(t.TempDir(), "touchid.env")
 
 	public, err := loadPublicConfig(volume.root)
 	if err != nil {
@@ -353,10 +408,17 @@ func TestIdentityPrompterUnlocksWithoutRequestingPassphrase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadVolume: %v", err)
 	}
+	if err := touchIDVolume.setLinkSource(storage, alias); err != nil {
+		t.Fatal(err)
+	}
+	alias, err = ResolvePathEntry(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for openNumber := 0; openNumber < 2; openNumber++ {
 		handle, err := touchIDVolume.openFile(
 			context.Background(),
-			"touchid.env",
+			storage,
 			syscall.O_RDONLY,
 		)
 		if err != nil {
@@ -374,6 +436,13 @@ func TestIdentityPrompterUnlocksWithoutRequestingPassphrase(t *testing.T) {
 			identityPrompts,
 			passwordPrompts,
 		)
+	}
+	prompter.mu.Lock()
+	defer prompter.mu.Unlock()
+	for _, request := range prompter.identityRequests {
+		if request.Path != alias {
+			t.Fatalf("Touch ID prompt path = %q, want alias %q", request.Path, alias)
+		}
 	}
 }
 

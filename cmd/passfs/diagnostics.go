@@ -116,8 +116,7 @@ func printMountDiagnosis(writer io.Writer, settings *passfs.Settings) {
 	description := "not mounted"
 	switch {
 	case mount.mounted && mount.passfs && mount.healthy:
-		_, adapter, _ := passfs.MountAdapterStatus(settings.MountPoint)
-		description = "mounted with " + adapter + " — " +
+		description = "mounted with " + mount.adapter + " — " +
 			terminalPath(settings.MountPoint)
 	case mount.mounted && mount.passfs:
 		description = "mounted but unavailable — run \"passfs reload\""

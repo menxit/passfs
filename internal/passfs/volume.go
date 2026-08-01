@@ -628,13 +628,17 @@ func (v *Volume) removeFileMeta(relative string) error {
 	v.metadataMu.Lock()
 	defer v.metadataMu.Unlock()
 	return v.updateMetadataLocked(func(metadata *Metadata) error {
-		delete(metadata.Files, key)
-		delete(metadata.Links, key)
-		delete(metadata.Orphaned, key)
-		delete(metadata.LegacyTargets, key)
-		delete(metadata.DisplacedLinks, key)
+		deleteFileMetadata(metadata, key)
 		return nil
 	})
+}
+
+func deleteFileMetadata(metadata *Metadata, key string) {
+	delete(metadata.Files, key)
+	delete(metadata.Links, key)
+	delete(metadata.Orphaned, key)
+	delete(metadata.LegacyTargets, key)
+	delete(metadata.DisplacedLinks, key)
 }
 
 type linkRecord struct {
@@ -968,14 +972,41 @@ func (v *Volume) unlockIdentity(
 ) (*age.X25519Identity, error) {
 	cacheKey := metadataKey(relative)
 	ownerPID := callerPID(ctx)
-	displayPath := filepath.ToSlash(filepath.Clean(relative))
-	displayPath = strings.TrimPrefix(displayPath, "files/")
-	displayPath = "/" + strings.TrimPrefix(displayPath, "/")
+	displayPath := v.promptDisplayPath(relative)
 	return v.unlockIdentityForRequest(ctx, cacheKey, PromptRequest{
 		Path:      displayPath,
 		Operation: operation,
 		PID:       ownerPID,
 	})
+}
+
+func (v *Volume) promptDisplayPath(relative string) string {
+	key := metadataKey(relative)
+	linkState := func() (string, bool) {
+		v.metadataMu.RLock()
+		defer v.metadataMu.RUnlock()
+		_, protected := v.metadata.Files[key]
+		return v.metadata.Links[key], protected
+	}
+	source, protected := linkState()
+	if source != "" {
+		return filepath.Clean(source)
+	}
+
+	// Sandboxed adapters and the CLI update the same metadata file from
+	// different processes. Refresh an immutable object's link-index miss so an
+	// adapter mounted before registration still names the user-visible alias.
+	if _, err := objectIDFromStoragePath(relative); protected && err == nil {
+		if err := v.refreshMetadata(); err == nil {
+			if source, _ := linkState(); source != "" {
+				return filepath.Clean(source)
+			}
+		}
+	}
+
+	displayPath := filepath.ToSlash(filepath.Clean(relative))
+	displayPath = strings.TrimPrefix(displayPath, "files/")
+	return "/" + strings.TrimPrefix(displayPath, "/")
 }
 
 func (v *Volume) unlockIdentityForRequest(

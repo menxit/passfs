@@ -45,7 +45,6 @@ type LinkSynchronizer struct {
 	search         *movedProtectedLinkSearch
 	globalSearch   bool
 	previousIssues map[string]string
-	wake           chan struct{}
 	closed         bool
 }
 
@@ -75,7 +74,6 @@ func NewLinkSynchronizer(
 		logger:         logger,
 		tracker:        newProtectedLinkTracker(),
 		previousIssues: make(map[string]string),
-		wake:           make(chan struct{}, 1),
 	}
 	if err := volume.attachLinkSynchronizer(synchronizer); err != nil {
 		return nil, err
@@ -249,7 +247,6 @@ func (synchronizer *LinkSynchronizer) Run(ctx context.Context) {
 			timer.Stop()
 			return
 		case <-events:
-		case <-synchronizer.wake:
 		case err := <-watcherErrors:
 			if err != nil && synchronizer.logger != nil {
 				synchronizer.logger.Printf("watch protected links: %v", err)
@@ -328,37 +325,6 @@ func uniqueExistingDirectories(paths []string) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func (synchronizer *LinkSynchronizer) Track(relative string) error {
-	var sourcePath string
-	for _, record := range synchronizer.volume.linkRecords() {
-		if metadataKey(record.relative) == metadataKey(relative) {
-			sourcePath = record.sourcePath
-			break
-		}
-	}
-	if sourcePath == "" {
-		return os.ErrNotExist
-	}
-	synchronizer.mu.Lock()
-	defer synchronizer.mu.Unlock()
-	if synchronizer.closed {
-		return errors.New("protected link tracker is closed")
-	}
-	if err := ensureLinkReferenceCapacity(
-		linkReferenceCount(synchronizer.volume.linkRecords()),
-	); err != nil {
-		return err
-	}
-	if err := synchronizer.tracker.ensure(relative, sourcePath); err != nil {
-		return err
-	}
-	select {
-	case synchronizer.wake <- struct{}{}:
-	default:
-	}
-	return nil
 }
 
 func (synchronizer *LinkSynchronizer) Close() {

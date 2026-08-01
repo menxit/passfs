@@ -1683,11 +1683,13 @@ private final class PassFSModel: ObservableObject {
     private var watchedDirectories = Set<String>()
     private var requestedWatchDirectories = Set<String>()
     private var managerVisible = false
+    private var managerScanTask: Task<Void, Never>?
     private var filesystemWatchers: [DispatchSourceFileSystemObject] = []
     private var filesystemRefreshTask: Task<Void, Never>?
     var keepManagerVisible: (() -> Void)?
 
     private static let openRefreshMaximumAge: TimeInterval = 60
+    private static let managerScanInterval = Duration.milliseconds(2_500)
 
     init() {
         let bundlePath = Bundle.main.bundleURL.standardizedFileURL.path
@@ -1797,7 +1799,34 @@ private final class PassFSModel: ObservableObject {
 
     func setManagerVisible(_ visible: Bool) {
         managerVisible = visible
+        updateManagerScanLoop()
         rebuildFilesystemWatchers()
+    }
+
+    private func updateManagerScanLoop() {
+        guard managerVisible else {
+            managerScanTask?.cancel()
+            managerScanTask = nil
+            return
+        }
+        guard managerScanTask == nil else { return }
+        managerScanTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: Self.managerScanInterval)
+                } catch {
+                    return
+                }
+                guard let self, self.managerVisible, !Task.isCancelled else {
+                    return
+                }
+                // Refreshing is serialized by refresh(), so a slow scan never
+                // overlaps the next one. The immediate refresh in showManager
+                // handles opening; this loop keeps deletions and additions in
+                // sync while the window remains open.
+                await self.refresh(silent: true)
+            }
+        }
     }
 
     private func rebuildFilesystemWatchers() {
@@ -1917,8 +1946,11 @@ private final class PassFSModel: ObservableObject {
 
     func setTouchID(_ enabled: Bool) {
         let previous = touchIDEnabled
+        let arguments = enabled
+            ? ["touchid", "enable", "--prompt", "native"]
+            : ["touchid", "disable"]
         runOptimisticAction(
-            ["touchid", enabled ? "enable" : "disable", "--prompt", "native"],
+            arguments,
             apply: {
                 self.touchIDEnabled = enabled
             },

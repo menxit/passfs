@@ -50,20 +50,35 @@ func (*countHandle) SetAttributes(
 	return fsapi.Attributes{}, 0
 }
 
-func TestFileHandleRejectsInvalidReadCount(t *testing.T) {
-	handle := &FileHandle{
-		handle: &countHandle{readCount: 5},
+func TestFileHandleRejectsInvalidCounts(t *testing.T) {
+	tests := []struct {
+		name string
+		core *countHandle
+		call func(*FileHandle) syscall.Errno
+	}{
+		{
+			name: "read",
+			core: &countHandle{readCount: 5},
+			call: func(handle *FileHandle) syscall.Errno {
+				_, errno := handle.Read(context.Background(), make([]byte, 4), 0)
+				return errno
+			},
+		},
+		{
+			name: "write",
+			core: &countHandle{writeCount: 5},
+			call: func(handle *FileHandle) syscall.Errno {
+				_, errno := handle.Write(context.Background(), make([]byte, 4), 0)
+				return errno
+			},
+		},
 	}
-	if _, errno := handle.Read(context.Background(), make([]byte, 4), 0); errno != syscall.EIO {
-		t.Fatalf("Read errno = %v, want EIO", errno)
-	}
-}
-
-func TestFileHandleRejectsInvalidWriteCount(t *testing.T) {
-	handle := &FileHandle{
-		handle: &countHandle{writeCount: 5},
-	}
-	if _, errno := handle.Write(context.Background(), make([]byte, 4), 0); errno != syscall.EIO {
-		t.Fatalf("Write errno = %v, want EIO", errno)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handle := &FileHandle{handle: test.core}
+			if errno := test.call(handle); errno != syscall.EIO {
+				t.Fatalf("errno = %v, want EIO", errno)
+			}
+		})
 	}
 }

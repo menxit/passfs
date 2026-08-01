@@ -184,6 +184,25 @@ type commonFlags struct {
 	configPath string
 }
 
+func configureCommandUsage(
+	flags *flag.FlagSet,
+	writer io.Writer,
+	synopsis string,
+	description ...string,
+) {
+	flags.SetOutput(writer)
+	flags.Usage = func() {
+		fmt.Fprintln(writer, "Usage: passfs "+synopsis)
+		fmt.Fprintln(writer)
+		for _, line := range description {
+			fmt.Fprintln(writer, line)
+		}
+		fmt.Fprintln(writer)
+		fmt.Fprintln(writer, "Options:")
+		flags.PrintDefaults()
+	}
+}
+
 func addCommonFlags(flags *flag.FlagSet, values *commonFlags) error {
 	defaultPath, err := passfs.DefaultSettingsPath()
 	if err != nil {
@@ -499,15 +518,12 @@ func migrateLegacyDefaultHome(stdout, stderr io.Writer) error {
 
 func runEncrypt(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("encrypt", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: passfs encrypt [options] FILE...")
-		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Protect one or more files. A batch requires one authorization.")
-		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Options:")
-		flags.PrintDefaults()
-	}
+	configureCommandUsage(
+		flags,
+		stderr,
+		"encrypt [options] FILE...",
+		"Protect one or more files. A batch requires one authorization.",
+	)
 	var common commonFlags
 	var maxFileSize int64
 	if err := addCommonFlags(flags, &common); err != nil {
@@ -769,16 +785,13 @@ func waitForDisplacedProtectedTarget(
 
 func runUnprotect(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("unprotect", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: passfs unprotect [options] [FILE]")
-		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "With FILE, remove protection only from that file.")
-		fmt.Fprintln(stderr, "Without FILE, remove protection from every passfs file.")
-		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Options:")
-		flags.PrintDefaults()
-	}
+	configureCommandUsage(
+		flags,
+		stderr,
+		"unprotect [options] [FILE]",
+		"With FILE, remove protection only from that file.",
+		"Without FILE, remove protection from every passfs file.",
+	)
 	var common commonFlags
 	var maxFileSize int64
 	var promptMode string
@@ -1580,13 +1593,9 @@ func runStatus(args []string, stdout, stderr io.Writer) error {
 	} else if mount.mounted {
 		filesystemDescription = "occupied by another filesystem"
 	}
-	activeAdapter := ""
-	if mount.mounted && mount.passfs {
-		_, activeAdapter, _ = passfs.MountAdapterStatus(settings.MountPoint)
-	}
 	adapterDescription := requestedAdapter(settings)
-	if activeAdapter != "" {
-		adapterDescription += " (mounted with " + activeAdapter + ")"
+	if mount.adapter != "" {
+		adapterDescription += " (mounted with " + mount.adapter + ")"
 	}
 	fmt.Fprintf(
 		stdout,
@@ -1896,17 +1905,22 @@ func (err actionableError) Error() string {
 type mountState struct {
 	mounted   bool
 	passfs    bool
+	adapter   string
 	healthy   bool
 	accessErr error
 }
 
 func inspectMount(mountPoint string) (mountState, error) {
-	mounted, isPassFS, err := passfs.MountStatus(mountPoint)
+	mounted, adapter, err := passfs.MountAdapterStatus(mountPoint)
 	if err != nil {
 		return mountState{}, err
 	}
-	state := mountState{mounted: mounted, passfs: isPassFS}
-	if !mounted || !isPassFS {
+	state := mountState{
+		mounted: mounted,
+		passfs:  adapter != passfs.MountAdapterUnknown,
+		adapter: adapter,
+	}
+	if !state.mounted || !state.passfs {
 		return state, nil
 	}
 	if _, err := os.ReadDir(mountPoint); err != nil {

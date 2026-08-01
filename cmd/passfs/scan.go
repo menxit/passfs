@@ -50,16 +50,13 @@ var jsonAssignmentPattern = regexp.MustCompile(
 
 func runScan(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("scan", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: passfs scan [options] [PATH...]")
-		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Find likely plaintext secret files without printing their contents.")
-		fmt.Fprintln(stderr, "By default, scans the current project and common credential/config locations.")
-		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Options:")
-		flags.PrintDefaults()
-	}
+	configureCommandUsage(
+		flags,
+		stderr,
+		"scan [options] [PATH...]",
+		"Find likely plaintext secret files without printing their contents.",
+		"By default, scans the current project and common credential/config locations.",
+	)
 	var common commonFlags
 	var all bool
 	var jsonOutput bool
@@ -506,6 +503,9 @@ func excludedScanDirectory(path string, name string) bool {
 		return true
 	}
 	lowerPath := strings.ToLower(filepath.ToSlash(path))
+	if installedToolchainDirectory(lowerPath) {
+		return true
+	}
 	for _, fragment := range []string{
 		"/.cargo/registry",
 		"/.cargo/git",
@@ -524,6 +524,32 @@ func excludedScanDirectory(path string, name string) bool {
 		return true
 	}
 	return platformExcludedScanDirectory(filepath.Clean(path))
+}
+
+// installedToolchainDirectory recognizes trees populated by language/runtime
+// version managers and user-local installers. Like dependency and vendor
+// directories, these contain third-party SDK sources and bundled test keys,
+// not user-authored credential files. Matching the installation root rather
+// than individual filenames also covers future toolchain versions and tools.
+func installedToolchainDirectory(lowerPath string) bool {
+	normalized := "/" + strings.Trim(lowerPath, "/") + "/"
+	for _, fragment := range []string{
+		"/.asdf/installs/",
+		"/.fnm/node-versions/",
+		"/.local/go/",
+		"/.local/opt/",
+		"/.local/share/fnm/node-versions/",
+		"/.local/share/mise/installs/",
+		"/.nvm/versions/",
+		"/.pyenv/versions/",
+		"/.rustup/toolchains/",
+		"/.sdkman/candidates/",
+	} {
+		if strings.Contains(normalized, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 var commonExcludedScanDirectories = map[string]struct{}{
@@ -822,10 +848,22 @@ var placeholderValuePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`^<[^<>]+>$`),
 }
 
+// SOPS serializes encrypted scalar values as self-describing envelopes. Treat
+// only well-formed envelopes as placeholders instead of skipping a whole SOPS
+// document: a partially encrypted document can still contain a plaintext
+// secret that should be reported.
+var encryptedSecretValuePattern = regexp.MustCompile(
+	`(?i)^ENC\[[A-Z0-9_+.-]+,data:[^,\]]+,iv:[^,\]]+,tag:[^,\]]+` +
+		`(?:,type:[^,\]]+)?\]$`,
+)
+
 func isPlaceholderSecret(value string) bool {
 	value = strings.TrimSpace(strings.TrimRight(value, ","))
 	value = strings.Trim(value, `"'`)
 	if value == "" || len(value) < 4 {
+		return true
+	}
+	if encryptedSecretValuePattern.MatchString(value) {
 		return true
 	}
 	lower := strings.ToLower(value)

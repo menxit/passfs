@@ -170,6 +170,7 @@ func TestPlaceholderValuePatternsRejectSubstitutions(t *testing.T) {
 		"@PROJECT_SECRET@",
 		"<your-api-key>",
 		"process.env.SECRET",
+		"ENC[AES256_GCM,data:c2VjcmV0,iv:aXY=,tag:dGFn,type:str]",
 	} {
 		if !isPlaceholderSecret(value) {
 			t.Errorf("%q was not treated as a placeholder", value)
@@ -179,6 +180,7 @@ func TestPlaceholderValuePatternsRejectSubstitutions(t *testing.T) {
 		"hunter2!x9",
 		"a3f9c27d18e450b6",
 		"pa$$word-with-symbols",
+		"ENC[plaintext-secret]",
 	} {
 		if isPlaceholderSecret(value) {
 			t.Errorf("%q was wrongly treated as a placeholder", value)

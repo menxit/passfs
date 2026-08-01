@@ -368,11 +368,7 @@ func (v *Volume) removeMaterializedCiphertext(
 	orphanedAt, hadOrphan := v.metadata.Orphaned[key]
 	legacyTarget, hadLegacyTarget := v.metadata.LegacyTargets[key]
 	if err := v.updateMetadataLocked(func(metadata *Metadata) error {
-		delete(metadata.Files, key)
-		delete(metadata.Links, key)
-		delete(metadata.Orphaned, key)
-		delete(metadata.LegacyTargets, key)
-		delete(metadata.DisplacedLinks, key)
+		deleteFileMetadata(metadata, key)
 		return nil
 	}); err != nil {
 		v.metadataMu.Unlock()

@@ -44,6 +44,87 @@ func TestScanFindsSecretsAndPrunesDependencies(t *testing.T) {
 	}
 }
 
+func TestScanPrunesInstalledToolchains(t *testing.T) {
+	root := t.TempDir()
+	paths := []string{
+		filepath.Join(
+			root,
+			".local", "share", "mise", "installs", "go", "1.26.5",
+			"src", "crypto", "x509", "platform_root_key.pem",
+		),
+		filepath.Join(
+			root,
+			".local", "opt", "cmake", "Templates", "TemporaryKey.pfx",
+		),
+	}
+	for _, path := range paths {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			path,
+			[]byte("-----BEGIN PRIVATE KEY-----\n"+strings.Repeat("a", 80)+
+				"\n-----END PRIVATE KEY-----\n"),
+			0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projectSecret := filepath.Join(root, "project", "installs", ".env")
+	if err := os.MkdirAll(filepath.Dir(projectSecret), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		projectSecret,
+		[]byte("API_KEY=real-secret-value\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := secretScanner{}
+	findings, err := scanner.scan([]scanRoot{{
+		path:     root,
+		maxDepth: -1,
+		explicit: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0] != projectSecret {
+		t.Fatalf("findings = %#v, want only %q", findings, projectSecret)
+	}
+}
+
+func TestScanTreatsSOPSEnvelopesAsEncrypted(t *testing.T) {
+	root := t.TempDir()
+	encrypted := filepath.Join(root, "config", "production.sops.yaml")
+	plaintext := filepath.Join(root, "config", "partially-encrypted.sops.yaml")
+	envelope := "ENC[AES256_GCM,data:c2VjcmV0,iv:aXY=,tag:dGFn,type:str]"
+	for path, contents := range map[string]string{
+		encrypted: "database_password: " + envelope + "\n" +
+			"api_key: " + envelope + "\n" +
+			"sops:\n  mac: " + envelope + "\n",
+		plaintext: "database_password: " + envelope + "\n" +
+			"api_key: plaintext-secret\n" +
+			"sops:\n  mac: " + envelope + "\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if found, err := fileContainsLikelySecret(encrypted); err != nil || found {
+		t.Fatalf("fully encrypted SOPS document = %v, %v", found, err)
+	}
+	if found, err := fileContainsLikelySecret(plaintext); err != nil || !found {
+		t.Fatalf("partially encrypted SOPS document = %v, %v", found, err)
+	}
+}
+
 func TestScannerSkipsTrackedAndProtectedLinks(t *testing.T) {
 	root := t.TempDir()
 	tracked := filepath.Join(root, ".env")
