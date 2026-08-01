@@ -86,13 +86,15 @@ file, prepares the best filesystem adapter for the platform, installs its
 background service, and mounts it:
 
 ```text
-~/.config/passfs/
+~/.passfs/
 ├── config.json
 ├── mnt/
 └── vault/
 ```
 
-`init` returns after mounting at `~/.config/passfs/mnt`. It is idempotent: if
+`init` returns after mounting at `~/.passfs/mnt`. Existing installations under
+`~/.config/passfs` are migrated automatically after the filesystem is safely
+stopped. It is idempotent: if
 platform approval interrupted the first attempt, enable the extension and run
 the same command again. The filesystem
 runs as a supervised background service, survives terminal closure, restarts
@@ -123,7 +125,7 @@ contents. The original pathname becomes a symbolic link:
 
 ```text
 /Users/menxit/Development/project/.env
-    -> ~/.config/passfs/mnt/Users/menxit/Development/project/.env
+    -> ~/.passfs/mnt/by-id/8c9dbbe8-9295-4dc4-a7e4-ec40a185c2f2
 ```
 
 Applications keep using the original path:
@@ -192,10 +194,10 @@ has the same effect. Renaming a protected link, moving it to another directory,
 or renaming one of its parent directories is tracked automatically while
 passfs is running, as long as the move stays on the same filesystem.
 
-If a registered link is already missing when passfs starts, its ciphertext is
-preserved because an offline move and deletion cannot be distinguished safely.
-For an offline move, move the link back to its original pathname, start passfs,
-then repeat the move while the service is running.
+When passfs starts, it reconciles protected links that were renamed, moved, or
+deleted while the filesystem was stopped. A moved link keeps its original
+contents at the new pathname; a deleted link also removes its encrypted copy,
+so the old pathname can immediately be reused and protected again.
 
 Do not replace a protected link with a regular file. Some editors implement
 atomic saves by replacing the pathname and can therefore bypass the link.
@@ -242,19 +244,16 @@ The default is:
 passfs config --unlock-for 0
 ```
 
-Every open asks for Touch ID on macOS or the passphrase on Linux. To authorize
-each opened file for five minutes:
+Every open asks for Touch ID on macOS or the passphrase on Linux. To keep the
+vault unlocked for five minutes after a successful authorization:
 
 ```sh
 passfs config --unlock-for 5m
 ```
 
-The cache is per file and exists only in the passfs process memory. Restart the
-service after changing this value:
-
-```sh
-passfs reload
-```
+The cache applies to the whole vault and exists only in the passfs process
+memory. If the filesystem is running, `passfs config` restarts it automatically
+so the new duration takes effect immediately.
 
 Change the global passphrase with:
 
@@ -332,43 +331,35 @@ never installed silently.
 
 ## Encrypted layout
 
-The source:
+Each protected file receives an immutable random identifier. Its encrypted
+object is stored independently of the original pathname:
 
 ```text
-/Users/menxit/Development/project/.env
-```
-
-is stored as:
-
-```text
-~/.config/passfs/vault/
+~/.passfs/vault/
 ├── .passfs/
 │   ├── config.json
 │   ├── identity.age
 │   └── metadata.json
-└── files/
-    └── Users/
-        └── menxit/
-            └── Development/
-                └── project/
-                    └── .env.age
+└── objects/
+    └── 8c9dbbe8-9295-4dc4-a7e4-ec40a185c2f2.age
 ```
 
-The absolute path is recreated only to organize encrypted files. passfs does
-not maintain a project registry and does not copy other project files.
+The original pathname is kept only in protected metadata. Renaming or moving
+the symbolic link does not rename or move the encrypted object. Existing
+vaults using the previous path-based layout are migrated automatically.
 
 ## Backup
 
 The age private identity is stored at:
 
 ```text
-~/.config/passfs/vault/.passfs/identity.age
+~/.passfs/vault/.passfs/identity.age
 ```
 
 Copy it to a secure offline location:
 
 ```sh
-cp ~/.config/passfs/vault/.passfs/identity.age /path/to/secure-backup/identity.age
+cp ~/.passfs/vault/.passfs/identity.age /path/to/secure-backup/identity.age
 ```
 
 `identity.age` is encrypted with the passphrase chosen during `passfs init`.

@@ -7,24 +7,5 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: Go (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-latest
-          - ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Check
-        run: make check
+  check:
+    uses: ./.github/workflows/check.yml

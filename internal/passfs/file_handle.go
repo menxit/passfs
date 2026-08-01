@@ -57,52 +57,21 @@ func (v *Volume) openFile(ctx context.Context, relative string, flags uint32) (*
 		return nil, syscall.EISDIR
 	}
 
-	meta := v.fileMeta(relative, info)
-	var data []byte
-	accessedAt := time.Now().UnixNano()
-	if writable && flags&syscall.O_TRUNC != 0 {
-		if err := v.authorize(ctx, relative, "truncate"); err != nil {
-			return nil, err
-		}
-		data = make([]byte, 0)
-		meta.Size = 0
-		meta.MTime = time.Now().UnixNano()
-		meta.ATime = accessedAt
-	} else {
-		operation := "read"
-		if writable {
-			operation = "read/write"
-		}
-		data, err = v.decryptFile(ctx, relative, operation)
-		if err != nil {
-			return nil, err
-		}
-		meta.Size = uint64(len(data))
-		meta.ATime = accessedAt
-		if err := v.setFileMeta(relative, meta); err != nil {
-			wipe(data)
-			return nil, err
-		}
+	data, meta, dirty, err := v.loadExistingFile(
+		ctx,
+		relative,
+		info,
+		flags,
+		writable,
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	handle := &OpenFile{
-		volume:                v,
-		relative:              relative,
-		data:                  data,
-		meta:                  meta,
-		writable:              writable,
-		append:                flags&syscall.O_APPEND != 0,
-		dirty:                 writable && flags&syscall.O_TRUNC != 0,
-		appendCandidateOffset: -1,
-		unlockPath:            unlockPath,
-	}
 	pathLockHeld = false
-	if writable {
-		handle.unlock = v.namespaceMu.RUnlock
-	} else {
-		v.namespaceMu.RUnlock()
-	}
-	v.registerOpenHandle(handle, callerPID(ctx))
+	handle := v.finishFileOpen(
+		ctx, relative, data, meta, flags, writable, dirty, unlockPath,
+	)
 	success = true
 	return handle, nil
 }
@@ -145,43 +114,22 @@ func (v *Volume) createFile(
 
 	accessMode := flags & syscall.O_ACCMODE
 	writable := accessMode == syscall.O_WRONLY || accessMode == syscall.O_RDWR
-	meta := FileMeta{
-		Mode:  mode & 0o777,
-		MTime: time.Now().UnixNano(),
-		ATime: time.Now().UnixNano(),
-	}
+	now := time.Now().UnixNano()
+	meta := FileMeta{Mode: mode & 0o777, MTime: now, ATime: now, Inode: newVirtualInode(relative)}
 	var data []byte
 	var dirty bool
 
 	if exists {
-		meta = v.fileMeta(relative, info)
-		meta.ATime = time.Now().UnixNano()
-		if flags&syscall.O_TRUNC != 0 {
-			if !writable {
-				return nil, syscall.EACCES
-			}
-			if err := v.authorize(ctx, relative, "truncate"); err != nil {
-				return nil, err
-			}
-			data = make([]byte, 0)
-			meta.Size = 0
-			meta.MTime = time.Now().UnixNano()
-			dirty = true
-		} else {
-			operation := "read"
-			if writable {
-				operation = "read/write"
-			}
-			var err error
-			data, err = v.decryptFile(ctx, relative, operation)
-			if err != nil {
-				return nil, err
-			}
-			meta.Size = uint64(len(data))
-			if err := v.setFileMeta(relative, meta); err != nil {
-				wipe(data)
-				return nil, err
-			}
+		var err error
+		data, meta, dirty, err = v.loadExistingFile(
+			ctx,
+			relative,
+			info,
+			flags,
+			writable,
+		)
+		if err != nil {
+			return nil, err
 		}
 	} else {
 		if err := v.authorize(ctx, relative, "create"); err != nil {
@@ -193,6 +141,62 @@ func (v *Volume) createFile(
 		}
 	}
 
+	pathLockHeld = false
+	handle := v.finishFileOpen(
+		ctx, relative, data, meta, flags, writable, dirty, unlockPath,
+	)
+	success = true
+	return handle, nil
+}
+
+func (v *Volume) loadExistingFile(
+	ctx context.Context,
+	relative string,
+	info os.FileInfo,
+	flags uint32,
+	writable bool,
+) ([]byte, FileMeta, bool, error) {
+	accessedAt := time.Now().UnixNano()
+	meta := v.fileMeta(relative, info)
+	meta.ATime = accessedAt
+	if flags&syscall.O_TRUNC != 0 {
+		if !writable {
+			return nil, FileMeta{}, false, syscall.EACCES
+		}
+		if err := v.authorize(ctx, relative, "truncate"); err != nil {
+			return nil, FileMeta{}, false, err
+		}
+		meta.Size = 0
+		meta.MTime = time.Now().UnixNano()
+		return []byte{}, meta, true, nil
+	}
+
+	operation := "read"
+	if writable {
+		operation = "read/write"
+	}
+	data, err := v.decryptFile(ctx, relative, operation)
+	if err != nil {
+		return nil, FileMeta{}, false, err
+	}
+	meta.Size = uint64(len(data))
+	v.recordFileAccess(relative, accessedAt)
+	return data, meta, false, nil
+}
+
+// finishFileOpen transfers the namespace and path locks already held by the
+// caller to a new handle. Read-only handles can release the namespace lock
+// immediately; writable handles keep it until flush/release.
+func (v *Volume) finishFileOpen(
+	ctx context.Context,
+	relative string,
+	data []byte,
+	meta FileMeta,
+	flags uint32,
+	writable bool,
+	dirty bool,
+	unlockPath func(),
+) *OpenFile {
 	handle := &OpenFile{
 		volume:                v,
 		relative:              relative,
@@ -204,15 +208,13 @@ func (v *Volume) createFile(
 		appendCandidateOffset: -1,
 		unlockPath:            unlockPath,
 	}
-	pathLockHeld = false
 	if writable {
 		handle.unlock = v.namespaceMu.RUnlock
 	} else {
 		v.namespaceMu.RUnlock()
 	}
 	v.registerOpenHandle(handle, callerPID(ctx))
-	success = true
-	return handle, nil
+	return handle
 }
 
 func (f *OpenFile) Read(
@@ -347,7 +349,7 @@ func (f *OpenFile) Attributes(
 		meta,
 		f.volume.uid,
 		f.volume.gid,
-		stableInode(f.relative),
+		inodeFromFileMeta(meta, f.relative),
 	), 0
 }
 
@@ -402,7 +404,7 @@ func (f *OpenFile) SetAttributes(
 		meta,
 		f.volume.uid,
 		f.volume.gid,
-		stableInode(f.relative),
+		inodeFromFileMeta(meta, f.relative),
 	), 0
 }
 

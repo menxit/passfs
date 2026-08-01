@@ -2,7 +2,6 @@ package passfs
 
 import (
 	"context"
-	"errors"
 	"hash/fnv"
 	"os"
 	"path/filepath"
@@ -36,12 +35,37 @@ func childPath(parent, name string) (string, error) {
 }
 
 func storagePath(relative string) string {
-	if relative == "" || relative == "." {
-		return "files"
+	clean := filepath.Clean(relative)
+	if clean == "." || clean == objectNamespaceDirectory {
+		return objectStorageDirectory
 	}
-	return filepath.Join("files", relative)
+	prefix := objectNamespaceDirectory + string(filepath.Separator)
+	if !strings.HasPrefix(clean, prefix) {
+		return filepath.Join(objectStorageDirectory, ".invalid")
+	}
+	objectID, err := normalizeObjectID(strings.TrimPrefix(clean, prefix))
+	if err != nil {
+		return filepath.Join(objectStorageDirectory, ".invalid")
+	}
+	storage, _ := objectStoragePath(objectID)
+	return storage
 }
 
+func virtualObjectID(relative string) (string, bool) {
+	clean := filepath.Clean(relative)
+	prefix := objectNamespaceDirectory + string(filepath.Separator)
+	if !strings.HasPrefix(clean, prefix) {
+		return "", false
+	}
+	objectID, err := normalizeObjectID(strings.TrimPrefix(clean, prefix))
+	return objectID, err == nil
+}
+
+// stableInode maps an identity string to the persistent object identifier
+// exposed by FSKit and FUSE. Callers deliberately namespace identities as
+// storage paths ("files/..."), metadata keys, or unique "path:timestamp"
+// values for newly created objects. Changing this normalization or hash would
+// require an object-ID migration for existing FSKit volumes.
 func stableInode(relative string) uint64 {
 	hasher := fnv.New64a()
 	_, _ = hasher.Write([]byte(filepath.ToSlash(filepath.Clean(relative))))
@@ -93,7 +117,7 @@ func isReservedFilesystemMetadataPath(relative string) bool {
 }
 
 func isReservedStorageMetadataPath(storage string) bool {
-	relative, err := filepath.Rel("files", filepath.Clean(storage))
+	relative, err := filepath.Rel(objectStorageDirectory, filepath.Clean(storage))
 	if err != nil || relative == "." ||
 		relative == ".." ||
 		strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
@@ -112,21 +136,50 @@ func (f *FileSystem) Lookup(
 	if isReservedFilesystemMetadataPath(relative) {
 		return fsapi.Entry{}, syscall.ENOENT
 	}
+	clean := filepath.Clean(relative)
+	if clean != "." && clean != objectNamespaceDirectory {
+		if _, valid := virtualObjectID(clean); !valid {
+			return fsapi.Entry{}, syscall.ENOENT
+		}
+	}
 	storage := storagePath(relative)
 	isDirectory, info, err := f.volume.virtualType(storage)
 	if err != nil {
 		return fsapi.Entry{}, errnoFromError(err)
 	}
+	meta := f.volume.fileMeta(storage, info)
 	attributes := fileAttributes(
-		f.volume.fileMeta(storage, info),
+		meta,
 		f.volume.uid,
 		f.volume.gid,
-		stableInode(storage),
+		inodeFromFileMeta(meta, storage),
 	)
 	if isDirectory {
-		attributes = directoryAttributes(info, stableInode(storage))
+		directoryInode := stableInode("/")
+		if clean == objectNamespaceDirectory {
+			directoryInode = stableInode(objectNamespaceDirectory)
+		}
+		attributes = directoryAttributes(
+			info,
+			directoryInode,
+		)
 	}
-	return fsapi.Entry{Path: relative, Attributes: attributes}, 0
+	parentInode, err := f.parentInode(relative, attributes.Inode)
+	if err != nil {
+		return fsapi.Entry{}, errnoFromError(err)
+	}
+	attributes.ParentInode = parentInode
+	return fsapi.Entry{Attributes: attributes}, 0
+}
+
+func (f *FileSystem) parentInode(relative string, ownInode uint64) (uint64, error) {
+	if relative == "" || relative == "." {
+		return ownInode, nil
+	}
+	if filepath.Clean(relative) == objectNamespaceDirectory {
+		return stableInode("/"), nil
+	}
+	return stableInode(objectNamespaceDirectory), nil
 }
 
 func (f *FileSystem) ReadDirectory(
@@ -136,14 +189,33 @@ func (f *FileSystem) ReadDirectory(
 	if err := validateRelativePath(relative); err != nil {
 		return nil, syscall.EINVAL
 	}
-	storage := storagePath(relative)
-	isDirectory, _, err := f.volume.virtualType(storage)
+	clean := filepath.Clean(relative)
+	if clean == "." {
+		info, err := os.Lstat(filepath.Join(f.volume.root, objectStorageDirectory))
+		if err != nil {
+			return nil, errnoFromError(err)
+		}
+		attributes := directoryAttributes(info, stableInode(objectNamespaceDirectory))
+		attributes.ParentInode = stableInode("/")
+		return []fsapi.DirectoryEntry{{
+			Name:       objectNamespaceDirectory,
+			Type:       fsapi.TypeDirectory,
+			Inode:      attributes.Inode,
+			Attributes: attributes,
+		}}, 0
+	}
+	if clean != objectNamespaceDirectory {
+		return nil, syscall.ENOTDIR
+	}
+	storage := objectStorageDirectory
+	isDirectory, directoryInfo, err := f.volume.virtualType(storage)
 	if err != nil {
 		return nil, errnoFromError(err)
 	}
 	if !isDirectory {
 		return nil, syscall.ENOTDIR
 	}
+	parentInode := inodeFromFileInfo(directoryInfo, stableInode(storage))
 	path, err := f.volume.directoryPath(storage)
 	if err != nil {
 		return nil, errnoFromError(err)
@@ -156,32 +228,29 @@ func (f *FileSystem) ReadDirectory(
 	virtualEntries := make([]fsapi.DirectoryEntry, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		switch {
-		case entry.IsDir():
-			// Directory names ending in .age would be ambiguous with the
-			// backing name of a regular virtual file, so they are not exposed.
-			if strings.HasSuffix(name, encryptedSuffix) {
-				continue
-			}
-			if isReservedFilesystemMetadataPath(filepath.Join(relative, name)) {
-				continue
-			}
-			virtualEntries = append(virtualEntries, fsapi.DirectoryEntry{
-				Name:  name,
-				Type:  fsapi.TypeDirectory,
-				Inode: stableInode(filepath.Join(storage, name)),
-			})
-		case entry.Type().IsRegular() && strings.HasSuffix(name, encryptedSuffix):
+		entryInfo, entryErr := entry.Info()
+		if entryErr != nil {
+			return nil, errnoFromError(entryErr)
+		}
+		if entry.Type().IsRegular() && strings.HasSuffix(name, encryptedSuffix) {
 			virtualName := strings.TrimSuffix(name, encryptedSuffix)
-			if isReservedFilesystemMetadataPath(
-				filepath.Join(relative, virtualName),
-			) {
+			if _, err := normalizeObjectID(virtualName); err != nil {
 				continue
 			}
+			virtualStorage := filepath.Join(storage, virtualName)
+			meta := f.volume.fileMeta(virtualStorage, entryInfo)
+			attributes := fileAttributes(
+				meta,
+				f.volume.uid,
+				f.volume.gid,
+				inodeFromFileMeta(meta, virtualStorage),
+			)
+			attributes.ParentInode = parentInode
 			virtualEntries = append(virtualEntries, fsapi.DirectoryEntry{
-				Name:  virtualName,
-				Type:  fsapi.TypeFile,
-				Inode: stableInode(filepath.Join(storage, virtualName)),
+				Name:       virtualName,
+				Type:       attributes.Type,
+				Inode:      attributes.Inode,
+				Attributes: attributes,
 			})
 		}
 	}
@@ -226,6 +295,12 @@ func (f *FileSystem) Create(
 	flags uint32,
 	mode uint32,
 ) (fsapi.Entry, fsapi.Handle, syscall.Errno) {
+	if filepath.Clean(parent) != objectNamespaceDirectory {
+		return fsapi.Entry{}, nil, syscall.EPERM
+	}
+	if _, err := normalizeObjectID(name); err != nil {
+		return fsapi.Entry{}, nil, syscall.EINVAL
+	}
 	parentEntry, errno := f.Lookup(ctx, parent)
 	if errno != 0 {
 		return fsapi.Entry{}, nil, errno
@@ -249,7 +324,8 @@ func (f *FileSystem) Create(
 		_ = handle.Close(ctx)
 		return fsapi.Entry{}, nil, errno
 	}
-	return fsapi.Entry{Path: relative, Attributes: attributes}, handle, 0
+	attributes.ParentInode = parentEntry.Attributes.Inode
+	return fsapi.Entry{Attributes: attributes}, handle, 0
 }
 
 func (f *FileSystem) MakeDirectory(
@@ -258,51 +334,11 @@ func (f *FileSystem) MakeDirectory(
 	name string,
 	mode uint32,
 ) (fsapi.Entry, syscall.Errno) {
-	parentEntry, errno := f.Lookup(ctx, parent)
-	if errno != 0 {
-		return fsapi.Entry{}, errno
-	}
-	if parentEntry.Attributes.Type != fsapi.TypeDirectory {
-		return fsapi.Entry{}, syscall.ENOTDIR
-	}
-	if strings.HasSuffix(name, encryptedSuffix) {
-		return fsapi.Entry{}, syscall.EINVAL
-	}
-	relative, err := childPath(parent, name)
-	if err != nil {
-		return fsapi.Entry{}, syscall.EINVAL
-	}
-	if isReservedFilesystemMetadataPath(relative) {
-		return fsapi.Entry{}, syscall.EPERM
-	}
-	storage := storagePath(relative)
-	unlock, ok := f.volume.tryNamespaceLock()
-	if !ok {
-		return fsapi.Entry{}, syscall.EBUSY
-	}
-	defer unlock()
-
-	if _, _, err := f.volume.virtualType(storage); err == nil {
-		return fsapi.Entry{}, syscall.EEXIST
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fsapi.Entry{}, errnoFromError(err)
-	}
-	path, err := f.volume.directoryPath(storage)
-	if err != nil {
-		return fsapi.Entry{}, errnoFromError(err)
-	}
-	if err := os.Mkdir(path, os.FileMode(mode&0o777)); err != nil {
-		return fsapi.Entry{}, errnoFromError(err)
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		_ = os.Remove(path)
-		return fsapi.Entry{}, errnoFromError(err)
-	}
-	return fsapi.Entry{
-		Path:       relative,
-		Attributes: directoryAttributes(info, stableInode(storage)),
-	}, 0
+	_ = ctx
+	_ = parent
+	_ = name
+	_ = mode
+	return fsapi.Entry{}, syscall.EPERM
 }
 
 func (f *FileSystem) Unlink(
@@ -339,32 +375,9 @@ func (f *FileSystem) RemoveDirectory(
 	parent string,
 	name string,
 ) syscall.Errno {
-	relative, err := childPath(parent, name)
-	if err != nil {
-		return syscall.EINVAL
-	}
-	if isReservedFilesystemMetadataPath(relative) {
-		return syscall.EPERM
-	}
-	storage := storagePath(relative)
-	unlock, ok := f.volume.tryNamespaceLock()
-	if !ok {
-		return syscall.EBUSY
-	}
-	defer unlock()
-
-	isDirectory, _, err := f.volume.virtualType(storage)
-	if err != nil {
-		return errnoFromError(err)
-	}
-	if !isDirectory {
-		return syscall.ENOTDIR
-	}
-	path, err := f.volume.directoryPath(storage)
-	if err != nil {
-		return errnoFromError(err)
-	}
-	return errnoFromError(os.Remove(path))
+	_ = parent
+	_ = name
+	return syscall.EPERM
 }
 
 func (f *FileSystem) Rename(
@@ -375,70 +388,12 @@ func (f *FileSystem) Rename(
 	newName string,
 	flags uint32,
 ) syscall.Errno {
-	if flags != 0 {
-		return syscall.ENOTSUP
-	}
-	oldRelative, err := childPath(oldParent, oldName)
-	if err != nil {
-		return syscall.EINVAL
-	}
-	newRelative, err := childPath(newParent, newName)
-	if err != nil {
-		return syscall.EINVAL
-	}
-	if isReservedFilesystemMetadataPath(oldRelative) ||
-		isReservedFilesystemMetadataPath(newRelative) {
-		return syscall.EPERM
-	}
-	if oldRelative == newRelative {
-		return 0
-	}
-	oldStorage := storagePath(oldRelative)
-	newStorage := storagePath(newRelative)
-
-	unlock, ok := f.volume.tryNamespaceLock()
-	if !ok {
-		return syscall.EBUSY
-	}
-	defer unlock()
-
-	isDirectory, _, err := f.volume.virtualType(oldStorage)
-	if err != nil {
-		return errnoFromError(err)
-	}
-	if isDirectory && strings.HasSuffix(newName, encryptedSuffix) {
-		return syscall.EINVAL
-	}
-	if targetDirectory, _, targetErr := f.volume.virtualType(newStorage); targetErr == nil {
-		if isDirectory && !targetDirectory {
-			return syscall.ENOTDIR
-		}
-		if !isDirectory && targetDirectory {
-			return syscall.EISDIR
-		}
-	} else if !errors.Is(targetErr, os.ErrNotExist) {
-		return errnoFromError(targetErr)
-	}
-
-	var oldPath, newPath string
-	if isDirectory {
-		oldPath, err = f.volume.directoryPath(oldStorage)
-		if err == nil {
-			newPath, err = f.volume.directoryPath(newStorage)
-		}
-	} else {
-		oldPath, err = f.volume.encryptedPath(oldStorage)
-		if err == nil {
-			newPath, err = f.volume.encryptedPath(newStorage)
-		}
-	}
-	if err != nil {
-		return errnoFromError(err)
-	}
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return errnoFromError(err)
-	}
-	return errnoFromError(f.volume.renameMetadata(oldStorage, newStorage, isDirectory))
+	_ = oldParent
+	_ = oldName
+	_ = newParent
+	_ = newName
+	_ = flags
+	return syscall.EPERM
 }
 
 func (f *FileSystem) SetAttributes(
@@ -536,7 +491,7 @@ func (f *FileSystem) SetAttributes(
 		meta,
 		f.volume.uid,
 		f.volume.gid,
-		stableInode(storage),
+		inodeFromFileMeta(meta, storage),
 	), 0
 }
 
@@ -557,11 +512,6 @@ func (f *FileSystem) SetExtendedAttribute(
 			return syscall.EPERM
 		}
 		return f.setEncryptSession(ctx, data)
-	case linkMarkerName:
-		if entry.Attributes.Type == fsapi.TypeDirectory {
-			return syscall.EINVAL
-		}
-		return f.setLinkMarker(relative, data)
 	case editSessionMarkerName:
 		if entry.Attributes.Type == fsapi.TypeDirectory {
 			return syscall.EINVAL
@@ -570,27 +520,6 @@ func (f *FileSystem) SetExtendedAttribute(
 	default:
 		return syscall.ENOTSUP
 	}
-}
-
-func (f *FileSystem) setLinkMarker(relative string, data []byte) syscall.Errno {
-	if len(data) == 0 || len(data) > 4096 ||
-		strings.ContainsRune(string(data), 0) {
-		return syscall.EINVAL
-	}
-	storage := storagePath(relative)
-	sourcePath, err := OriginalPath(storage)
-	if err != nil {
-		return errnoFromError(err)
-	}
-	targetPath := filepath.Clean(string(data))
-	link, err := inspectProtectedLink(sourcePath)
-	if err != nil {
-		return errnoFromError(err)
-	}
-	if !link.isSymlink || link.target != targetPath {
-		return syscall.EINVAL
-	}
-	return errnoFromError(f.volume.registerProtectedLink(storage, targetPath))
 }
 
 func (f *FileSystem) setEditSession(

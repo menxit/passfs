@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -13,7 +15,22 @@ import (
 	"time"
 )
 
-const linkSyncInterval = 500 * time.Millisecond
+const (
+	// Native filesystem notifications are the primary reconciliation trigger.
+	// The long safety pass only protects against an exceptionally lost kernel
+	// event; keeping it infrequent avoids repeatedly walking user directories on
+	// an otherwise idle laptop.
+	linkSyncSafetyInterval         = 6 * time.Hour
+	linkSyncFallbackInterval       = time.Minute
+	linkSyncRetryInterval          = 100 * time.Millisecond
+	linkSyncRetryMaximum           = time.Second
+	trackedLinkDeletionGrace       = 500 * time.Millisecond
+	pendingObjectRegistrationGrace = 30 * time.Second
+)
+
+var errIncompleteLinkSearch = errors.New(
+	"protected link could not be located with a complete search; encrypted data was preserved",
+)
 
 type LinkSyncLogger interface {
 	Printf(format string, values ...any)
@@ -25,8 +42,21 @@ type LinkSynchronizer struct {
 	mountPoint     string
 	logger         LinkSyncLogger
 	tracker        *protectedLinkTracker
+	search         *movedProtectedLinkSearch
+	globalSearch   bool
 	previousIssues map[string]string
+	wake           chan struct{}
 	closed         bool
+}
+
+// EnableGlobalMoveSearch adds the user's home and temporary directory to the
+// one-time offline-move index. Adapters enable it in production; focused
+// engine tests and embedders retain bounded per-project roots by default.
+func (synchronizer *LinkSynchronizer) EnableGlobalMoveSearch() {
+	synchronizer.mu.Lock()
+	synchronizer.globalSearch = true
+	synchronizer.search = nil
+	synchronizer.mu.Unlock()
 }
 
 func NewLinkSynchronizer(
@@ -45,6 +75,7 @@ func NewLinkSynchronizer(
 		logger:         logger,
 		tracker:        newProtectedLinkTracker(),
 		previousIssues: make(map[string]string),
+		wake:           make(chan struct{}, 1),
 	}
 	if err := volume.attachLinkSynchronizer(synchronizer); err != nil {
 		return nil, err
@@ -55,55 +86,260 @@ func NewLinkSynchronizer(
 // Synchronize performs one complete pass. Calling it once before exposing a
 // newly mounted service ensures every existing protected link has a kernel
 // reference before external rename or unlink operations can be interpreted.
-func (synchronizer *LinkSynchronizer) Synchronize() {
+func (synchronizer *LinkSynchronizer) Synchronize() bool {
+	retry := false
+	err := WithLinkReconciliationLock(
+		synchronizer.volume.root,
+		func() error {
+			synchronizer.mu.Lock()
+			defer synchronizer.mu.Unlock()
+			if synchronizer.closed {
+				return nil
+			}
+
+			// Construction is cheap and indexing is lazy. Rebuilding here keeps
+			// the target set current after imports while performing no user-tree
+			// I/O on the normal all-links-present path.
+			synchronizer.search = newMovedProtectedLinkSearchWithGlobalRoots(
+				synchronizer.volume.root,
+				synchronizer.mountPoint,
+				synchronizer.volume.linkRecords(),
+				synchronizer.globalSearch,
+			)
+			issues := synchronizeLinksOnceTrackedWithSearch(
+				synchronizer.volume,
+				synchronizer.mountPoint,
+				synchronizer.tracker,
+				synchronizer.search,
+			)
+			currentIssues := make(map[string]string, len(issues))
+			for path, issue := range issues {
+				message := issue.Error()
+				currentIssues[path] = message
+				if errors.Is(issue, syscall.EBUSY) ||
+					errors.Is(issue, os.ErrNotExist) {
+					retry = true
+				}
+				if errors.Is(issue, syscall.EBUSY) {
+					continue
+				}
+				if synchronizer.previousIssues[path] != message &&
+					synchronizer.logger != nil {
+					synchronizer.logger.Printf(
+						"synchronize protected link %q: %v",
+						path,
+						issue,
+					)
+				}
+			}
+			synchronizer.previousIssues = currentIssues
+			return nil
+		},
+	)
+	if err != nil {
+		if synchronizer.logger != nil {
+			synchronizer.logger.Printf(
+				"coordinate protected link reconciliation: %v",
+				err,
+			)
+		}
+		return true
+	}
+	return retry
+}
+
+// Prepare installs kernel references for links that are already in place
+// without searching for offline moves. Native adapters use it before mounting
+// so startup is never blocked by a bounded home-directory reconciliation.
+func (synchronizer *LinkSynchronizer) Prepare() error {
 	synchronizer.mu.Lock()
 	defer synchronizer.mu.Unlock()
 	if synchronizer.closed {
-		return
+		return errors.New("protected link tracker is closed")
 	}
-
-	issues := synchronizeLinksOnceTracked(
-		synchronizer.volume,
-		synchronizer.mountPoint,
-		synchronizer.tracker,
-	)
-	currentIssues := make(map[string]string, len(issues))
-	for path, issue := range issues {
-		message := issue.Error()
-		currentIssues[path] = message
-		if errors.Is(issue, syscall.EBUSY) {
+	if err := synchronizer.volume.refreshMetadata(); err != nil {
+		return err
+	}
+	for _, record := range synchronizer.volume.linkRecords() {
+		if !record.protected || record.sourcePath == "" {
 			continue
 		}
-		if synchronizer.previousIssues[path] != message &&
-			synchronizer.logger != nil {
-			synchronizer.logger.Printf(
-				"synchronize protected link %q: %v",
-				path,
-				issue,
-			)
+		sourcePath := record.sourcePath
+		targetPath, err := mountedPathForStorage(synchronizer.mountPoint, record.relative)
+		if err != nil {
+			continue
+		}
+		link, err := inspectProtectedLink(sourcePath)
+		if err != nil {
+			continue
+		}
+		if link.isSymlink && link.target == filepath.Clean(targetPath) {
+			if err := synchronizer.tracker.ensure(record.relative, sourcePath); err != nil {
+				return err
+			}
 		}
 	}
-	synchronizer.previousIssues = currentIssues
+	return nil
 }
 
 func (synchronizer *LinkSynchronizer) Run(ctx context.Context) {
 	defer synchronizer.Close()
-	ticker := time.NewTicker(linkSyncInterval)
-	defer ticker.Stop()
+	var watcher linkChangeWatcher
+	var watchedDirectories []string
+	retryInterval := linkSyncRetryInterval
+	defer func() {
+		if watcher != nil {
+			_ = watcher.close()
+		}
+	}()
+
 	for {
+		desiredDirectories := synchronizer.watchDirectories()
+		var watchErr error
+		if watcher == nil ||
+			!slices.Equal(desiredDirectories, watchedDirectories) {
+			var replacement linkChangeWatcher
+			replacement, watchErr = newLinkChangeWatcher(desiredDirectories)
+			if watchErr == nil {
+				if watcher != nil {
+					_ = watcher.close()
+				}
+				watcher = replacement
+				watchedDirectories = desiredDirectories
+			}
+		}
+
+		interval := linkSyncSafetyInterval
+		var events <-chan struct{}
+		var watcherErrors <-chan error
+		if watcher != nil {
+			events = watcher.events()
+			watcherErrors = watcher.errors()
+		}
+		if watchErr != nil || watcher == nil {
+			interval = linkSyncFallbackInterval
+			if synchronizer.logger != nil {
+				synchronizer.logger.Printf(
+					"watch protected links; using periodic reconciliation: %v",
+					watchErr,
+				)
+			}
+		}
+
+		// Reconcile after installing the watches. The watcher remains active
+		// across normal events, avoiding both a subscription gap and repeated
+		// kqueue/inotify construction. A short retry is used only for a
+		// transient pathname race or a busy namespace lock.
+		if synchronizer.Synchronize() {
+			interval = retryInterval
+			retryInterval = min(linkSyncRetryMaximum, retryInterval*2)
+		} else {
+			retryInterval = linkSyncRetryInterval
+		}
+		updatedDirectories := synchronizer.watchDirectories()
+		if watchErr == nil && watcher != nil && !slices.Equal(
+			updatedDirectories,
+			watchedDirectories,
+		) {
+			continue
+		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			synchronizer.Synchronize()
+		case <-events:
+		case <-synchronizer.wake:
+		case err := <-watcherErrors:
+			if err != nil && synchronizer.logger != nil {
+				synchronizer.logger.Printf("watch protected links: %v", err)
+			}
+			if watcher != nil {
+				_ = watcher.close()
+				watcher = nil
+				watchedDirectories = nil
+			}
+		case <-timer.C:
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
 		}
 	}
 }
 
+func (synchronizer *LinkSynchronizer) watchDirectories() []string {
+	directories := make(map[string]struct{})
+	add := func(path string) {
+		if directory := nearestExistingDirectory(path); directory != "" {
+			directories[directory] = struct{}{}
+		}
+	}
+	add(filepath.Join(synchronizer.volume.root, internalDirName))
+	for _, record := range synchronizer.volume.linkRecords() {
+		if !record.protected || record.sourcePath == "" {
+			continue
+		}
+		add(filepath.Dir(record.sourcePath))
+	}
+	result := make([]string, 0, len(directories))
+	for directory := range directories {
+		result = append(result, directory)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// Watch the closest live ancestor when a protected file's parent was removed.
+// Its recreation then produces an event that lets the synchronizer move the
+// watch back down. Recording a missing directory as watched would otherwise
+// leave an inotify/kqueue subscription permanently absent until the safety
+// reconciliation many hours later.
+func nearestExistingDirectory(path string) string {
+	for {
+		path = filepath.Clean(path)
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			return path
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return ""
+		}
+		path = parent
+	}
+}
+
+func uniqueExistingDirectories(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(path)
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		seen[path] = struct{}{}
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
+}
+
 func (synchronizer *LinkSynchronizer) Track(relative string) error {
-	sourcePath, err := OriginalPath(relative)
-	if err != nil {
-		return err
+	var sourcePath string
+	for _, record := range synchronizer.volume.linkRecords() {
+		if metadataKey(record.relative) == metadataKey(relative) {
+			sourcePath = record.sourcePath
+			break
+		}
+	}
+	if sourcePath == "" {
+		return os.ErrNotExist
 	}
 	synchronizer.mu.Lock()
 	defer synchronizer.mu.Unlock()
@@ -115,7 +351,14 @@ func (synchronizer *LinkSynchronizer) Track(relative string) error {
 	); err != nil {
 		return err
 	}
-	return synchronizer.tracker.ensure(relative, sourcePath)
+	if err := synchronizer.tracker.ensure(relative, sourcePath); err != nil {
+		return err
+	}
+	select {
+	case synchronizer.wake <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 func (synchronizer *LinkSynchronizer) Close() {
@@ -146,586 +389,706 @@ func (v *Volume) detachLinkSynchronizer(synchronizer *LinkSynchronizer) {
 	v.linkSynchronizerMu.Unlock()
 }
 
-func (v *Volume) registerProtectedLink(relative, target string) error {
-	if err := v.setLinkTarget(relative, target); err != nil {
-		return err
-	}
-	v.linkSynchronizerMu.RLock()
-	synchronizer := v.linkSynchronizer
-	v.linkSynchronizerMu.RUnlock()
-	if synchronizer == nil {
-		return nil
-	}
-	return synchronizer.Track(relative)
-}
-
-func synchronizeLinksOnceTracked(
+func synchronizeLinksOnceTrackedWithSearch(
 	volume *Volume,
 	mountPoint string,
 	tracker *protectedLinkTracker,
+	movedLinkSearch *movedProtectedLinkSearch,
 ) map[string]error {
-	issues := make(map[string]error)
-	records := volume.linkRecords()
-	if tracker != nil {
-		if err := ensureLinkReferenceCapacity(linkReferenceCount(records)); err != nil {
-			issues[mountPoint] = fmt.Errorf(
-				"reserve protected link tracking capacity: %w",
-				err,
-			)
-			return issues
-		}
-	}
-	processedMoves, moveIssues := synchronizeTrackedMoves(
+	return synchronizeOpaqueLinksOnce(
 		volume,
 		mountPoint,
 		tracker,
-		records,
+		movedLinkSearch,
 	)
-	for path, issue := range moveIssues {
-		issues[path] = issue
+}
+
+func synchronizeOpaqueLinksOnce(
+	volume *Volume,
+	mountPoint string,
+	tracker *protectedLinkTracker,
+	search *movedProtectedLinkSearch,
+) map[string]error {
+	issues := make(map[string]error)
+	directoryMoves := make(map[linkDirectoryMove]int)
+	if err := volume.refreshMetadata(); err != nil {
+		issues[mountPoint] = fmt.Errorf("refresh protected link metadata: %w", err)
+		return issues
 	}
+	records := volume.linkRecords()
+	if search == nil {
+		search = newMovedProtectedLinkSearch(volume.root, mountPoint, records)
+	}
+	if tracker != nil {
+		if err := ensureLinkReferenceCapacity(linkReferenceCount(records)); err != nil {
+			issues[mountPoint] = err
+			return issues
+		}
+	}
+
 	for _, record := range records {
-		if processedMoves[metadataKey(record.relative)] {
+		if !record.protected {
 			continue
 		}
-		sourcePath, err := OriginalPath(record.relative)
+		expectedTarget, err := mountedPathForStorage(mountPoint, record.relative)
 		if err != nil {
 			issues[record.relative] = err
 			continue
 		}
-		targetPath, err := MountedPath(mountPoint, sourcePath)
-		if err != nil {
-			issues[sourcePath] = err
-			continue
+		sourcePath := filepath.Clean(record.sourcePath)
+		if sourcePath == "." {
+			sourcePath = ""
 		}
-
-		link, err := inspectProtectedLink(sourcePath)
-		if err != nil {
-			issues[sourcePath] = err
-			continue
-		}
-
-		recordedTarget := filepath.Clean(record.linkTarget)
-		currentTarget := filepath.Clean(targetPath)
-		if tracker != nil &&
-			record.protected &&
-			record.linkTarget != "" &&
-			link.isSymlink &&
-			(link.target == recordedTarget || link.target == currentTarget) {
-			if err := tracker.ensure(record.relative, sourcePath); err != nil {
+		link := protectedLink{}
+		if sourcePath != "" {
+			link, err = inspectProtectedLink(sourcePath)
+			if err != nil {
 				issues[sourcePath] = err
 				continue
 			}
 		}
-		if tracker != nil && (!record.protected || record.linkTarget == "") {
-			tracker.forget(record.relative)
+
+		if link.isSymlink &&
+			(targetMatchesStorage(link.target, record.relative) ||
+				(record.legacyTarget != "" && link.target == filepath.Clean(record.legacyTarget))) {
+			if link.target != filepath.Clean(expectedTarget) {
+				if err := replaceProtectedLink(sourcePath, expectedTarget, link.target); err != nil {
+					issues[sourcePath] = fmt.Errorf("migrate protected link target: %w", err)
+					continue
+				}
+			}
+			if tracker != nil {
+				if err := tracker.ensure(record.relative, sourcePath); err != nil {
+					issues[sourcePath] = err
+					continue
+				}
+			}
+			if err := volume.clearLinkOrphan(record.relative); err != nil {
+				issues[sourcePath] = err
+			}
+			continue
 		}
 
-		switch {
-		case record.protected && record.linkTarget != "" && !link.exists:
-			movedPath, observedDeletion, moveErr := locateMovedProtectedLink(
-				tracker,
-				record,
-				sourcePath,
-				targetPath,
-			)
-			if moveErr != nil {
-				issues[sourcePath] = moveErr
+		movedPath := ""
+		tracked := false
+		trackedLinked := false
+		if tracker != nil {
+			trackedPath, linked, isTracked, trackErr := tracker.state(record.relative)
+			if trackErr != nil {
+				issues[sourcePath] = trackErr
 				continue
 			}
-			if movedPath != "" {
-				if err := synchronizeMovedProtectedLink(
-					volume,
-					mountPoint,
-					tracker,
-					record,
-					movedPath,
-					targetPath,
-				); err != nil {
-					issues[sourcePath] = err
+			tracked = isTracked
+			trackedLinked = linked
+			if tracked {
+				if linked && filepath.Clean(trackedPath) != sourcePath {
+					movedPath = trackedPath
 				}
+			}
+		}
+		if movedPath == "" && tracked {
+			if trackedLinked {
+				// The kernel still resolves the reference at the registered path,
+				// while Lstat observed it missing. This is a short pathname race;
+				// never turn it into a tree scan or a deletion.
+				issues[sourcePath] = syscall.EBUSY
 				continue
 			}
-			if tracker != nil && !observedDeletion {
+			if link.exists {
+				_ = volume.markLinkOrphan(record.relative, time.Now())
 				issues[sourcePath] = errors.New(
-					"protected link was already missing when passfs started; encrypted data was preserved because an offline move and deletion cannot be distinguished",
+					"protected pathname was replaced; encrypted data was preserved",
 				)
 				continue
 			}
+			if record.orphanedAt == 0 ||
+				time.Since(time.Unix(0, record.orphanedAt)) < trackedLinkDeletionGrace {
+				_ = volume.markLinkOrphan(record.relative, time.Now())
+				issues[sourcePath] = syscall.EBUSY
+				continue
+			}
+			// A live O_PATH/O_SYMLINK reference has reported the entry unlinked
+			// across the grace window. This is stronger evidence than a bounded
+			// filesystem scan and keeps ordinary deletes both safe and cheap.
 			if err := volume.removeProtectedFile(record.relative); err != nil &&
 				!errors.Is(err, os.ErrNotExist) {
-				issues[sourcePath] = fmt.Errorf("remove encrypted file: %w", err)
+				issues[sourcePath] = fmt.Errorf(
+					"remove deleted protected object: %w",
+					err,
+				)
+				continue
+			}
+			tracker.forget(record.relative)
+			continue
+		}
+		if movedPath == "" {
+			movedPath, err = search.find(sourcePath, expectedTarget)
+			if err == nil && movedPath == "" && record.legacyTarget != "" {
+				movedPath, err = search.find(sourcePath, record.legacyTarget)
+			}
+			if err != nil {
+				issues[sourcePath] = err
+				_ = volume.markLinkOrphan(record.relative, time.Now())
+				continue
+			}
+		}
+
+		if movedPath != "" {
+			movedLink, inspectErr := inspectProtectedLink(movedPath)
+			if inspectErr != nil {
+				issues[movedPath] = inspectErr
+				continue
+			}
+			if !movedLink.isSymlink ||
+				(!targetMatchesStorage(movedLink.target, record.relative) &&
+					movedLink.target != filepath.Clean(record.legacyTarget)) {
+				issues[movedPath] = errors.New("moved protected link changed target; encrypted data was preserved")
+				_ = volume.markLinkOrphan(record.relative, time.Now())
+				continue
+			}
+			if movedLink.target != filepath.Clean(expectedTarget) {
+				if err := replaceProtectedLink(movedPath, expectedTarget, movedLink.target); err != nil {
+					issues[movedPath] = err
+					continue
+				}
+			}
+			if move, ok := inferLinkDirectoryMove(sourcePath, movedPath); ok {
+				directoryMoves[move]++
+			}
+			if err := volume.setLinkSource(record.relative, movedPath); err != nil {
+				issues[movedPath] = err
 				continue
 			}
 			if tracker != nil {
-				tracker.forget(record.relative)
+				if err := tracker.replace(record.relative, record.relative, movedPath); err != nil {
+					issues[movedPath] = err
+				}
 			}
-			if err := volume.setLinkTarget(record.relative, ""); err != nil {
-				issues[sourcePath] = fmt.Errorf("clear removed link record: %w", err)
-			}
+			continue
+		}
 
-		case record.protected && record.linkTarget != "" && !link.isSymlink:
-			issues[sourcePath] = errors.New(
-				"pathname was replaced instead of deleted; encrypted data was preserved",
+		if link.exists {
+			_ = volume.markLinkOrphan(record.relative, time.Now())
+			issues[sourcePath] = errors.New("protected pathname was replaced; encrypted data was preserved")
+			continue
+		}
+		if sourcePath == "" && record.orphanedAt != 0 &&
+			time.Since(time.Unix(0, record.orphanedAt)) < pendingObjectRegistrationGrace {
+			issues[record.relative] = syscall.EBUSY
+			continue
+		}
+		if record.legacyTarget != "" {
+			issues[record.relative] = errors.New(
+				"legacy protected link could not be located; encrypted data was preserved",
 			)
-
-		case record.protected && record.linkTarget != "":
-			switch link.target {
-			case currentTarget:
-				if recordedTarget != currentTarget {
-					if err := volume.setLinkTarget(record.relative, currentTarget); err != nil {
-						issues[sourcePath] = fmt.Errorf("update protected link record: %w", err)
-					}
-				}
-			case recordedTarget:
-				if err := replaceProtectedLink(
-					sourcePath,
-					currentTarget,
-					recordedTarget,
-				); err != nil {
-					issues[sourcePath] = fmt.Errorf("update protected link target: %w", err)
-					continue
-				}
-				if tracker != nil {
-					if err := tracker.replace(
-						record.relative,
-						record.relative,
-						sourcePath,
-					); err != nil {
-						issues[sourcePath] = err
-						continue
-					}
-				}
-				if err := volume.setLinkTarget(record.relative, currentTarget); err != nil {
-					issues[sourcePath] = fmt.Errorf("update protected link record: %w", err)
-				}
-			default:
-				issues[sourcePath] = errors.New(
-					"symbolic link target changed outside passfs; encrypted data was preserved",
-				)
-			}
-
-		case !record.protected && record.linkTarget != "":
-			if link.isSymlink && link.target == filepath.Clean(record.linkTarget) {
-				if err := os.Remove(sourcePath); err != nil {
-					issues[sourcePath] = fmt.Errorf("remove dangling protected link: %w", err)
-					continue
-				}
-				if err := syncDirectory(filepath.Dir(sourcePath)); err != nil {
-					issues[sourcePath] = fmt.Errorf("sync removed protected link: %w", err)
-					continue
-				}
-			}
-			if link.exists && (!link.isSymlink ||
-				link.target != filepath.Clean(record.linkTarget)) {
-				issues[sourcePath] = errors.New(
-					"protected file was removed but its pathname now belongs to another entry",
-				)
-			}
-			if err := volume.setLinkTarget(record.relative, ""); err != nil {
-				issues[sourcePath] = fmt.Errorf("clear dangling link record: %w", err)
-			}
+			continue
+		}
+		if !search.comprehensive || !search.indexed {
+			_ = volume.markLinkOrphan(record.relative, time.Now())
+			// This is a stable safety state, not a transient lock race. Retrying
+			// every second would repeatedly walk the same directories and waste
+			// battery; filesystem events or the long safety pass will wake us.
+			issues[sourcePath] = errIncompleteLinkSearch
+			continue
+		}
+		if err := volume.removeProtectedFile(record.relative); err != nil &&
+			!errors.Is(err, os.ErrNotExist) {
+			issues[sourcePath] = fmt.Errorf("remove deleted protected object: %w", err)
+			continue
+		}
+		if tracker != nil {
+			tracker.forget(record.relative)
+		}
+	}
+	for move, count := range directoryMoves {
+		if count < 2 || !confirmedDirectoryMove(move) {
+			continue
+		}
+		changed, err := volume.rebaseLinkSources(move.oldRoot, move.newRoot)
+		if err != nil {
+			issues[move.oldRoot] = fmt.Errorf("record moved protected directory: %w", err)
+			continue
+		}
+		if changed > 0 {
+			// Re-run once with the inferred paths so deleted children are
+			// reconciled against the new parent rather than the stale one.
+			issues[move.oldRoot] = syscall.EBUSY
 		}
 	}
 	return issues
 }
 
-type trackedLinkMove struct {
-	record     linkRecord
-	sourcePath string
-	movedPath  string
-	oldTarget  string
-	newTarget  string
-	newStorage string
+type linkDirectoryMove struct {
+	oldRoot string
+	newRoot string
 }
 
-func synchronizeTrackedMoves(
-	volume *Volume,
-	mountPoint string,
-	tracker *protectedLinkTracker,
-	records []linkRecord,
-) (map[string]bool, map[string]error) {
-	processed := make(map[string]bool)
-	issues := make(map[string]error)
-	if tracker == nil {
-		return processed, issues
+func inferLinkDirectoryMove(oldPath, newPath string) (linkDirectoryMove, bool) {
+	oldPath = filepath.Clean(oldPath)
+	newPath = filepath.Clean(newPath)
+	if !filepath.IsAbs(oldPath) || !filepath.IsAbs(newPath) || oldPath == newPath {
+		return linkDirectoryMove{}, false
 	}
-
-	moves := make(map[string]trackedLinkMove)
-	for _, record := range records {
-		if !record.protected || record.linkTarget == "" {
-			continue
-		}
-		sourcePath, err := OriginalPath(record.relative)
-		if err != nil {
-			continue
-		}
-		movedPath, linked, tracked, err := tracker.state(record.relative)
-		if err != nil || !tracked || !linked ||
-			filepath.Clean(movedPath) == filepath.Clean(sourcePath) {
-			continue
-		}
-		oldTarget, err := MountedPath(mountPoint, sourcePath)
-		if err != nil {
-			continue
-		}
-		newTarget, newStorage, err := movedProtectedLinkDestination(
-			volume,
-			mountPoint,
-			movedPath,
-			oldTarget,
-		)
-		if err != nil {
-			continue
-		}
-		moves[metadataKey(record.relative)] = trackedLinkMove{
-			record:     record,
-			sourcePath: sourcePath,
-			movedPath:  movedPath,
-			oldTarget:  oldTarget,
-			newTarget:  newTarget,
-			newStorage: newStorage,
-		}
+	oldParts := strings.Split(strings.TrimPrefix(filepath.ToSlash(oldPath), "/"), "/")
+	newParts := strings.Split(strings.TrimPrefix(filepath.ToSlash(newPath), "/"), "/")
+	suffix := 0
+	for suffix < len(oldParts) && suffix < len(newParts) &&
+		oldParts[len(oldParts)-1-suffix] == newParts[len(newParts)-1-suffix] {
+		suffix++
 	}
-
-	incoming := make(map[string]string, len(moves))
-	queue := make([]string, 0, len(moves))
-	for oldKey, move := range moves {
-		newKey := metadataKey(move.newStorage)
-		incoming[newKey] = oldKey
-		if _, occupiedByMove := moves[newKey]; !occupiedByMove {
-			queue = append(queue, oldKey)
-		}
+	// A shared filename is required. A renamed individual file does not prove
+	// anything about its parent directory.
+	if suffix == 0 || suffix == len(oldParts) || suffix == len(newParts) {
+		return linkDirectoryMove{}, false
 	}
-	sort.Strings(queue)
-	for len(queue) != 0 {
-		key := queue[0]
-		queue = queue[1:]
-		if processed[key] {
-			continue
-		}
-		move := moves[key]
-		err := synchronizeMovedProtectedLink(
-			volume,
-			mountPoint,
-			tracker,
-			move.record,
-			move.movedPath,
-			move.oldTarget,
-		)
-		processed[key] = true
-		if err != nil {
-			issues[move.sourcePath] = err
-			continue
-		}
-		if predecessor := incoming[key]; predecessor != "" {
-			queue = append(queue, predecessor)
-		}
+	oldRoot := filepath.FromSlash("/" + strings.Join(oldParts[:len(oldParts)-suffix], "/"))
+	newRoot := filepath.FromSlash("/" + strings.Join(newParts[:len(newParts)-suffix], "/"))
+	if oldRoot == string(filepath.Separator) || newRoot == string(filepath.Separator) ||
+		oldRoot == newRoot {
+		return linkDirectoryMove{}, false
 	}
-
-	visited := make(map[string]bool, len(moves))
-	for _, record := range records {
-		start := metadataKey(record.relative)
-		if processed[start] ||
-			visited[start] ||
-			moves[start].record.relative == "" {
-			continue
-		}
-		var sequence []string
-		indices := make(map[string]int)
-		current := start
-		for {
-			if index, exists := indices[current]; exists {
-				cycleKeys := sequence[index:]
-				if len(cycleKeys) >= 2 {
-					synchronizeTrackedMoveCycle(
-						volume,
-						tracker,
-						moves,
-						cycleKeys,
-						processed,
-						issues,
-					)
-				}
-				break
-			}
-			if visited[current] {
-				break
-			}
-			if processed[current] {
-				break
-			}
-			move, exists := moves[current]
-			if !exists {
-				break
-			}
-			indices[current] = len(sequence)
-			sequence = append(sequence, current)
-			current = metadataKey(move.newStorage)
-		}
-		for _, key := range sequence {
-			visited[key] = true
-		}
-	}
-	return processed, issues
+	return linkDirectoryMove{oldRoot: oldRoot, newRoot: newRoot}, true
 }
 
-func synchronizeTrackedMoveCycle(
-	volume *Volume,
-	tracker *protectedLinkTracker,
-	moves map[string]trackedLinkMove,
-	cycleKeys []string,
-	processed map[string]bool,
-	issues map[string]error,
-) {
-	cycle := make([]string, len(cycleKeys))
-	rekeys := make(map[string]string, len(cycleKeys))
-	for index, key := range cycleKeys {
-		move := moves[key]
-		cycle[index] = move.record.relative
-		rekeys[move.record.relative] = move.newStorage
-		processed[key] = true
+func confirmedDirectoryMove(move linkDirectoryMove) bool {
+	if _, err := os.Lstat(move.oldRoot); !errors.Is(err, os.ErrNotExist) {
+		return false
 	}
+	info, err := os.Stat(move.newRoot)
+	return err == nil && info.IsDir()
+}
 
-	committed, cycleErr := volume.cycleProtectedFiles(cycle)
-	if !committed {
-		for _, key := range cycleKeys {
-			move := moves[key]
-			issues[move.sourcePath] = fmt.Errorf(
-				"rotate encrypted files after protected link moves: %w",
-				cycleErr,
-			)
-		}
-		return
-	}
-
-	tracker.rekey(rekeys)
-	for _, key := range cycleKeys {
-		move := moves[key]
-		updateErr := replaceProtectedLink(
-			move.movedPath,
-			move.newTarget,
-			move.oldTarget,
-		)
-		if updateErr == nil {
-			updateErr = volume.setLinkTarget(
-				move.newStorage,
-				move.newTarget,
-			)
-		}
-		if updateErr != nil || cycleErr != nil {
-			if updateErr != nil {
-				updateErr = fmt.Errorf(
-					"update moved protected link: %w",
-					updateErr,
-				)
+func (v *Volume) rebaseLinkSources(oldRoot, newRoot string) (int, error) {
+	oldRoot = filepath.Clean(oldRoot)
+	newRoot = filepath.Clean(newRoot)
+	v.metadataMu.Lock()
+	defer v.metadataMu.Unlock()
+	changed := 0
+	err := v.updateMetadataLocked(func(metadata *Metadata) error {
+		for key, source := range metadata.Links {
+			relative, err := filepath.Rel(oldRoot, filepath.Clean(source))
+			if err != nil || relative == "." || relative == ".." ||
+				strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				continue
 			}
-			issues[move.sourcePath] = errors.Join(
-				cycleErr,
-				updateErr,
-			)
+			metadata.Links[key] = filepath.Join(newRoot, relative)
+			changed++
 		}
-	}
+		return nil
+	})
+	return changed, err
 }
 
 func linkReferenceCount(records []linkRecord) int {
 	count := 0
 	for _, record := range records {
-		if record.protected && record.linkTarget != "" {
+		if record.protected && record.sourcePath != "" {
 			count++
 		}
 	}
 	return count
 }
 
-func locateMovedProtectedLink(
-	tracker *protectedLinkTracker,
-	record linkRecord,
-	sourcePath string,
-	targetPath string,
-) (path string, observedDeletion bool, err error) {
-	if tracker != nil {
-		path, linked, tracked, err := tracker.state(record.relative)
-		if err != nil {
-			return "", false, fmt.Errorf("inspect tracked protected link: %w", err)
-		}
-		if tracked {
-			if linked {
-				if filepath.Clean(path) == filepath.Clean(sourcePath) {
-					return "", false, errors.New(
-						"tracked protected link still reports its missing original pathname; encrypted data was preserved",
-					)
-				}
-				return path, false, nil
-			}
-			return "", true, nil
-		}
-	}
-
-	path, err = findMovedProtectedLink(sourcePath, targetPath)
-	if err != nil {
-		return "", false, err
-	}
-	return path, false, nil
+type movedProtectedLinkSearch struct {
+	roots         []string
+	internalRoots []string
+	indexedRoots  []string
+	targets       map[string]struct{}
+	objectTargets map[string]string
+	byTarget      map[string]map[string]struct{}
+	nextRoot      int
+	comprehensive bool
+	indexed       bool
 }
 
-func synchronizeMovedProtectedLink(
-	volume *Volume,
-	mountPoint string,
-	tracker *protectedLinkTracker,
-	record linkRecord,
-	movedPath string,
-	oldTarget string,
-) error {
-	newTarget, newStorage, err := movedProtectedLinkDestination(
-		volume,
-		mountPoint,
-		movedPath,
-		oldTarget,
-	)
-	if err != nil {
-		return err
-	}
-	if err := volume.renameProtectedFile(record.relative, newStorage); err != nil {
-		return fmt.Errorf(
-			"rename encrypted file after protected link move: %w",
-			err,
-		)
-	}
-	if err := replaceProtectedLink(movedPath, newTarget, oldTarget); err != nil {
-		rollbackErr := volume.renameProtectedFile(
-			newStorage,
-			record.relative,
-		)
-		return errors.Join(
-			fmt.Errorf("update moved protected link: %w", err),
-			rollbackErr,
-		)
-	}
-
-	var trackerErr error
-	if tracker != nil {
-		trackerErr = tracker.replace(
-			record.relative,
-			newStorage,
-			movedPath,
-		)
-	}
-	linkErr := volume.setLinkTarget(newStorage, newTarget)
-	if linkErr != nil {
-		linkErr = fmt.Errorf("register moved protected link: %w", linkErr)
-	}
-	return errors.Join(trackerErr, linkErr)
-}
-
-func movedProtectedLinkDestination(
-	volume *Volume,
-	mountPoint string,
-	movedPath string,
-	oldTarget string,
-) (newTarget string, newStorage string, resultErr error) {
-	movedLink, err := inspectProtectedLink(movedPath)
-	if err != nil {
-		return "", "", fmt.Errorf("inspect moved protected link: %w", err)
-	}
-	if !movedLink.isSymlink ||
-		movedLink.target != filepath.Clean(oldTarget) {
-		return "", "", errors.New(
-			"moved protected link changed before it could be synchronized; encrypted data was preserved",
-		)
-	}
-	internal, err := movedLinkUsesInternalStorage(
-		volume.root,
-		mountPoint,
-		movedPath,
-	)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve moved protected link: %w", err)
-	}
-	if internal {
-		return "", "", errors.New(
-			"refusing to move a protected link into passfs internal storage",
-		)
-	}
-
-	newTarget, err = MountedPath(mountPoint, movedPath)
-	if err != nil {
-		return "", "", err
-	}
-	if err := validateImportTarget(mountPoint, newTarget); err != nil {
-		return "", "", fmt.Errorf("validate moved protected link: %w", err)
-	}
-	newRelative, err := filepath.Rel(mountPoint, newTarget)
-	if err != nil || newRelative == "." ||
-		newRelative == ".." ||
-		strings.HasPrefix(newRelative, ".."+string(os.PathSeparator)) {
-		return "", "", errors.New(
-			"moved protected link resolves outside the passfs mount",
-		)
-	}
-	return newTarget, storagePath(newRelative), nil
-}
-
-func movedLinkUsesInternalStorage(
+func newMovedProtectedLinkSearch(
 	vault string,
 	mountPoint string,
-	movedPath string,
-) (bool, error) {
-	resolvedParent, err := ResolvePath(filepath.Dir(movedPath))
-	if err != nil {
-		return false, err
-	}
-	resolvedMovedPath := filepath.Join(resolvedParent, filepath.Base(movedPath))
-	resolvedVault, err := ResolvePath(vault)
-	if err != nil {
-		return false, err
-	}
-	resolvedMountPoint, err := canonicalMountPoint(mountPoint)
-	if err != nil {
-		return false, err
-	}
-
-	roots := []string{resolvedVault, resolvedMountPoint}
-	if filepath.Base(resolvedVault) == "vault" &&
-		filepath.Base(resolvedMountPoint) == "mnt" &&
-		filepath.Dir(resolvedVault) == filepath.Dir(resolvedMountPoint) {
-		roots = append(roots, filepath.Dir(resolvedVault))
-	}
-	for _, root := range roots {
-		if PathWithin(root, resolvedMovedPath) {
-			return true, nil
-		}
-	}
-	return false, nil
+	records []linkRecord,
+) *movedProtectedLinkSearch {
+	return newMovedProtectedLinkSearchWithGlobalRoots(
+		vault,
+		mountPoint,
+		records,
+		false,
+	)
 }
 
-func findMovedProtectedLink(sourcePath, targetPath string) (string, error) {
-	parent := filepath.Dir(sourcePath)
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		return "", fmt.Errorf("inspect directory for moved protected link: %w", err)
-	}
-	var match string
-	for _, entry := range entries {
-		candidate := filepath.Join(parent, entry.Name())
-		if candidate == sourcePath || entry.Type()&os.ModeSymlink == 0 {
+func newMovedProtectedLinkSearchWithGlobalRoots(
+	vault string,
+	mountPoint string,
+	records []linkRecord,
+	global bool,
+) *movedProtectedLinkSearch {
+	roots := make(map[string]struct{})
+	for _, record := range records {
+		if !record.protected || record.sourcePath == "" {
 			continue
 		}
-		link, err := inspectProtectedLink(candidate)
-		if err != nil {
+		sourcePath := record.sourcePath
+		root := protectedLinkSearchRoot(sourcePath)
+		roots[filepath.Clean(root)] = struct{}{}
+	}
+	orderedRoots := compactSearchRoots(roots)
+	if global {
+		home, _ := os.UserHomeDir()
+		for _, broadRoot := range []string{
+			home,
+			os.TempDir(),
+			canonicalTemporaryRoot(),
+		} {
+			broadRoot = filepath.Clean(broadRoot)
+			if broadRoot == "." {
+				continue
+			}
+			if _, alreadyPreferred := roots[broadRoot]; alreadyPreferred {
+				continue
+			}
+			orderedRoots = append(orderedRoots, broadRoot)
+		}
+	}
+	targets := make(map[string]struct{})
+	objectTargets := make(map[string]string)
+	for _, record := range records {
+		if !record.protected {
+			continue
+		}
+		if target, err := mountedPathForStorage(mountPoint, record.relative); err == nil {
+			targets[filepath.Clean(target)] = struct{}{}
+			if objectID, objectErr := objectIDFromStoragePath(record.relative); objectErr == nil {
+				objectTargets[objectID] = filepath.Clean(target)
+			}
+		}
+		if record.legacyTarget != "" {
+			targets[filepath.Clean(record.legacyTarget)] = struct{}{}
+		}
+	}
+	return &movedProtectedLinkSearch{
+		roots:         orderedRoots,
+		internalRoots: []string{filepath.Clean(vault), filepath.Clean(mountPoint)},
+		targets:       targets,
+		objectTargets: objectTargets,
+		byTarget:      make(map[string]map[string]struct{}),
+		comprehensive: global,
+	}
+}
+
+func protectedLinkSearchRoot(sourcePath string) string {
+	parent := filepath.Clean(filepath.Dir(sourcePath))
+	home, _ := os.UserHomeDir()
+	for current := parent; current != filepath.Dir(current); current = filepath.Dir(current) {
+		if _, err := os.Lstat(filepath.Join(current, ".git")); err == nil {
+			return nearestExistingSearchRoot(current)
+		}
+		if home != "" && filepath.Clean(current) == filepath.Clean(home) {
+			break
+		}
+	}
+	if home == "" || !PathWithin(home, sourcePath) {
+		return nearestExistingSearchRoot(parent)
+	}
+	relative, err := filepath.Rel(home, parent)
+	if err != nil || relative == "." || strings.HasPrefix(relative, "..") {
+		return nearestExistingSearchRoot(parent)
+	}
+	first := strings.Split(filepath.ToSlash(relative), "/")[0]
+	if first == "" || first == "." {
+		return nearestExistingSearchRoot(parent)
+	}
+	if first == "Library" {
+		components := strings.Split(filepath.ToSlash(relative), "/")
+		depth := min(2, len(components))
+		if len(components) >= 3 && components[1] == "Application Support" {
+			depth = 3
+		}
+		return nearestExistingSearchRoot(
+			filepath.Join(append([]string{home}, components[:depth]...)...),
+		)
+	}
+	return nearestExistingSearchRoot(filepath.Join(home, first))
+}
+
+func nearestExistingSearchRoot(root string) string {
+	if existing := nearestExistingDirectory(root); existing != "" {
+		return existing
+	}
+	return filepath.Clean(root)
+}
+
+func canonicalTemporaryRoot() string {
+	root := filepath.Clean(os.TempDir())
+	if runtime.GOOS != "darwin" {
+		return root
+	}
+	// macOS uses a per-user directory for os.TempDir, while command-line tools
+	// and applications commonly create durable temporary work below /tmp.
+	// Resolve the system symlink so candidate paths and internal-root checks use
+	// the same /private/tmp namespace returned by filepath.Abs.
+	if resolved, err := filepath.EvalSymlinks("/tmp"); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean("/tmp")
+}
+
+func compactSearchRoots(roots map[string]struct{}) []string {
+	ordered := make([]string, 0, len(roots))
+	for root := range roots {
+		ordered = append(ordered, root)
+	}
+	sort.Slice(ordered, func(left, right int) bool {
+		if len(ordered[left]) == len(ordered[right]) {
+			return ordered[left] < ordered[right]
+		}
+		return len(ordered[left]) > len(ordered[right])
+	})
+	return ordered
+}
+
+func (search *movedProtectedLinkSearch) find(
+	sourcePath string,
+	targetPath string,
+) (string, error) {
+	cleanTarget := filepath.Clean(targetPath)
+	for {
+		candidates := search.byTarget[cleanTarget]
+		var match string
+		for candidate := range candidates {
+			if filepath.Clean(candidate) == filepath.Clean(sourcePath) {
+				continue
+			}
+			if match != "" {
+				return "", errors.New(
+					"multiple symbolic links reference the missing passfs pathname; encrypted data was preserved",
+				)
+			}
+			match = candidate
+		}
+		if match != "" || search.indexed {
+			return match, nil
+		}
+		if err := search.indexNextRoot(); err != nil {
 			return "", err
 		}
-		if !link.isSymlink || link.target != filepath.Clean(targetPath) {
+	}
+}
+
+func (search *movedProtectedLinkSearch) indexNextRoot() error {
+	if search.indexed {
+		return nil
+	}
+	if search.nextRoot >= len(search.roots) {
+		search.indexed = true
+		return nil
+	}
+	root := search.roots[search.nextRoot]
+	search.nextRoot++
+	if err := search.indexRoot(root); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("search for an offline protected-link move: %w", err)
+	}
+	search.indexedRoots = append(search.indexedRoots, filepath.Clean(root))
+	if search.nextRoot >= len(search.roots) {
+		search.indexed = true
+	}
+	return nil
+}
+
+type movedProtectedLinkScanResult struct {
+	directories []string
+	links       map[string][]string
+	incomplete  bool
+}
+
+func (search *movedProtectedLinkSearch) indexRoot(root string) error {
+	if _, err := os.Stat(root); err != nil {
+		return err
+	}
+	// Directory metadata traversal becomes I/O-bound well before one worker per
+	// logical CPU. A modest cap avoids an avoidable SSD and energy spike when a
+	// missing protected link triggers the exceptional offline-move search.
+	workerCount := min(8, max(2, runtime.GOMAXPROCS(0)))
+	if os.Getenv("PASSFS_LOW_POWER_MODE") == "1" {
+		workerCount = 2
+	}
+	jobs := make(chan string)
+	results := make(chan movedProtectedLinkScanResult, workerCount)
+	for range workerCount {
+		go func() {
+			for directory := range jobs {
+				results <- search.scanDirectory(directory)
+			}
+		}()
+	}
+
+	queue := []string{root}
+	active := 0
+	for len(queue) > 0 || active > 0 {
+		if len(queue) > 0 && active < workerCount {
+			directory := queue[0]
+			queue = queue[1:]
+			jobs <- directory
+			active++
 			continue
 		}
-		if match != "" {
-			return "", errors.New(
-				"multiple symbolic links reference the missing passfs pathname; encrypted data was preserved",
-			)
+		result := <-results
+		active--
+		if result.incomplete {
+			// A skipped or unreadable directory could contain the moved link.
+			// The index remains useful for finding moves, but it must never be
+			// used as proof that a missing link was deleted.
+			search.comprehensive = false
 		}
-		match = candidate
+		queue = append(queue, result.directories...)
+		for target, paths := range result.links {
+			if search.byTarget[target] == nil {
+				search.byTarget[target] = make(map[string]struct{})
+			}
+			for _, path := range paths {
+				search.byTarget[target][path] = struct{}{}
+			}
+		}
 	}
-	return match, nil
+	close(jobs)
+	return nil
+}
+
+func (search *movedProtectedLinkSearch) scanDirectory(
+	directory string,
+) movedProtectedLinkScanResult {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return movedProtectedLinkScanResult{incomplete: true}
+	}
+	result := movedProtectedLinkScanResult{
+		directories: make([]string, 0, len(entries)/4),
+		links:       make(map[string][]string),
+	}
+	for _, entry := range entries {
+		path := filepath.Join(directory, entry.Name())
+		if entry.IsDir() {
+			skip, incomplete := search.shouldSkipDirectory(path, entry.Name())
+			if incomplete {
+				result.incomplete = true
+			}
+			if !skip {
+				result.directories = append(result.directories, path)
+			}
+			continue
+		}
+		if entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		link, err := inspectProtectedLink(path)
+		if err != nil || !link.isSymlink {
+			continue
+		}
+		target := filepath.Clean(link.target)
+		indexTarget := target
+		if _, tracked := search.targets[target]; !tracked {
+			objectID, objectErr := objectIDFromOpaqueTarget(target)
+			if objectErr != nil || search.objectTargets[objectID] == "" {
+				continue
+			}
+			indexTarget = search.objectTargets[objectID]
+		}
+		result.links[indexTarget] = append(result.links[indexTarget], filepath.Clean(path))
+	}
+	return result
+}
+
+func (search *movedProtectedLinkSearch) shouldSkipDirectory(
+	path string,
+	name string,
+) (skip bool, incomplete bool) {
+	for _, internalRoot := range search.internalRoots {
+		if PathWithin(internalRoot, path) {
+			return true, false
+		}
+	}
+	for _, indexedRoot := range search.indexedRoots {
+		if filepath.Clean(path) == indexedRoot || PathWithin(indexedRoot, path) {
+			return true, false
+		}
+	}
+	home, _ := os.UserHomeDir()
+	if filepath.Clean(filepath.Dir(path)) == filepath.Clean(home) {
+		if _, excluded := broadHomeSearchExcludedDirectories[strings.ToLower(name)]; excluded {
+			return true, true
+		}
+	}
+	lowerName := strings.ToLower(name)
+	if _, excluded := movedLinkSearchExcludedDirectories[lowerName]; excluded {
+		return true, true
+	}
+	for _, suffix := range []string{
+		".app", ".dsym", ".framework", ".xcarchive",
+	} {
+		if strings.HasSuffix(lowerName, suffix) {
+			return true, true
+		}
+	}
+	return false, false
+}
+
+var broadHomeSearchExcludedDirectories = map[string]struct{}{
+	"applications": {},
+	"library":      {},
+	"movies":       {},
+	"music":        {},
+	"pictures":     {},
+	"public":       {},
+}
+
+// Offline moves are user actions. Dependency stores, generated output and
+// caches can contain millions of directories, but are not meaningful
+// destinations for a protected secret. Pruning them keeps the one-time safety
+// scan bounded without excluding source/configuration trees.
+var movedLinkSearchExcludedDirectories = map[string]struct{}{
+	".bzr":              {},
+	".bundle":           {},
+	".cache":            {},
+	".dart_tool":        {},
+	".git":              {},
+	".gradle":           {},
+	".hg":               {},
+	".idea":             {},
+	".ivy2":             {},
+	".m2":               {},
+	".next":             {},
+	".nuget":            {},
+	".npm":              {},
+	".parcel-cache":     {},
+	".pnpm-store":       {},
+	".svn":              {},
+	".svelte-kit":       {},
+	".terraform":        {},
+	".terragrunt-cache": {},
+	".trash":            {},
+	".turbo":            {},
+	".venv":             {},
+	".yarn":             {},
+	"__pycache__":       {},
+	"_build":            {},
+	"bower_components":  {},
+	"build":             {},
+	"caches":            {},
+	"carthage":          {},
+	"cmakefiles":        {},
+	"coverage":          {},
+	"deriveddata":       {},
+	"dist":              {},
+	"generated":         {},
+	"jspm_packages":     {},
+	"node_modules":      {},
+	"obj":               {},
+	"pods":              {},
+	"site-packages":     {},
+	"target":            {},
+	"third-party":       {},
+	"third_party":       {},
+	"vendor":            {},
+	"vendors":           {},
+	"venv":              {},
+	"virtualenv":        {},
 }
 
 type protectedLink struct {
@@ -746,6 +1109,12 @@ func inspectProtectedLink(sourcePath string) (protectedLink, error) {
 		return protectedLink{exists: true}, nil
 	}
 	linkTarget, err := os.Readlink(sourcePath)
+	if errors.Is(err, os.ErrNotExist) {
+		// The entry was removed or renamed after Lstat. Reporting it as
+		// absent lets reconciliation use its tracked kernel reference or
+		// remove the corresponding ciphertext immediately.
+		return protectedLink{}, nil
+	}
 	if err != nil {
 		return protectedLink{}, err
 	}

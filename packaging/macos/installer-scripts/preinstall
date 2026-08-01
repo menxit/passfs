@@ -1,0 +1,47 @@
+#!/bin/sh
+
+# Stop an existing installation before its app-extension executable is
+# replaced. Unloading the volume first lets livefsd remove the registration;
+# terminating the now-idle extension then guarantees that the postinstall
+# reload launches code from the new bundle rather than retaining an old inode.
+script_directory=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+# shellcheck source=common.sh
+. "$script_directory/common.sh"
+passfs_load_console_user || exit 0
+installed_cli=/Applications/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli
+
+if [ ! -x "$installed_cli" ]; then
+	exit 0
+fi
+
+config=$passfs_user_home/.passfs/config.json
+if [ ! -f "$config" ]; then
+	config=$passfs_user_home/.config/passfs/config.json
+fi
+if [ -f "$config" ]; then
+	if ! /bin/launchctl asuser "$passfs_user_id" \
+		/usr/bin/sudo -H -u "$passfs_console_user" \
+		"$installed_cli" unmount --config "$config" \
+		>/dev/null 2>&1; then
+		echo "PassFS could not stop the existing protected filesystem; the upgrade was not applied." >&2
+		exit 1
+	fi
+fi
+
+# Restrict the process match to the console user. With no configuration the
+# extension is idle; otherwise the successful unmount above made it safe to
+# terminate before Installer replaces its executable.
+/usr/bin/pkill -u "$passfs_user_id" -x PassFSFileSystem \
+	>/dev/null 2>&1 || true
+attempt=0
+while /usr/bin/pgrep -u "$passfs_user_id" -x PassFSFileSystem \
+	>/dev/null 2>&1; do
+	if [ "$attempt" -ge 50 ]; then
+		echo "PassFS File System Extension did not stop; the upgrade was not applied." >&2
+		exit 1
+	fi
+	/bin/sleep 0.1
+	attempt=$((attempt + 1))
+done
+
+exit 0

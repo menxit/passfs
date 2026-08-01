@@ -2,7 +2,11 @@ package updater
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,15 +16,31 @@ import (
 func TestLatestAndVerifiedDownload(t *testing.T) {
 	asset := []byte("passfs test binary")
 	checksum := fmt.Sprintf("%x", sha256.Sum256(asset))
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := json.Marshal(map[string]any{
+		"version": "1.2.3",
+		"checksums": map[string]string{
+			"passfs-linux-x64.gz": checksum,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature := base64.StdEncoding.EncodeToString(
+		ed25519.Sign(privateKey, manifest),
+	)
 	server := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
 		request *http.Request,
 	) {
 		switch request.URL.Path {
-		case "/latest.txt":
-			fmt.Fprintln(writer, "1.2.3")
-		case "/latest/SHA256SUMS":
-			fmt.Fprintf(writer, "%s  passfs-linux-x64.gz\n", checksum)
+		case "/latest/MANIFEST.json":
+			_, _ = writer.Write(manifest)
+		case "/latest/MANIFEST.sig":
+			fmt.Fprintln(writer, signature)
 		case "/latest/passfs-linux-x64.gz":
 			_, _ = writer.Write(asset)
 		default:
@@ -29,7 +49,7 @@ func TestLatestAndVerifiedDownload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL)
+	client := NewClientWithPublicKey(server.URL, publicKey)
 	release, err := client.Latest(t.Context())
 	if err != nil {
 		t.Fatal(err)

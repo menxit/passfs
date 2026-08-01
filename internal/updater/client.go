@@ -1,10 +1,12 @@
 package updater
 
 import (
-	"bufio"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,14 +19,16 @@ import (
 )
 
 const (
-	DefaultReleaseBaseURL = "https://getpassfs.com/releases"
-	maxMetadataBytes      = 1024 * 1024
-	maxAssetBytes         = 512 * 1024 * 1024
+	DefaultReleaseBaseURL  = "https://getpassfs.com/releases"
+	DefaultUpdatePublicKey = "5XWsw8zINimtmMUgAZyf6z5lHGKTotyB7GGu6LIMsKk="
+	maxMetadataBytes       = 1024 * 1024
+	maxAssetBytes          = 512 * 1024 * 1024
 )
 
 type Client struct {
-	BaseURL string
-	HTTP    *http.Client
+	BaseURL   string
+	HTTP      *http.Client
+	PublicKey ed25519.PublicKey
 }
 
 type Release struct {
@@ -33,8 +37,17 @@ type Release struct {
 }
 
 func NewClient(baseURL string) *Client {
+	publicKey, err := base64.StdEncoding.DecodeString(DefaultUpdatePublicKey)
+	if err != nil || len(publicKey) != ed25519.PublicKeySize {
+		panic("invalid embedded passfs update public key")
+	}
+	return NewClientWithPublicKey(baseURL, publicKey)
+}
+
+func NewClientWithPublicKey(baseURL string, publicKey []byte) *Client {
 	return &Client{
-		BaseURL: strings.TrimRight(baseURL, "/"),
+		BaseURL:   strings.TrimRight(baseURL, "/"),
+		PublicKey: append(ed25519.PublicKey(nil), publicKey...),
 		HTTP: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -42,27 +55,67 @@ func NewClient(baseURL string) *Client {
 }
 
 func (client *Client) Latest(ctx context.Context) (Release, error) {
-	versionData, err := client.getBounded(ctx, "latest.txt", 128)
-	if err != nil {
-		return Release{}, fmt.Errorf("read latest passfs version: %w", err)
-	}
-	version, err := NormalizeVersion(strings.TrimSpace(string(versionData)))
-	if err != nil {
-		return Release{}, fmt.Errorf("invalid latest passfs version: %w", err)
-	}
-	checksumData, err := client.getBounded(
+	manifestData, err := client.getBounded(
 		ctx,
-		"latest/SHA256SUMS",
+		"latest/MANIFEST.json",
 		maxMetadataBytes,
 	)
 	if err != nil {
-		return Release{}, fmt.Errorf("read latest passfs checksums: %w", err)
+		return Release{}, fmt.Errorf("read latest passfs manifest: %w", err)
 	}
-	checksums, err := ParseChecksums(string(checksumData))
+	signatureData, err := client.getBounded(ctx, "latest/MANIFEST.sig", 1024)
+	if err != nil {
+		return Release{}, fmt.Errorf("read latest passfs manifest signature: %w", err)
+	}
+	if len(client.PublicKey) != ed25519.PublicKeySize {
+		return Release{}, errors.New("passfs update public key is invalid")
+	}
+	signature, err := base64.StdEncoding.DecodeString(
+		strings.TrimSpace(string(signatureData)),
+	)
+	if err != nil {
+		return Release{}, fmt.Errorf("decode passfs manifest signature: %w", err)
+	}
+	if !ed25519.Verify(client.PublicKey, manifestData, signature) {
+		return Release{}, errors.New("passfs update manifest signature is invalid")
+	}
+	var manifest struct {
+		Version   string            `json:"version"`
+		Checksums map[string]string `json:"checksums"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(manifestData)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return Release{}, fmt.Errorf("parse passfs update manifest: %w", err)
+	}
+	version, err := NormalizeVersion(manifest.Version)
+	if err != nil {
+		return Release{}, fmt.Errorf("invalid latest passfs version: %w", err)
+	}
+	checksums, err := validateChecksums(manifest.Checksums)
 	if err != nil {
 		return Release{}, err
 	}
 	return Release{Version: version, Checksums: checksums}, nil
+}
+
+func validateChecksums(values map[string]string) (map[string]string, error) {
+	checksums := make(map[string]string, len(values))
+	for name, value := range values {
+		if path.Base(name) != name || name == "." || name == "" {
+			return nil, fmt.Errorf("invalid checksum asset %q", name)
+		}
+		checksum := strings.ToLower(value)
+		if _, err := hex.DecodeString(checksum); err != nil ||
+			len(checksum) != sha256.Size*2 {
+			return nil, fmt.Errorf("invalid SHA-256 checksum %q", value)
+		}
+		checksums[name] = checksum
+	}
+	if len(checksums) == 0 {
+		return nil, errors.New("checksum map is empty")
+	}
+	return checksums, nil
 }
 
 func (client *Client) Download(
@@ -155,37 +208,6 @@ func (client *Client) request(
 		return nil, fmt.Errorf("GET %s: %s", endpoint, response.Status)
 	}
 	return response, nil
-}
-
-func ParseChecksums(value string) (map[string]string, error) {
-	checksums := make(map[string]string)
-	scanner := bufio.NewScanner(strings.NewReader(value))
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) != 2 {
-			return nil, fmt.Errorf("invalid checksum line %q", scanner.Text())
-		}
-		checksum := strings.ToLower(fields[0])
-		if _, err := hex.DecodeString(checksum); err != nil || len(checksum) != sha256.Size*2 {
-			return nil, fmt.Errorf("invalid SHA-256 checksum %q", fields[0])
-		}
-		name := strings.TrimPrefix(fields[1], "*")
-		name = strings.TrimPrefix(name, "./")
-		if path.Base(name) != name || name == "." || name == "" {
-			return nil, fmt.Errorf("invalid checksum asset %q", name)
-		}
-		if _, duplicate := checksums[name]; duplicate {
-			return nil, fmt.Errorf("duplicate checksum for %s", name)
-		}
-		checksums[name] = checksum
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	if len(checksums) == 0 {
-		return nil, errors.New("checksum file is empty")
-	}
-	return checksums, nil
 }
 
 type semanticVersion struct {

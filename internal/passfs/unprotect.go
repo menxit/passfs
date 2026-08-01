@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -44,7 +43,7 @@ func (v *Volume) UnprotectAll(
 	records := v.linkRecords()
 	protected := make([]linkRecord, 0, len(records))
 	for _, record := range records {
-		if record.protected {
+		if record.protected && record.sourcePath != "" && record.orphanedAt == 0 {
 			protected = append(protected, record)
 		}
 	}
@@ -66,7 +65,7 @@ func (v *Volume) UnprotectFile(
 	forbiddenRoots []string,
 ) UnprotectReport {
 	var report UnprotectReport
-	absolute, err := filepath.Abs(sourcePath)
+	absolute, err := ResolvePathEntry(sourcePath)
 	if err != nil {
 		report.Failed = append(report.Failed, UnprotectIssue{
 			Path: sourcePath,
@@ -83,8 +82,7 @@ func (v *Volume) UnprotectFile(
 		if !record.protected {
 			continue
 		}
-		original, err := OriginalPath(record.relative)
-		if err != nil || filepath.Clean(original) != absolute {
+		if filepath.Clean(record.sourcePath) != absolute {
 			continue
 		}
 		return v.unprotectRecords(
@@ -127,13 +125,11 @@ func (v *Volume) unprotectRecords(
 
 	for _, record := range protected {
 		issuePath := record.relative
-		sourcePath, err := OriginalPath(record.relative)
+		sourcePath := record.sourcePath
 		if sourcePath != "" {
 			issuePath = sourcePath
 		}
-		if err == nil {
-			err = validateUnprotectDestination(sourcePath, forbiddenRoots)
-		}
+		err := validateUnprotectDestination(sourcePath, forbiddenRoots)
 		if err == nil {
 			var warning error
 			warning, err = v.unprotectFile(record, sourcePath, identity)
@@ -202,34 +198,18 @@ func (v *Volume) inspectUnprotectDestination(
 		return plaintextDestination{}, false, err
 	}
 	if !link.exists {
-		if record.linkTarget != "" {
-			return plaintextDestination{}, false, errors.New(
-				"the registered protected link is missing; encrypted data was preserved",
-			)
-		}
-		parentInfo, err := os.Stat(filepath.Dir(sourcePath))
-		if err != nil {
-			return plaintextDestination{}, false, fmt.Errorf(
-				"inspect destination directory: %w",
-				err,
-			)
-		}
-		if !parentInfo.IsDir() {
-			return plaintextDestination{}, false, errors.New(
-				"plaintext destination parent is not a directory",
-			)
-		}
-		return plaintextDestination{absent: true}, false, nil
+		return plaintextDestination{}, false, errors.New(
+			"the registered protected link is missing; encrypted data was preserved",
+		)
 	}
 	if link.isSymlink {
-		if record.linkTarget == "" ||
-			link.target != filepath.Clean(record.linkTarget) {
+		if !targetMatchesStorage(link.target, record.relative) {
 			return plaintextDestination{}, false, errors.New(
 				"pathname is not the registered passfs link; encrypted data was preserved",
 			)
 		}
 		return plaintextDestination{
-			linkTarget: filepath.Clean(record.linkTarget),
+			linkTarget: filepath.Clean(link.target),
 		}, false, nil
 	}
 
@@ -384,10 +364,15 @@ func (v *Volume) removeMaterializedCiphertext(
 
 	v.metadataMu.Lock()
 	meta, hadMeta := v.metadata.Files[key]
-	linkTarget, hadLink := v.metadata.Links[key]
+	linkSource, hadLink := v.metadata.Links[key]
+	orphanedAt, hadOrphan := v.metadata.Orphaned[key]
+	legacyTarget, hadLegacyTarget := v.metadata.LegacyTargets[key]
 	if err := v.updateMetadataLocked(func(metadata *Metadata) error {
 		delete(metadata.Files, key)
 		delete(metadata.Links, key)
+		delete(metadata.Orphaned, key)
+		delete(metadata.LegacyTargets, key)
+		delete(metadata.DisplacedLinks, key)
 		return nil
 	}); err != nil {
 		v.metadataMu.Unlock()
@@ -400,8 +385,12 @@ func (v *Volume) removeMaterializedCiphertext(
 			key,
 			meta,
 			hadMeta,
-			linkTarget,
+			linkSource,
 			hadLink,
+			orphanedAt,
+			hadOrphan,
+			legacyTarget,
+			hadLegacyTarget,
 		)
 		return false, errors.Join(
 			fmt.Errorf("remove encrypted file: %w", err),
@@ -411,16 +400,19 @@ func (v *Volume) removeMaterializedCiphertext(
 
 	parent := filepath.Dir(path)
 	syncErr := syncDirectory(parent)
-	pruneErr := pruneEmptyDirectories(parent, filepath.Join(v.root, "files"))
-	return true, errors.Join(syncErr, pruneErr)
+	return true, syncErr
 }
 
 func (v *Volume) restoreUnprotectMetadata(
 	key string,
 	meta FileMeta,
 	hadMeta bool,
-	linkTarget string,
+	linkSource string,
 	hadLink bool,
+	orphanedAt int64,
+	hadOrphan bool,
+	legacyTarget string,
+	hadLegacyTarget bool,
 ) error {
 	v.metadataMu.Lock()
 	defer v.metadataMu.Unlock()
@@ -429,28 +421,17 @@ func (v *Volume) restoreUnprotectMetadata(
 			metadata.Files[key] = meta
 		}
 		if hadLink {
-			metadata.Links[key] = linkTarget
+			metadata.Links[key] = linkSource
+		}
+		if hadOrphan {
+			metadata.Orphaned[key] = orphanedAt
+		}
+		if hadLegacyTarget {
+			metadata.LegacyTargets[key] = legacyTarget
 		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("restore metadata after encrypted-file removal failed: %w", err)
-	}
-	return nil
-}
-
-func pruneEmptyDirectories(directory, stop string) error {
-	stop = filepath.Clean(stop)
-	for current := filepath.Clean(directory); current != stop; current = filepath.Dir(current) {
-		if !PathWithin(stop, current) {
-			return errors.New("refusing to prune outside the encrypted files directory")
-		}
-		err := os.Remove(current)
-		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
-			return nil
-		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
 	}
 	return nil
 }

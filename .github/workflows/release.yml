@@ -27,23 +27,8 @@ jobs:
         run: echo "value=$(./scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
 
   verify:
-    name: Verify (${{ matrix.os }})
     needs: version
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-latest
-          - ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Check
-        run: make check
+    uses: ./.github/workflows/check.yml
 
   linux:
     name: Linux binaries
@@ -65,11 +50,20 @@ jobs:
           VERSION: ${{ needs.version.outputs.value }}
         run: |
           ./scripts/checksums.sh "release/v${VERSION}"
+          openssl genpkey -algorithm Ed25519 \
+            -out "$RUNNER_TEMP/update-smoke-key.pem"
+          PASSFS_UPDATE_SIGNING_KEY="$(cat "$RUNNER_TEMP/update-smoke-key.pem")" \
+            ./scripts/sign-release.sh "release/v${VERSION}"
+          smoke_public_key="$(
+            openssl pkey -in "$RUNNER_TEMP/update-smoke-key.pem" \
+              -pubout -outform DER | base64 -w 0
+          )"
           if [[ ! -e /dev/fuse ]]; then
             sudo mknod -m 0666 /dev/fuse c 10 229
           fi
           PASSFS_RELEASE_BASE="file://${GITHUB_WORKSPACE}/release" \
           PASSFS_VERSION="${VERSION}" \
+          PASSFS_TEST_UPDATE_PUBLIC_KEY_DER_BASE64="$smoke_public_key" \
           PASSFS_INSTALL_DIR="${RUNNER_TEMP}/passfs-bin" \
           PASSFS_NO_MODIFY_PATH=1 \
             ./install.sh
@@ -190,7 +184,11 @@ jobs:
           path: release/v${{ needs.version.outputs.value }}
           merge-multiple: true
       - name: Create checksums
-        run: ./scripts/checksums.sh "release/v${{ needs.version.outputs.value }}"
+        env:
+          PASSFS_UPDATE_SIGNING_KEY: ${{ secrets.PASSFS_UPDATE_SIGNING_KEY }}
+        run: |
+          ./scripts/checksums.sh "release/v${{ needs.version.outputs.value }}"
+          ./scripts/sign-release.sh "release/v${{ needs.version.outputs.value }}"
       - name: Publish assets
         shell: bash
         env:

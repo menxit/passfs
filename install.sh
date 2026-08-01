@@ -6,6 +6,7 @@ BASE_URL="${PASSFS_RELEASE_BASE:-https://getpassfs.com/releases}"
 INSTALL_DIRECTORY="${PASSFS_INSTALL_DIR:-${HOME}/.local/bin}"
 VERSION="${PASSFS_VERSION:-}"
 APT_UPDATED=0
+UPDATE_PUBLIC_KEY_DER_BASE64="MCowBQYDK2VwAyEA5XWsw8zINimtmMUgAZyf6z5lHGKTotyB7GGu6LIMsKk="
 
 say() {
 	printf 'passfs: %s\n' "$*"
@@ -104,23 +105,14 @@ install_graphical_prompt() {
 	fail "this installer is for Linux; download the signed macOS package from https://getpassfs.com/"
 command -v curl >/dev/null 2>&1 || fail "curl is required."
 command -v gzip >/dev/null 2>&1 || fail "gzip is required."
+command -v openssl >/dev/null 2>&1 || fail "openssl is required."
+command -v base64 >/dev/null 2>&1 || fail "base64 is required."
 command -v systemctl >/dev/null 2>&1 ||
 	fail "systemd is required to supervise the passfs user service."
 [[ -n "${INSTALL_DIRECTORY}" && "${INSTALL_DIRECTORY}" == /* &&
 	"${INSTALL_DIRECTORY}" != *:* &&
 	"${INSTALL_DIRECTORY}" != *$'\n'* ]] ||
 	fail "PASSFS_INSTALL_DIR must be an absolute path without colons or newlines."
-
-if [[ -z "${VERSION}" ]]; then
-	VERSION="$(curl -fsSL "${BASE_URL}/latest.txt")"
-	VERSION_URL="${BASE_URL}/latest"
-else
-	VERSION="${VERSION#v}"
-	VERSION_URL="${BASE_URL}/v${VERSION}"
-fi
-VERSION="${VERSION#v}"
-[[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$ ]] ||
-	fail "invalid release version."
 
 case "$(uname -m)" in
 	x86_64 | amd64) ARCHITECTURE="x64" ;;
@@ -141,16 +133,56 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ -z "${VERSION}" ]]; then
+	VERSION_URL="${BASE_URL}/latest"
+else
+	VERSION="${VERSION#v}"
+	VERSION_URL="${BASE_URL}/v${VERSION}"
+fi
+
+curl -fsSL "${VERSION_URL}/MANIFEST.json" \
+	-o "${TEMPORARY_DIRECTORY}/MANIFEST.json"
+curl -fsSL "${VERSION_URL}/MANIFEST.sig" \
+	-o "${TEMPORARY_DIRECTORY}/MANIFEST.sig"
+
+PUBLIC_KEY="${UPDATE_PUBLIC_KEY_DER_BASE64}"
+if [[ -n "${PASSFS_TEST_UPDATE_PUBLIC_KEY_DER_BASE64:-}" ]]; then
+	[[ "${BASE_URL}" == file://* ]] ||
+		fail "the test update key is allowed only with a local file URL."
+	PUBLIC_KEY="${PASSFS_TEST_UPDATE_PUBLIC_KEY_DER_BASE64}"
+fi
+printf '%s' "${PUBLIC_KEY}" | base64 -d \
+	> "${TEMPORARY_DIRECTORY}/update-public-key.der" 2>/dev/null ||
+	fail "invalid update verification key."
+base64 -d < "${TEMPORARY_DIRECTORY}/MANIFEST.sig" \
+	> "${TEMPORARY_DIRECTORY}/MANIFEST.sig.bin" 2>/dev/null ||
+	fail "invalid update manifest signature encoding."
+openssl pkeyutl -verify -rawin -pubin -keyform DER \
+	-inkey "${TEMPORARY_DIRECTORY}/update-public-key.der" \
+	-in "${TEMPORARY_DIRECTORY}/MANIFEST.json" \
+	-sigfile "${TEMPORARY_DIRECTORY}/MANIFEST.sig.bin" \
+	>/dev/null 2>&1 || fail "update manifest signature verification failed."
+
+SIGNED_VERSION="$({
+	sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' \
+		"${TEMPORARY_DIRECTORY}/MANIFEST.json"
+} | head -n 1)"
+SIGNED_VERSION="${SIGNED_VERSION#v}"
+[[ "${SIGNED_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$ ]] ||
+	fail "signed manifest contains an invalid release version."
+if [[ -n "${VERSION}" && "${VERSION}" != "${SIGNED_VERSION}" ]]; then
+	fail "signed manifest version does not match the requested release."
+fi
+VERSION="${SIGNED_VERSION}"
+
 say "downloading passfs ${VERSION} for linux/${ARCHITECTURE}"
 curl -fsSL "${VERSION_URL}/${ASSET}" \
 	-o "${TEMPORARY_DIRECTORY}/${ASSET}"
-curl -fsSL "${VERSION_URL}/SHA256SUMS" \
-	-o "${TEMPORARY_DIRECTORY}/SHA256SUMS"
 
 EXPECTED="$(
-	awk -v asset="${ASSET}" \
-		'$2 == asset || $2 == ("./" asset) { print $1; exit }' \
-		"${TEMPORARY_DIRECTORY}/SHA256SUMS"
+	sed -n \
+		's/^[[:space:]]*"'"${ASSET}"'":[[:space:]]*"\([[:xdigit:]]\{64\}\)".*/\1/p' \
+		"${TEMPORARY_DIRECTORY}/MANIFEST.json" | head -n 1
 )"
 [[ -n "${EXPECTED}" ]] || fail "checksum not found for ${ASSET}."
 [[ "${EXPECTED}" =~ ^[[:xdigit:]]{64}$ ]] ||
@@ -179,12 +211,9 @@ install_graphical_prompt
 	fail "/dev/fuse is not accessible to the current user; fix its permissions and run the installer again."
 
 mkdir -p "${INSTALL_DIRECTORY}"
-STAGED_BINARY="${INSTALL_DIRECTORY}/.passfs-install-$$"
+STAGED_BINARY="$(mktemp "${INSTALL_DIRECTORY}/.passfs-install.XXXXXX")"
 gzip -dc "${TEMPORARY_DIRECTORY}/${ASSET}" > "${STAGED_BINARY}"
 chmod 0755 "${STAGED_BINARY}"
-REPORTED_VERSION="$("${STAGED_BINARY}" version 2>/dev/null || true)"
-[[ "${REPORTED_VERSION}" == "passfs ${VERSION}" ]] ||
-	fail "downloaded executable reported an unexpected version."
 mv "${STAGED_BINARY}" "${INSTALL_DIRECTORY}/passfs"
 STAGED_BINARY=""
 
@@ -207,11 +236,12 @@ if [[ ":${PATH}:" != *":${INSTALL_DIRECTORY}:"* &&
 fi
 
 say "installed ${INSTALL_DIRECTORY}/passfs"
-if [[ -f "${HOME}/.config/passfs/config.json" ]]; then
-	if "${INSTALL_DIRECTORY}/passfs" reload; then
-		say "reloaded the passfs service"
+if [[ -f "${HOME}/.passfs/config.json" ||
+	-f "${HOME}/.config/passfs/config.json" ]]; then
+	if "${INSTALL_DIRECTORY}/passfs" init --no-open; then
+		say "migrated and restarted the passfs service"
 	else
-		say "warning: installation succeeded, but the existing service could not be reloaded"
+		say "warning: installation succeeded, but the existing service could not be restarted"
 	fi
 fi
 if [[ ":${PATH}:" != *":${INSTALL_DIRECTORY}:"* ]]; then

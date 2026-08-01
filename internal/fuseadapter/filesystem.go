@@ -26,7 +26,7 @@ func NewRootNode(fileSystem fsapi.FileSystem) *Node {
 
 func (n *Node) relativePath() string {
 	relative := n.Path(n.Root())
-	if relative == "." {
+	if relative == "" || relative == "." {
 		return ""
 	}
 	return filepath.Clean(relative)
@@ -46,8 +46,6 @@ func requestContext(ctx context.Context) context.Context {
 	}
 	return fsapi.WithCaller(ctx, fsapi.Caller{
 		PID: caller.Pid,
-		UID: caller.Uid,
-		GID: caller.Gid,
 	})
 }
 
@@ -79,8 +77,8 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	for _, entry := range entries {
 		fuseEntries = append(fuseEntries, fuse.DirEntry{
 			Name: entry.Name,
-			Mode: fuseMode(entry.Type, 0),
-			Ino:  entry.Inode,
+			Mode: fuseMode(entry.Attributes.Type, 0),
+			Ino:  entry.Attributes.Inode,
 		})
 	}
 	return fs.NewListDirStream(fuseEntries), 0

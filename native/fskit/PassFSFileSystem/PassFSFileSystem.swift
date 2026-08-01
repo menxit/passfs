@@ -18,12 +18,21 @@ final class PassFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
         resource: FSResource,
         replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void
     ) {
-        guard resource is FSPathURLResource else {
+        guard let pathResource = resource as? FSPathURLResource else {
             Logger.passfs.error("Probe rejected an unsupported resource")
             replyHandler(nil, POSIXError(.ENODEV))
             return
         }
-        let containerUUID = UUID()
+        guard pathResource.url.startAccessingSecurityScopedResource() else {
+            replyHandler(nil, POSIXError(.EACCES))
+            return
+        }
+        defer { pathResource.url.stopAccessingSecurityScopedResource() }
+        guard let containerUUID = passFSVolumeUUID(at: pathResource.url) else {
+            Logger.passfs.error("Probe rejected a vault with an invalid identifier")
+            replyHandler(nil, POSIXError(.EINVAL))
+            return
+        }
         let identifier = FSContainerIdentifier(
             uuid: containerUUID
         )
@@ -55,7 +64,7 @@ final class PassFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
             replyHandler(nil, POSIXError(.EINVAL))
             return
         }
-        for option in options.taskOptions where option.contains("-f") {
+        for option in options.taskOptions where option == "-f" {
             Logger.passfs.error("Force loading is unsupported")
             replyHandler(nil, POSIXError(.ENOTSUP))
             return
@@ -67,7 +76,6 @@ final class PassFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
         }
         do {
             let configuration = try passFSConfiguration(options)
-            let volumeUUID = UUID()
             let bridge = try PassFSBridge(
                 vaultPath: pathResource.url.path,
                 maximumFileSize: configuration.maximumFileSize,
@@ -75,14 +83,13 @@ final class PassFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
             )
             let volume = try PassFSVolume(
                 bridge: bridge,
-                maximumFileSize: UInt64(configuration.maximumFileSize),
-                volumeUUID: volumeUUID
+                volumeUUID: bridge.volumeUUID
             )
             self.resource = pathResource
             self.volume = volume
             containerStatus = .ready
             Logger.passfs.info(
-                "Resource ready; volume=\(volumeUUID.uuidString, privacy: .public)"
+                "Resource ready; volume=\(bridge.volumeUUID.uuidString, privacy: .public); unlockDurationNs=\(configuration.unlockDurationNanoseconds, privacy: .public)"
             )
             replyHandler(volume, nil)
         } catch {
@@ -114,12 +121,49 @@ final class PassFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
     }
 }
 
-private struct PassFSConfiguration {
+private struct PassFSPublicConfiguration: Decodable {
+    let volumeId: String
+}
+
+private func passFSVolumeUUID(at vault: URL) -> UUID? {
+    let configuration = vault
+        .appendingPathComponent(".passfs", isDirectory: true)
+        .appendingPathComponent("config.json", isDirectory: false)
+    guard let data = try? Data(contentsOf: configuration),
+          let publicConfiguration = try? JSONDecoder().decode(
+              PassFSPublicConfiguration.self,
+              from: data
+          ) else {
+        return nil
+    }
+    let identifier = publicConfiguration.volumeId
+    guard identifier.count == 32,
+          identifier.allSatisfy({ $0.isHexDigit }) else {
+        return nil
+    }
+    let parts = [8, 4, 4, 4, 12]
+    var offset = identifier.startIndex
+    var components: [String] = []
+    for length in parts {
+        guard let end = identifier.index(
+            offset,
+            offsetBy: length,
+            limitedBy: identifier.endIndex
+        ) else {
+            return nil
+        }
+        components.append(String(identifier[offset..<end]))
+        offset = end
+    }
+    return UUID(uuidString: components.joined(separator: "-"))
+}
+
+struct PassFSConfiguration {
     var maximumFileSize: Int64 = 16 * 1024 * 1024
     var unlockDurationNanoseconds: Int64 = 0
 }
 
-private func passFSConfiguration(
+func passFSConfiguration(
     _ taskOptions: FSTaskOptions
 ) throws -> PassFSConfiguration {
     var configuration = PassFSConfiguration()

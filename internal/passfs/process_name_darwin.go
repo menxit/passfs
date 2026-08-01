@@ -3,23 +3,15 @@
 package passfs
 
 import (
-	"os/exec"
-	"strconv"
-	"strings"
+	"golang.org/x/sys/unix"
 )
 
 func platformProcessName(pid uint32) string {
-	output, err := exec.Command(
-		"/bin/ps",
-		"-p",
-		strconv.FormatUint(uint64(pid), 10),
-		"-o",
-		"comm=",
-	).Output()
+	process, err := unix.SysctlKinfoProc("kern.proc.pid", int(pid))
 	if err != nil {
 		return ""
 	}
-	return string(output)
+	return unix.ByteSliceToString(process.Proc.P_comm[:])
 }
 
 func platformProcessID(pid uint32) uint32 {
@@ -27,19 +19,12 @@ func platformProcessID(pid uint32) uint32 {
 }
 
 func platformParentProcessID(pid uint32) uint32 {
-	output, err := exec.Command(
-		"/bin/ps",
-		"-p",
-		strconv.FormatUint(uint64(pid), 10),
-		"-o",
-		"ppid=",
-	).Output()
+	process, err := unix.SysctlKinfoProc("kern.proc.pid", int(pid))
 	if err != nil {
 		return 0
 	}
-	parent, err := strconv.ParseUint(strings.TrimSpace(string(output)), 10, 32)
-	if err != nil {
+	if process.Eproc.Ppid <= 0 {
 		return 0
 	}
-	return uint32(parent)
+	return uint32(process.Eproc.Ppid)
 }

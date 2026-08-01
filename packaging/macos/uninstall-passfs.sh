@@ -19,7 +19,7 @@ Removes the installed PassFS application, command-line link, LaunchAgent,
 FSKit registration and enablement state, package receipt, preferences, and
 sandbox container.
 
-The PassFS vault under ~/.config/passfs is preserved by default. Use
+The PassFS vault under ~/.passfs is preserved by default. Use
 --purge-data only when you also want to move that vault to the Trash.
 EOF
 }
@@ -107,7 +107,11 @@ if [ -z "$user_id" ] || [ -z "$user_group" ] ||
 	exit 1
 fi
 if [ -z "$config_path" ]; then
-	config_path="$user_home/.config/passfs/config.json"
+	if [ -f "$user_home/.passfs/config.json" ]; then
+		config_path="$user_home/.passfs/config.json"
+	else
+		config_path="$user_home/.config/passfs/config.json"
+	fi
 fi
 
 run_as_user()
@@ -199,6 +203,7 @@ if [ -n "$app_bundle" ] && [ -x "$launch_services_register" ]; then
 		>/dev/null 2>&1 || true
 fi
 
+remaining=false
 enabled_modules="$user_home/Library/Group Containers/group.com.apple.fskit.settings/enabledModules.plist"
 if [ -f "$enabled_modules" ]; then
 	module_index=0
@@ -213,6 +218,7 @@ if [ -f "$enabled_modules" ]; then
 				continue
 			fi
 			warn "could not remove the PassFS FSKit enablement entry"
+			remaining=true
 		fi
 		module_index=$((module_index + 1))
 	done
@@ -225,7 +231,6 @@ trash_dir=$(
 	exit 1
 }
 /usr/sbin/chown "$console_user:$user_group" "$trash_dir" 2>/dev/null || true
-remaining=false
 
 move_to_trash()
 {

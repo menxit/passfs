@@ -23,8 +23,19 @@ extension PassFSVolume: FSVolume.Operations {
         options: FSTaskOptions,
         replyHandler: @escaping (FSItem?, (any Error)?) -> Void
     ) {
-        Logger.passfs.info("Activating passfs volume")
-        replyHandler(rootItem, nil)
+        do {
+            let configuration = try passFSConfiguration(options)
+            try configure(configuration)
+            Logger.passfs.info(
+                "Activating passfs volume; maximumFileSize=\(configuration.maximumFileSize, privacy: .public); unlockDurationNs=\(configuration.unlockDurationNanoseconds, privacy: .public)"
+            )
+            replyHandler(rootItem, nil)
+        } catch {
+            Logger.passfs.error(
+                "Unable to configure passfs activation: \(error.localizedDescription)"
+            )
+            replyHandler(nil, error)
+        }
     }
 
     func deactivate(
@@ -314,7 +325,11 @@ extension PassFSVolume: FSVolume.Operations {
                overItem !== item {
                 removeFromCache(overItem)
             }
-            updateCachedPaths(from: oldPath, to: newPath)
+            updateCachedPaths(
+                from: oldPath,
+                to: newPath,
+                newParentInode: destinationDirectory.inode
+            )
             replyHandler(FSFileName(string: destinationName), nil)
         } catch {
             replyHandler(nil, error)
@@ -357,21 +372,20 @@ extension PassFSVolume: FSVolume.Operations {
                         directory.currentPath(),
                         entry.name
                     )
-                    let bridgeAttributes = try bridge.lookup(path: path)
                     let item = self.item(
                         path: path,
-                        attributes: bridgeAttributes
+                        attributes: entry.attributes
                     )
                     attributes = fsAttributes(
-                        bridgeAttributes,
+                        entry.attributes,
                         item: item,
                         desired: requestedAttributes
                     )
                 }
                 let packed = packer.packEntry(
                     name: FSFileName(string: entry.name),
-                    itemType: fsItemType(entry.type),
-                    itemID: FSItem.Identifier(rawValue: entry.inode)
+                    itemType: fsItemType(entry.attributes.itemType),
+                    itemID: FSItem.Identifier(rawValue: entry.attributes.inode)
                         ?? .invalid,
                     nextCookie: FSDirectoryCookie(UInt64(index + 1)),
                     attributes: attributes
@@ -468,7 +482,11 @@ private func fsAttributes(
             ?? .invalid
     }
     if desired.isAttributeWanted(.parentID) {
-        attributes.parentID = parentIdentifier(for: item.currentPath())
+        let parentInode = source.parentInode == 0
+            ? item.parentInode()
+            : source.parentInode
+        attributes.parentID = FSItem.Identifier(rawValue: parentInode)
+            ?? .invalid
     }
     if desired.isAttributeWanted(.type) {
         attributes.type = item.itemType
@@ -497,21 +515,4 @@ private func fsAttributes(
         )
     }
     return attributes
-}
-
-private func parentIdentifier(for path: String) -> FSItem.Identifier {
-    guard !path.isEmpty else {
-        return FSItem.Identifier(rawValue: 1) ?? .invalid
-    }
-    let parent = (path as NSString).deletingLastPathComponent
-    let storagePath = parent.isEmpty ? "files" : "files/" + parent
-    var hash: UInt64 = 14_695_981_039_346_656_037
-    for byte in storagePath.utf8 {
-        hash ^= UInt64(byte)
-        hash &*= 1_099_511_628_211
-    }
-    if hash < 2 {
-        hash += 2
-    }
-    return FSItem.Identifier(rawValue: hash) ?? .invalid
 }

@@ -19,12 +19,9 @@ const (
 )
 
 // Caller describes the process on whose behalf an adapter is performing an
-// operation. Adapters should populate every field made available by their
-// platform. A zero value means that the platform did not provide the field.
+// operation. A zero PID means that the platform did not expose the caller.
 type Caller struct {
 	PID uint32
-	UID uint32
-	GID uint32
 }
 
 type callerContextKey struct{}
@@ -42,18 +39,19 @@ func CallerFromContext(ctx context.Context) (Caller, bool) {
 
 // Attributes contains the portable metadata exposed for an item.
 type Attributes struct {
-	Type       ItemType
-	Inode      uint64
-	Size       uint64
-	Blocks     uint64
-	Mode       uint32
-	UID        uint32
-	GID        uint32
-	LinkCount  uint32
-	AccessTime time.Time
-	ChangeTime time.Time
-	ModifyTime time.Time
-	BirthTime  time.Time
+	Type        ItemType
+	Inode       uint64
+	ParentInode uint64
+	Size        uint64
+	Blocks      uint64
+	Mode        uint32
+	UID         uint32
+	GID         uint32
+	LinkCount   uint32
+	AccessTime  time.Time
+	ChangeTime  time.Time
+	ModifyTime  time.Time
+	BirthTime   time.Time
 }
 
 // SetAttributes contains only the metadata fields requested by the caller.
@@ -68,15 +66,15 @@ type SetAttributes struct {
 
 // Entry is an item returned by a lookup or create operation.
 type Entry struct {
-	Path       string
 	Attributes Attributes
 }
 
 // DirectoryEntry is one item returned while enumerating a directory.
 type DirectoryEntry struct {
-	Name  string
-	Type  ItemType
-	Inode uint64
+	Name       string
+	Type       ItemType
+	Inode      uint64
+	Attributes Attributes
 }
 
 // Statistics describes capacity and inode information for a mounted volume.

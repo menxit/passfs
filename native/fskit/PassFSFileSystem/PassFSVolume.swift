@@ -1,14 +1,12 @@
 import Darwin
 import Foundation
 import FSKit
-import OSLog
 
 final class PassFSVolume: FSVolume,
                           FSVolume.ReadWriteOperations,
                           FSVolume.OpenCloseOperations {
     let bridge: PassFSBridge
     let rootItem: PassFSItem
-    let maximumFileSize: UInt64
 
     private let cacheLock = NSLock()
     private var itemCache: [UInt64: PassFSItem] = [:]
@@ -16,11 +14,9 @@ final class PassFSVolume: FSVolume,
 
     init(
         bridge: PassFSBridge,
-        maximumFileSize: UInt64,
         volumeUUID: UUID
     ) throws {
         self.bridge = bridge
-        self.maximumFileSize = maximumFileSize
         let rootAttributes = try bridge.lookup(path: "")
         rootItem = PassFSItem(path: "", attributes: rootAttributes)
         super.init(
@@ -50,12 +46,19 @@ final class PassFSVolume: FSVolume,
         bridge.close()
     }
 
+    func configure(_ configuration: PassFSConfiguration) throws {
+        try bridge.configure(
+            maximumFileSize: configuration.maximumFileSize,
+            unlockDurationNanoseconds: configuration.unlockDurationNanoseconds
+        )
+    }
+
     func item(path: String, attributes: BridgeAttributes) -> PassFSItem {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         if let cached = itemCache[attributes.inode],
            cached.itemType == fsItemType(attributes.itemType) {
-            cached.move(to: path)
+            cached.move(to: path, parentInode: attributes.parentInode)
             return cached
         }
         let item = PassFSItem(path: path, attributes: attributes)
@@ -71,7 +74,11 @@ final class PassFSVolume: FSVolume,
         cacheLock.unlock()
     }
 
-    func updateCachedPaths(from oldPath: String, to newPath: String) {
+    func updateCachedPaths(
+        from oldPath: String,
+        to newPath: String,
+        newParentInode: UInt64
+    ) {
         cacheLock.lock()
         let cachedItems = Array(itemCache.values)
         cacheLock.unlock()
@@ -79,19 +86,12 @@ final class PassFSVolume: FSVolume,
         for item in cachedItems {
             let path = item.currentPath()
             if path == oldPath {
-                item.move(to: newPath)
+                item.move(to: newPath, parentInode: newParentInode)
             } else if !prefix.isEmpty && path.hasPrefix(prefix) {
                 let suffix = String(path.dropFirst(prefix.count))
                 item.move(to: newPath + "/" + suffix)
             }
         }
-    }
-
-    func setVolumeName(
-        _ name: FSFileName,
-        replyHandler: @escaping (FSFileName?, (any Error)?) -> Void
-    ) {
-        replyHandler(FSFileName(string: "passfs"), POSIXError(.ENOTSUP))
     }
 
     var maximumLinkCount: Int { 1 }

@@ -80,17 +80,16 @@ func runUpdate(args []string, stdout, stderr io.Writer) error {
 		if _, statErr := os.Stat(configPath); statErr == nil {
 			command := exec.Command(
 				result.executable,
-				"reload",
-				"--config",
-				configPath,
+				"init",
+				"--no-open",
 			)
 			command.Stdout = stdout
 			command.Stderr = stderr
 			if reloadErr := command.Run(); reloadErr != nil {
 				return actionableError{
-					"passfs was updated, but its service could not be reloaded: " + reloadErr.Error(),
+					"passfs was updated, but its service could not be restarted: " + reloadErr.Error(),
 					"retry with:",
-					"  passfs reload",
+					"  passfs init",
 				}
 			}
 		} else if !errors.Is(statErr, os.ErrNotExist) {
@@ -181,7 +180,7 @@ func printCachedUpdateNotice(command string, writer io.Writer) {
 	}
 	switch command {
 	case "update", "serve", "__touchid-helper", "help", "--help", "-h",
-		"version", "--version", "-version", "__update-status":
+		"version", "--version", "-version", "__update-status", "__ui-status":
 		return
 	}
 	path, err := updateStatePath()

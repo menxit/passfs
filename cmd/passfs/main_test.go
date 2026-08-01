@@ -26,6 +26,22 @@ func TestUsageAdvertisesSingleFileUnprotectAndLLMDocs(t *testing.T) {
 	}
 }
 
+func TestConfigFlagProvidedRecognizesFlagForms(t *testing.T) {
+	for _, arguments := range [][]string{
+		{"--config", "/tmp/config.json"},
+		{"-config", "/tmp/config.json"},
+		{"--config=/tmp/config.json"},
+		{"-config=/tmp/config.json"},
+	} {
+		if !configFlagProvided(arguments) {
+			t.Fatalf("config flag not recognized in %#v", arguments)
+		}
+	}
+	if configFlagProvided([]string{"--no-mount"}) {
+		t.Fatal("unrelated flag was recognized as --config")
+	}
+}
+
 func TestEncryptWithoutMountExplainsHowToRecover(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "config.json")

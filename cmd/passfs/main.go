@@ -21,13 +21,11 @@ import (
 )
 
 var version = "0.1.0-dev"
-var errPlatformFilesystemApprovalRequired = errors.New(
-	"platform filesystem approval required",
-)
 
 const (
-	defaultMaxFileSize = 16 * 1024 * 1024
-	serviceWaitTimeout = 10 * time.Second
+	defaultMaxFileSize  = 16 * 1024 * 1024
+	serviceWaitTimeout  = 10 * time.Second
+	displacedTargetWait = 3 * time.Second
 )
 
 func main() {
@@ -131,6 +129,8 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runUpdate(args[1:], stdout, stderr)
 	case "__update-status":
 		return runCachedUpdateStatus(args[1:], stdout)
+	case "__ui-status":
+		return runUISnapshot(args[1:], stdout, stderr)
 	case "passwd":
 		return runPasswd(args[1:], stdout, stderr)
 	case "config":
@@ -161,6 +161,7 @@ Usage:
   passfs scan [options] [PATH...]
   passfs ignore [options] FILE...
   passfs unignore [options] FILE...
+  passfs ignored [options]
   passfs encrypt [options] FILE...
   passfs protected [options]
   passfs unprotect [options] [FILE]
@@ -243,6 +244,11 @@ func validateMaxFileSize(value int64) error {
 }
 
 func runInit(args []string, stdout, stderr io.Writer) error {
+	if !configFlagProvided(args) {
+		if err := migrateLegacyDefaultHome(stdout, stderr); err != nil {
+			return err
+		}
+	}
 	flags := flag.NewFlagSet("init", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var common commonFlags
@@ -268,7 +274,7 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	}
 	flags.StringVar(&vaultPath, "vault", defaultVault, "directory that stores encrypted data")
 	flags.StringVar(&mountPoint, "mount-point", defaultMountPoint, "directory where passfs is mounted")
-	flags.DurationVar(&unlockFor, "unlock-for", 0, "per-file authorization duration")
+	flags.DurationVar(&unlockFor, "unlock-for", 0, "authorization cache duration")
 	flags.BoolVar(
 		&disableTouchID,
 		"no-touchid",
@@ -413,6 +419,84 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	return runMount(mountArguments, stdout, stderr)
 }
 
+func configFlagProvided(args []string) bool {
+	for _, argument := range args {
+		if argument == "--config" || argument == "-config" ||
+			strings.HasPrefix(argument, "--config=") ||
+			strings.HasPrefix(argument, "-config=") {
+			return true
+		}
+	}
+	return false
+}
+
+func migrateLegacyDefaultHome(stdout, stderr io.Writer) error {
+	legacyPath, err := passfs.LegacySettingsPath()
+	if err != nil {
+		return err
+	}
+	defaultPath, err := passfs.DefaultSettingsPath()
+	if err != nil {
+		return err
+	}
+	if defaultPath != legacyPath {
+		return nil
+	}
+
+	settings, err := passfs.LoadSettings(legacyPath)
+	if err != nil {
+		return err
+	}
+	service, err := queryService()
+	if err != nil {
+		return err
+	}
+	mount, err := inspectMount(settings.MountPoint)
+	if err != nil {
+		return err
+	}
+	wasActive := service.Running || mount.mounted
+	if service.Installed || wasActive {
+		if err := runUnmount(
+			[]string{"--config", legacyPath},
+			io.Discard,
+			stderr,
+		); err != nil {
+			return fmt.Errorf("stop passfs before migrating its home: %w", err)
+		}
+	}
+
+	migrated, err := passfs.MigrateLegacyHome()
+	if err != nil {
+		if wasActive {
+			restartErr := runMount(
+				[]string{"--config", legacyPath, "--no-open"},
+				io.Discard,
+				stderr,
+			)
+			if restartErr != nil {
+				return errors.Join(
+					err,
+					fmt.Errorf("restore passfs after failed migration: %w", restartErr),
+				)
+			}
+		}
+		return err
+	}
+	if migrated {
+		currentPath, pathErr := passfs.DefaultSettingsPath()
+		if pathErr != nil {
+			return pathErr
+		}
+		fmt.Fprintf(
+			stdout,
+			"Migrated PassFS data to %s.\n",
+			terminalPath(filepath.Dir(currentPath)),
+		)
+	}
+	return nil
+}
+
 func runEncrypt(args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("encrypt", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -450,7 +534,7 @@ func runEncrypt(args []string, stdout, stderr io.Writer) error {
 
 	sourcePaths := make([]string, 0, flags.NArg())
 	for _, argument := range flags.Args() {
-		sourcePath, err := filepath.Abs(argument)
+		sourcePath, err := passfs.ResolvePathEntry(argument)
 		if err != nil {
 			return err
 		}
@@ -470,10 +554,46 @@ func runEncrypt(args []string, stdout, stderr io.Writer) error {
 	for _, sourcePath := range sourcePaths {
 		if err := passfs.ValidateImportThroughMount(
 			sourcePath,
+			settings.Vault,
 			settings.MountPoint,
 			maxFileSize,
 		); err != nil {
-			return fmt.Errorf("validate %s: %w", terminalPath(sourcePath), err)
+			targetPath, pathErr := passfs.ProtectedTargetForPath(
+				settings.Vault,
+				settings.MountPoint,
+				sourcePath,
+			)
+			if pathErr != nil {
+				return pathErr
+			}
+			replaceable, recoveryErr := waitForDisplacedProtectedTarget(
+				settings.Vault,
+				settings.MountPoint,
+				sourcePath,
+				targetPath,
+				maxFileSize,
+			)
+			if recoveryErr != nil {
+				return fmt.Errorf(
+					"inspect displaced protected file %s: %w",
+					terminalPath(sourcePath),
+					recoveryErr,
+				)
+			}
+			if !replaceable {
+				if retryErr := passfs.ValidateImportThroughMount(
+					sourcePath,
+					settings.Vault,
+					settings.MountPoint,
+					maxFileSize,
+				); retryErr != nil {
+					return fmt.Errorf(
+						"validate %s: %w",
+						terminalPath(sourcePath),
+						retryErr,
+					)
+				}
+			}
 		}
 	}
 
@@ -492,11 +612,6 @@ func runEncrypt(args []string, stdout, stderr io.Writer) error {
 				err,
 			)
 		}
-	} else if len(sourcePaths) > 1 {
-		fmt.Fprintln(
-			stderr,
-			"FSKit does not expose caller process IDs; each file requires its own authorization.",
-		)
 	}
 
 	encryptErr := encryptPaths(
@@ -526,20 +641,79 @@ func encryptPaths(
 	stdout io.Writer,
 ) error {
 	for _, sourcePath := range sourcePaths {
-		result, err := passfs.ImportThroughMount(
-			sourcePath,
+		targetPath, targetErr := passfs.ProtectedTargetForPath(
+			settings.Vault,
 			mountPoint,
-			maxFileSize,
-			func(sourcePath, targetPath string) error {
-				return adapter.RegisterProtectedLink(
-					settings,
+			sourcePath,
+		)
+		register := func(sourcePath, targetPath string) error {
+			return adapter.RegisterProtectedLink(
+				settings,
+				sourcePath,
+				targetPath,
+			)
+		}
+		var replaceable bool
+		var err error
+		if targetErr == nil {
+			err = withSettledLinkReconciliation(settings.Vault, func() error {
+				var inspectErr error
+				replaceable, inspectErr = passfs.CanReplaceDisplacedProtectedTarget(
+					settings.Vault,
+					mountPoint,
 					sourcePath,
 					targetPath,
+					maxFileSize,
 				)
-			},
-		)
+				return inspectErr
+			})
+		} else if !errors.Is(targetErr, os.ErrNotExist) {
+			return fmt.Errorf("resolve protected target for %s: %w", terminalPath(sourcePath), targetErr)
+		}
 		if err != nil {
 			return fmt.Errorf("encrypt %s: %w", terminalPath(sourcePath), err)
+		}
+
+		// Classification persists a displaced-link marker while holding the
+		// cross-process reconciliation lock. Release the lock before entering
+		// the mounted filesystem: the adapter may need the same lock to finish
+		// namespace housekeeping, and keeping it here would deadlock the CLI
+		// against FUSE/FSKit. The marker is the durable handoff that prevents
+		// background cleanup from deleting the previous ciphertext meanwhile.
+		if replaceable {
+			replaced, replaceErr := passfs.ReconcileProtectedEdit(
+				sourcePath,
+				targetPath,
+				maxFileSize,
+				register,
+			)
+			if replaceErr != nil {
+				return fmt.Errorf(
+					"encrypt %s: replace previous protected contents: %w",
+					terminalPath(sourcePath),
+					replaceErr,
+				)
+			}
+			if !replaced {
+				return fmt.Errorf(
+					"encrypt %s: replace previous protected contents: protected link was not restored",
+					terminalPath(sourcePath),
+				)
+			}
+			fmt.Fprintf(stdout, "Encrypted %s\n", terminalPath(sourcePath))
+			fmt.Fprintf(stdout, "Protected by %s\n", terminalPath(targetPath))
+			continue
+		}
+
+		result, importErr := passfs.ImportThroughMount(
+			sourcePath,
+			settings.Vault,
+			mountPoint,
+			maxFileSize,
+			register,
+		)
+		if importErr != nil {
+			return fmt.Errorf("encrypt %s: %w", terminalPath(sourcePath), importErr)
 		}
 		switch {
 		case result.Imported:
@@ -552,6 +726,45 @@ func encryptPaths(
 		fmt.Fprintf(stdout, "Protected by %s\n", terminalPath(result.TargetPath))
 	}
 	return nil
+}
+
+func withSettledLinkReconciliation(vault string, action func() error) error {
+	deadline := time.Now().Add(displacedTargetWait)
+	for {
+		err := passfs.WithLinkReconciliationLock(vault, action)
+		if !errors.Is(err, passfs.ErrLinkReconciliationInProgress) {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf(
+				"%w; retry after the protected link settles",
+				err,
+			)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func waitForDisplacedProtectedTarget(
+	vault string,
+	mountPoint string,
+	sourcePath string,
+	targetPath string,
+	maxFileSize int64,
+) (bool, error) {
+	var replaceable bool
+	err := withSettledLinkReconciliation(vault, func() error {
+		var err error
+		replaceable, err = passfs.CanReplaceDisplacedProtectedTarget(
+			vault,
+			mountPoint,
+			sourcePath,
+			targetPath,
+			maxFileSize,
+		)
+		return err
+	})
+	return replaceable, err
 }
 
 func runUnprotect(args []string, stdout, stderr io.Writer) error {
@@ -612,7 +825,7 @@ func runUnprotect(args []string, stdout, stderr io.Writer) error {
 	}
 	var sourcePath string
 	if flags.NArg() == 1 {
-		sourcePath, err = filepath.Abs(flags.Arg(0))
+		sourcePath, err = passfs.ResolvePathEntry(flags.Arg(0))
 		if err != nil {
 			return err
 		}
@@ -768,9 +981,17 @@ func unprotectFiles(
 	maxFileSize int64,
 	sourcePath string,
 ) (passfs.UnprotectReport, error) {
-	instanceLock, err := passfs.AcquireInstanceLock()
+	lockContext, cancelLockWait := context.WithTimeout(
+		context.Background(),
+		serviceWaitTimeout,
+	)
+	defer cancelLockWait()
+	instanceLock, err := passfs.AcquireInstanceLockContext(lockContext)
 	if err != nil {
-		return passfs.UnprotectReport{}, err
+		return passfs.UnprotectReport{}, fmt.Errorf(
+			"wait for the passfs service to stop: %w",
+			err,
+		)
 	}
 	defer instanceLock.Close()
 
@@ -860,11 +1081,15 @@ func runEdit(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	sourcePath, err := filepath.Abs(flags.Arg(0))
+	sourcePath, err := passfs.ResolvePathEntry(flags.Arg(0))
 	if err != nil {
 		return err
 	}
-	targetPath, err := passfs.MountedPath(settings.MountPoint, sourcePath)
+	targetPath, err := passfs.ProtectedTargetForPath(
+		settings.Vault,
+		settings.MountPoint,
+		sourcePath,
+	)
 	if err != nil {
 		return err
 	}
@@ -888,7 +1113,12 @@ func runEdit(args []string, stdout, stderr io.Writer) error {
 	if _, err := passfs.EnsureProtectedLink(sourcePath, targetPath); err != nil {
 		return err
 	}
-	if err := passfs.MarkProtectedLink(targetPath); err != nil {
+	if err := passfs.RegisterProtectedLinkInVault(
+		settings.Vault,
+		settings.MountPoint,
+		sourcePath,
+		targetPath,
+	); err != nil {
 		return fmt.Errorf("register protected link with passfs: %w", err)
 	}
 
@@ -926,11 +1156,6 @@ func runEdit(args []string, stdout, stderr io.Writer) error {
 				err,
 			)
 		}
-	} else {
-		fmt.Fprintln(
-			stderr,
-			"FSKit does not expose caller process IDs; the editor may request authorization more than once.",
-		)
 	}
 	commandErr := command.Run()
 	_, reconcileErr := passfs.ReconcileProtectedEdit(
@@ -1080,37 +1305,10 @@ func runMount(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 	}
-	if err := ensureMountDirectories(settings); err != nil {
-		return err
-	}
-	if entries, err := os.ReadDir(settings.MountPoint); err != nil {
-		return err
-	} else if len(entries) != 0 {
-		return fmt.Errorf(
-			"mount point %s is not empty",
-			terminalPath(settings.MountPoint),
-		)
-	}
-
-	executable, err := currentExecutable()
-	if err != nil {
-		return err
-	}
-	logHint := serviceLogHint(settings.Path())
-	logOffset := serviceLogOffset(logHint)
-	if err := installAndStartService(
-		executable,
-		settings.Path(),
-		adapter.Name(),
-	); err != nil {
-		return err
-	}
-	if err := waitForFilesystemMount(
+	if err := startFilesystemService(
 		settings,
 		adapter,
-		logHint,
-		logOffset,
-		!noOpen,
+		noOpen,
 		stdout,
 	); err != nil {
 		return err
@@ -1175,34 +1373,48 @@ func runReload(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 	if mount.mounted {
-		var unmountErr error
-		if status.Running {
-			unmountErr = waitForMountState(
-				settings.MountPoint,
-				false,
-				serviceWaitTimeout,
-			)
-		} else {
-			unmountErr = errors.New("orphaned passfs mount")
-		}
-		if unmountErr != nil {
-			if forceErr := passfs.UnmountPath(settings.MountPoint); forceErr != nil {
-				return errors.Join(
-					unmountErr,
-					fmt.Errorf("force unmount passfs: %w", forceErr),
-				)
-			}
-			if retryErr := waitForMountState(
-				settings.MountPoint,
-				false,
-				serviceWaitTimeout,
-			); retryErr != nil {
-				return errors.Join(unmountErr, retryErr)
-			}
+		if err := ensurePassFSMountStopped(
+			settings.MountPoint,
+			status.Running,
+		); err != nil {
+			return err
 		}
 	}
+	if err := startFilesystemService(
+		settings,
+		adapter,
+		noOpen,
+		stdout,
+	); err != nil {
+		return err
+	}
+	fmt.Fprintf(
+		stdout,
+		"Reloaded passfs at %s using %s\n",
+		terminalPath(settings.MountPoint),
+		adapter.Name(),
+	)
+	return nil
+}
+
+func startFilesystemService(
+	settings *passfs.Settings,
+	adapter filesystemAdapter,
+	noOpen bool,
+	stdout io.Writer,
+) error {
 	if err := ensureMountDirectories(settings); err != nil {
 		return err
+	}
+	entries, err := os.ReadDir(settings.MountPoint)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf(
+			"mount point %s is not empty",
+			terminalPath(settings.MountPoint),
+		)
 	}
 
 	executable, err := currentExecutable()
@@ -1218,22 +1430,43 @@ func runReload(args []string, stdout, stderr io.Writer) error {
 	); err != nil {
 		return err
 	}
-	if err := waitForFilesystemMount(
+	return waitForFilesystemMount(
 		settings,
 		adapter,
 		logHint,
 		logOffset,
 		!noOpen,
 		stdout,
-	); err != nil {
-		return err
-	}
-	fmt.Fprintf(
-		stdout,
-		"Reloaded passfs at %s using %s\n",
-		terminalPath(settings.MountPoint),
-		adapter.Name(),
 	)
+}
+
+func ensurePassFSMountStopped(mountPoint string, serviceWasRunning bool) error {
+	var gracefulErr error
+	if serviceWasRunning {
+		gracefulErr = waitForMountState(
+			mountPoint,
+			false,
+			serviceWaitTimeout,
+		)
+		if gracefulErr == nil {
+			return nil
+		}
+	} else {
+		gracefulErr = errors.New("orphaned passfs mount")
+	}
+	if forceErr := passfs.UnmountPath(mountPoint); forceErr != nil {
+		return errors.Join(
+			gracefulErr,
+			fmt.Errorf("force unmount passfs: %w", forceErr),
+		)
+	}
+	if retryErr := waitForMountState(
+		mountPoint,
+		false,
+		serviceWaitTimeout,
+	); retryErr != nil {
+		return errors.Join(gracefulErr, retryErr)
+	}
 	return nil
 }
 
@@ -1283,22 +1516,11 @@ func runUnmount(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if mount.mounted {
-		if !status.Running {
-			if err := passfs.UnmountPath(settings.MountPoint); err != nil {
-				return fmt.Errorf("remove orphaned passfs mount: %w", err)
-			}
-		}
-		if err := waitForMountState(settings.MountPoint, false, serviceWaitTimeout); err != nil {
-			if forceErr := passfs.UnmountPath(settings.MountPoint); forceErr != nil {
-				return errors.Join(err, fmt.Errorf("force unmount passfs: %w", forceErr))
-			}
-			if retryErr := waitForMountState(
-				settings.MountPoint,
-				false,
-				serviceWaitTimeout,
-			); retryErr != nil {
-				return errors.Join(err, retryErr)
-			}
+		if err := ensurePassFSMountStopped(
+			settings.MountPoint,
+			status.Running,
+		); err != nil {
+			return err
 		}
 	}
 	fmt.Fprintln(stdout, "Unmounted passfs and disabled automatic startup")
@@ -1497,7 +1719,7 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 	if err := addCommonFlags(flags, &common); err != nil {
 		return err
 	}
-	flags.StringVar(&unlockFor, "unlock-for", "", "set per-file authorization duration")
+	flags.StringVar(&unlockFor, "unlock-for", "", "set authorization cache duration")
 	flags.StringVar(&mountPoint, "mount-point", "", "set the global mount point")
 	flags.StringVar(
 		&adapterName,
@@ -1572,7 +1794,31 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 		requestedAdapter(settings),
 	)
 	if changed {
-		printReloadNotice(stdout)
+		mount, err := inspectMount(settings.MountPoint)
+		if err != nil {
+			return err
+		}
+		if mount.mounted {
+			if !mount.passfs {
+				return fmt.Errorf(
+					"%s is mounted by another filesystem",
+					terminalPath(settings.MountPoint),
+				)
+			}
+			if err := runReload(
+				[]string{"--config", settings.Path(), "--no-open"},
+				stdout,
+				stderr,
+			); err != nil {
+				return actionableError{
+					"the configuration was saved, but passfs could not apply it: " + err.Error(),
+					"retry with:",
+					"  passfs reload",
+				}
+			}
+		} else {
+			printReloadNotice(stdout)
+		}
 	}
 	return nil
 }

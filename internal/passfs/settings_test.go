@@ -1,6 +1,7 @@
 package passfs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,7 +9,7 @@ import (
 	"time"
 )
 
-func TestDefaultPathsUseDotConfig(t *testing.T) {
+func TestDefaultPathsUsePassFSHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -16,7 +17,7 @@ func TestDefaultPathsUseDotConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultSettingsPath: %v", err)
 	}
-	wantBase := filepath.Join(home, ".config", "passfs")
+	wantBase := filepath.Join(home, ".passfs")
 	if want := filepath.Join(wantBase, "config.json"); settingsPath != want {
 		t.Fatalf("settings path = %q, want %q", settingsPath, want)
 	}
@@ -35,6 +36,110 @@ func TestDefaultPathsUseDotConfig(t *testing.T) {
 	}
 	if want := filepath.Join(wantBase, "mnt"); mountPoint != want {
 		t.Fatalf("mount point = %q, want %q", mountPoint, want)
+	}
+}
+
+func TestDefaultSettingsPathUsesLegacyHomeUntilMigrated(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacy := filepath.Join(home, ".config", "passfs", "config.json")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DefaultSettingsPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != legacy {
+		t.Fatalf("settings path = %q, want legacy path %q", got, legacy)
+	}
+}
+
+func TestMigrateLegacyHomeMovesAndRewritesDefaultPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacyRoot := filepath.Join(home, ".config", "passfs")
+	legacySettings, err := NewSettings(
+		filepath.Join(legacyRoot, "config.json"),
+		filepath.Join(legacyRoot, "vault"),
+		filepath.Join(legacyRoot, "mnt"),
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySettings.TouchID = true
+	legacySettings.Adapter = "fskit"
+	if err := legacySettings.Save(); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(legacyRoot, "vault", "marker")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := MigrateLegacyHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated {
+		t.Fatal("legacy home was not migrated")
+	}
+	currentRoot := filepath.Join(home, ".passfs")
+	current, err := LoadSettings(filepath.Join(currentRoot, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Vault != filepath.Join(currentRoot, "vault") {
+		t.Fatalf("vault = %q", current.Vault)
+	}
+	if current.MountPoint != filepath.Join(currentRoot, "mnt") {
+		t.Fatalf("mount point = %q", current.MountPoint)
+	}
+	if !current.TouchID || current.Adapter != "fskit" {
+		t.Fatalf("settings not preserved: %#v", current)
+	}
+	if _, err := os.Stat(filepath.Join(currentRoot, "vault", "marker")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacyRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy root still exists: %v", err)
+	}
+}
+
+func TestMigrateLegacyHomePreservesExternalPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacyRoot := filepath.Join(home, ".config", "passfs")
+	external := filepath.Join(home, "PassFS Data")
+	settings, err := NewSettings(
+		filepath.Join(legacyRoot, "config.json"),
+		filepath.Join(external, "vault"),
+		filepath.Join(external, "mnt"),
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MigrateLegacyHome(); err != nil {
+		t.Fatal(err)
+	}
+	current, err := LoadSettings(filepath.Join(home, ".passfs", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Vault != filepath.Join(external, "vault") ||
+		current.MountPoint != filepath.Join(external, "mnt") {
+		t.Fatalf("external paths changed: %#v", current)
 	}
 }
 

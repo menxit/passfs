@@ -1,24 +1,16 @@
 #!/bin/sh
 
-# Reload an existing per-user service after an upgrade, then arrange for the
-# menu app to open only after the user closes Installer.
-console_user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)
-case "$console_user" in
-	"" | root | loginwindow | _mbsetupuser)
-		exit 0
-		;;
-esac
+# Migrate and restart an existing per-user service after an upgrade, then
+# arrange for the menu app to open only after the user closes Installer.
+script_directory=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+# shellcheck source=common.sh
+. "$script_directory/common.sh"
+passfs_load_console_user || exit 0
 
-user_id=$(/usr/bin/id -u "$console_user" 2>/dev/null || true)
-user_home=$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null |
-	/usr/bin/awk '{ print $2 }')
-if [ -z "$user_id" ] || [ -z "$user_home" ]; then
-	exit 0
-fi
-
-if [ -f "$user_home/.config/passfs/config.json" ]; then
-	/bin/launchctl asuser "$user_id" \
-		/usr/bin/sudo -H -u "$console_user" \
+if [ -f "$passfs_user_home/.passfs/config.json" ] ||
+	[ -f "$passfs_user_home/.config/passfs/config.json" ]; then
+	/bin/launchctl asuser "$passfs_user_id" \
+		/usr/bin/sudo -H -u "$passfs_console_user" \
 		/Applications/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli \
 		reload --no-open \
 		>/dev/null 2>&1 || true
@@ -35,12 +27,12 @@ fi
 # Installer UI is gone. This keeps the PassFS setup guide behind the package
 # installation instead of covering its final screen.
 postinstall_label=com.menxit.passfs.postinstall
-/bin/launchctl asuser "$user_id" \
-	/usr/bin/sudo -H -u "$console_user" \
+/bin/launchctl asuser "$passfs_user_id" \
+	/usr/bin/sudo -H -u "$passfs_console_user" \
 	/bin/launchctl remove "$postinstall_label" \
 	>/dev/null 2>&1 || true
-/bin/launchctl asuser "$user_id" \
-	/usr/bin/sudo -H -u "$console_user" \
+/bin/launchctl asuser "$passfs_user_id" \
+	/usr/bin/sudo -H -u "$passfs_console_user" \
 	/bin/launchctl submit -l "$postinstall_label" -- \
 	/bin/sh -c \
 	'while /usr/bin/pgrep -x Installer >/dev/null 2>&1; do

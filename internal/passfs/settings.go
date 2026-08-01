@@ -1,7 +1,6 @@
 package passfs
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +10,11 @@ import (
 )
 
 const settingsVersion = 2
+
+const (
+	defaultHomeName = ".passfs"
+	legacyHomeName  = ".config/passfs"
+)
 
 type Settings struct {
 	Version    int    `json:"version"`
@@ -28,7 +32,135 @@ func DefaultSettingsPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("find user home directory: %w", err)
 	}
-	return filepath.Join(homeDirectory, ".config", "passfs", "config.json"), nil
+	current := filepath.Join(homeDirectory, defaultHomeName, "config.json")
+	if _, err := os.Stat(current); err == nil {
+		return current, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect passfs settings: %w", err)
+	}
+	legacy := filepath.Join(homeDirectory, filepath.FromSlash(legacyHomeName), "config.json")
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect legacy passfs settings: %w", err)
+	}
+	return current, nil
+}
+
+// LegacySettingsPath returns the settings location used before ~/.passfs.
+// It is exposed so the CLI can stop a service using that path before moving
+// its mounted state directory.
+func LegacySettingsPath() (string, error) {
+	homeDirectory, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("find user home directory: %w", err)
+	}
+	return filepath.Join(
+		homeDirectory,
+		filepath.FromSlash(legacyHomeName),
+		"config.json",
+	), nil
+}
+
+// MigrateLegacyHome atomically moves the former ~/.config/passfs directory to
+// ~/.passfs and rewrites only paths that lived inside that directory. Callers
+// must stop the filesystem service first because the old directory contains
+// the mount point.
+func MigrateLegacyHome() (bool, error) {
+	homeDirectory, err := os.UserHomeDir()
+	if err != nil {
+		return false, fmt.Errorf("find user home directory: %w", err)
+	}
+	legacyRoot := filepath.Join(homeDirectory, filepath.FromSlash(legacyHomeName))
+	legacySettingsPath := filepath.Join(legacyRoot, "config.json")
+	currentRoot := filepath.Join(homeDirectory, defaultHomeName)
+	currentSettingsPath := filepath.Join(currentRoot, "config.json")
+
+	if _, err := os.Stat(currentSettingsPath); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("inspect current passfs settings: %w", err)
+	}
+	legacyInfo, err := os.Lstat(legacyRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect legacy passfs home: %w", err)
+	}
+	if !legacyInfo.IsDir() || legacyInfo.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("legacy passfs home %s is not a directory", legacyRoot)
+	}
+	if _, err := os.Stat(legacySettingsPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect legacy passfs settings: %w", err)
+	}
+	if _, err := os.Lstat(currentRoot); err == nil {
+		return false, fmt.Errorf(
+			"cannot migrate passfs: both %s and %s exist",
+			legacyRoot,
+			currentRoot,
+		)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("inspect current passfs home: %w", err)
+	}
+
+	legacySettings, err := LoadSettings(legacySettingsPath)
+	if err != nil {
+		return false, err
+	}
+	if err := os.Rename(legacyRoot, currentRoot); err != nil {
+		return false, fmt.Errorf("move passfs home to %s: %w", currentRoot, err)
+	}
+	rollback := func() {
+		_ = os.Rename(currentRoot, legacyRoot)
+	}
+	if err := os.Chmod(currentRoot, 0o700); err != nil {
+		rollback()
+		return false, fmt.Errorf("secure migrated passfs home: %w", err)
+	}
+
+	vault := migratedHomePath(legacySettings.Vault, legacyRoot, currentRoot)
+	mountPoint := migratedHomePath(
+		legacySettings.MountPoint,
+		legacyRoot,
+		currentRoot,
+	)
+	unlockFor, err := legacySettings.UnlockDuration()
+	if err != nil {
+		rollback()
+		return false, err
+	}
+	currentSettings, err := NewSettings(
+		currentSettingsPath,
+		vault,
+		mountPoint,
+		unlockFor,
+	)
+	if err != nil {
+		rollback()
+		return false, err
+	}
+	currentSettings.TouchID = legacySettings.TouchID
+	currentSettings.Adapter = legacySettings.Adapter
+	if err := currentSettings.Save(); err != nil {
+		rollback()
+		return false, fmt.Errorf("rewrite migrated passfs settings: %w", err)
+	}
+	return true, nil
+}
+
+func migratedHomePath(path, oldRoot, newRoot string) string {
+	relative, err := filepath.Rel(oldRoot, path)
+	if err != nil || relative == ".." || strings.HasPrefix(
+		relative,
+		".."+string(os.PathSeparator),
+	) {
+		return path
+	}
+	return filepath.Join(newRoot, relative)
 }
 
 func defaultConfigEntry(name string) (string, error) {
@@ -123,12 +255,7 @@ func (settings *Settings) Save() error {
 		return errors.New("settings path is not configured")
 	}
 	settings.Version = settingsVersion
-	data, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	if err := WriteFileAtomic(settings.path, data, 0o600); err != nil {
+	if err := WriteJSONFileAtomic(settings.path, settings, 0o600); err != nil {
 		return err
 	}
 	return nil

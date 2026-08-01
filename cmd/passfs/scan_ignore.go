@@ -129,15 +129,9 @@ func updateScanIgnoredPaths(
 			ignored[filepath.Clean(path)] = struct{}{}
 		}
 	}
-	sorted := sortedPathSet(ignored)
-	data, err := json.MarshalIndent(sorted, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	if err := passfs.WriteFileAtomic(
+	if err := passfs.WriteJSONFileAtomic(
 		scanIgnorePath(configPath),
-		data,
+		sortedPathSet(ignored),
 		0o600,
 	); err != nil {
 		return fmt.Errorf("save scan ignore list: %w", err)

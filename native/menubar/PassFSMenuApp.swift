@@ -1,5 +1,7 @@
 import AppKit
 import CoreServices
+import Darwin
+import Dispatch
 import Foundation
 import FSKit
 import OSLog
@@ -16,8 +18,8 @@ struct PassFSMenuApp: App {
         MenuBarExtra {
             PassFSMenuControls(
                 model: model,
-                manage: {
-                    appDelegate.showManager()
+                open: { tab in
+                    appDelegate.showManager(tab: tab)
                 }
             )
                 .task {
@@ -28,13 +30,15 @@ struct PassFSMenuApp: App {
                         for: .passFSFilesystemChanged
                     )
                 ) { _ in
-                    Task { await model.refresh(silent: true) }
+                    Task {
+                        await model.refresh(silent: true, includeScan: false)
+                    }
                 }
         } label: {
-            PassFSStatusIcon(unprotectedCount: model.unprotected.count)
+            PassFSStatusIcon()
                 .task {
                     appDelegate.configure(model: model)
-                    await model.runBackgroundRefreshLoop()
+                    await model.loadInitialSnapshot()
                 }
         }
         .menuBarExtraStyle(.menu)
@@ -68,9 +72,19 @@ private enum PassFSSetupLog {
     private static let maximumSize: UInt64 = 1_000_000
 
     static var url: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        let manager = FileManager.default
+        let home = manager.homeDirectoryForCurrentUser
+        let current = home.appendingPathComponent(".passfs", isDirectory: true)
+        let legacy = home
             .appendingPathComponent(".config", isDirectory: true)
             .appendingPathComponent("passfs", isDirectory: true)
+        let currentConfig = current.appendingPathComponent("config.json")
+        let legacyConfig = legacy.appendingPathComponent("config.json")
+        let directory = manager.fileExists(atPath: currentConfig.path) ||
+            !manager.fileExists(atPath: legacyConfig.path)
+            ? current
+            : legacy
+        return directory
             .appendingPathComponent("setup.log", isDirectory: false)
     }
 
@@ -139,38 +153,17 @@ private enum PassFSSetupLog {
 }
 
 private struct PassFSStatusIcon: View {
-    let unprotectedCount: Int
-
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Image(nsImage: PassFSMenuIcon.image)
-                .renderingMode(.template)
-                .frame(width: 18, height: 18)
-            if unprotectedCount > 0 {
-                Text(unprotectedCount > 99 ? "99+" : "\(unprotectedCount)")
-                    .font(.system(size: 8, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 3)
-                    .frame(minWidth: 12, minHeight: 12)
-                    .background(Color.red, in: Capsule())
-                    .offset(x: 7, y: -5)
-            }
-        }
-        .frame(width: 25, height: 18)
-        .accessibilityLabel(
-            unprotectedCount == 0
-                ? localized("PassFS, no unprotected files")
-                : localizedFormat(
-                    "PassFS, %lld unprotected files",
-                    Int64(unprotectedCount)
-                )
-        )
+        Image(nsImage: PassFSMenuIcon.image)
+            .renderingMode(.template)
+            .frame(width: 18, height: 18)
+            .accessibilityLabel("PassFS")
     }
 }
 
 private struct PassFSMenuControls: View {
     @ObservedObject var model: PassFSModel
-    let manage: () -> Void
+    let open: (PassFSTab) -> Void
 
     var body: some View {
         Label(
@@ -186,7 +179,7 @@ private struct PassFSMenuControls: View {
             if model.mounted {
                 model.stop()
             } else {
-                model.runAction(["init"])
+                model.start()
             }
         } label: {
             Label(
@@ -212,10 +205,33 @@ private struct PassFSMenuControls: View {
 
         Divider()
 
-        Button(action: manage) {
+        Button {
+            open(.unprotected)
+        } label: {
             Label(
-                localized("Manage PassFS…"),
-                systemImage: "slider.horizontal.3"
+                localizedFormat(
+                    "%lld unprotected secrets",
+                    Int64(model.unprotected.count)
+                ),
+                systemImage: PassFSTab.unprotected.symbol
+            )
+        }
+
+        Button {
+            open(.protected)
+        } label: {
+            Label(
+                localized(PassFSTab.protected.rawValue),
+                systemImage: PassFSTab.protected.symbol
+            )
+        }
+
+        Button {
+            open(.settings)
+        } label: {
+            Label(
+                localized(PassFSTab.settings.rawValue),
+                systemImage: PassFSTab.settings.symbol
             )
         }
 
@@ -224,7 +240,7 @@ private struct PassFSMenuControls: View {
         Button {
             NSApplication.shared.terminate(nil)
         } label: {
-            Label(localized("Quit PassFS"), systemImage: "power")
+            Label(localized("Quit PassFS App"), systemImage: "power")
         }
     }
 }
@@ -233,20 +249,15 @@ private struct PassFSMenuControls: View {
 private final class PassFSAppDelegate: NSObject, NSApplicationDelegate {
     private var setupWindow: NSWindow?
     private var managerWindow: NSWindow?
+    private let managerNavigation = PassFSManagerNavigation()
     private weak var model: PassFSModel?
     private var receivedFSKitSetupRequest = false
     private var receivedManagerRequest = false
-    private var startupTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if CommandLine.arguments.contains("--enable-fskit") {
-            receivedFSKitSetupRequest = true
-            showFSKitSetup()
-            return
-        }
-        startupTask = Task {
+        Task {
             try? await Task.sleep(for: .milliseconds(600))
-            guard !Task.isCancelled, !receivedFSKitSetupRequest else { return }
+            guard !receivedFSKitSetupRequest else { return }
             await initializeAndMount()
         }
     }
@@ -318,17 +329,27 @@ private final class PassFSAppDelegate: NSObject, NSApplicationDelegate {
 
     func configure(model: PassFSModel) {
         self.model = model
+        model.keepManagerVisible = { [weak self] in
+            self?.keepManagerVisible()
+        }
         if receivedManagerRequest {
             showManager()
         }
     }
 
-    func showManager() {
+    func showManager(tab: PassFSTab? = nil) {
         guard let model else {
             receivedManagerRequest = true
             return
         }
+        if let tab {
+            managerNavigation.tab = tab
+        }
+        model.setManagerVisible(true)
         receivedManagerRequest = false
+        Task {
+            await model.refresh(silent: true)
+        }
         if let managerWindow {
             NSApplication.shared.activate(ignoringOtherApps: true)
             managerWindow.makeKeyAndOrderFront(nil)
@@ -352,7 +373,10 @@ private final class PassFSAppDelegate: NSObject, NSApplicationDelegate {
         window.setFrameAutosaveName("PassFSManagerWindow")
         window.center()
         window.contentViewController = NSHostingController(
-            rootView: PassFSManagerView(model: model)
+            rootView: PassFSManagerView(
+                model: model,
+                navigation: managerNavigation
+            )
         )
         managerWindow = window
         NotificationCenter.default.addObserver(
@@ -361,12 +385,25 @@ private final class PassFSAppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                self?.model?.setManagerVisible(false)
                 self?.managerWindow = nil
             }
         }
 
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    private func keepManagerVisible() {
+        guard let managerWindow else {
+            showManager()
+            return
+        }
+        NSApplication.shared.unhide(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        managerWindow.deminiaturize(nil)
+        managerWindow.orderFrontRegardless()
+        managerWindow.makeKey()
     }
 
     func showFSKitSetup() {
@@ -754,7 +791,10 @@ private final class FSKitSetupModel: ObservableObject {
                     return
                 }
             }
-            try? await Task.sleep(for: .milliseconds(750))
+            // FSKit does not publish an approval-change notification. A
+            // two-second check keeps the one-time setup responsive without
+            // waking an unattended Mac more than necessary.
+            try? await Task.sleep(for: .seconds(2))
         }
     }
 
@@ -840,12 +880,10 @@ private final class FSKitSetupModel: ObservableObject {
         hasError = false
         message = nil
         do {
-            let touchIDStatus = try? await Task.detached(priority: .utility) {
-                try PassFSCommands.run(["touchid", "status"])
+            let touchIDEnabled = try? await Task.detached(priority: .utility) {
+                try PassFSCommands.loadSnapshot(includeScan: false).touchID
             }.value
-            if touchIDStatus?.localizedCaseInsensitiveContains(
-                "Touch ID: disabled"
-            ) == true {
+            if touchIDEnabled == false {
                 PassFSSetupLog.write(
                     "Touch ID is disabled; enabling it for the native FSKit adapter"
                 )
@@ -900,10 +938,10 @@ private enum PassFSMenuIcon {
 }
 
 private enum PassFSTab: String, CaseIterable, Identifiable {
-    case unprotected = "Unprotected"
-    case protected = "Protected"
+    case unprotected = "Unprotected Secrets"
+    case protected = "Protected Files"
     case ignored = "Ignored"
-    case advanced = "Advanced"
+    case settings = "Settings"
 
     var id: String { rawValue }
 
@@ -915,33 +953,38 @@ private enum PassFSTab: String, CaseIterable, Identifiable {
             return "lock.shield.fill"
         case .ignored:
             return "eye.slash.fill"
-        case .advanced:
+        case .settings:
             return "slider.horizontal.3"
         }
     }
 }
 
+@MainActor
+private final class PassFSManagerNavigation: ObservableObject {
+    @Published var tab = PassFSTab.unprotected
+}
+
 private struct PassFSManagerView: View {
     @ObservedObject var model: PassFSModel
+    @ObservedObject var navigation: PassFSManagerNavigation
 
     var body: some View {
-        PassFSPanel(model: model)
-            .task {
-                await model.refreshIfStale()
-            }
+        PassFSPanel(model: model, navigation: navigation)
             .onReceive(
                 NotificationCenter.default.publisher(
                     for: .passFSFilesystemChanged
                 )
             ) { _ in
-                Task { await model.refresh(silent: true) }
+                Task {
+                    await model.refresh(silent: true, includeScan: false)
+                }
             }
     }
 }
 
 private struct PassFSPanel: View {
     @ObservedObject var model: PassFSModel
-    @State private var tab = PassFSTab.unprotected
+    @ObservedObject var navigation: PassFSManagerNavigation
     @State private var search = ""
     @State private var pendingUnprotect: PassFSFile?
 
@@ -949,7 +992,7 @@ private struct PassFSPanel: View {
         VStack(spacing: 12) {
             header
 
-            Picker("", selection: $tab) {
+            Picker("", selection: $navigation.tab) {
                 ForEach(PassFSTab.allCases) { tab in
                     Label(localized(tab.rawValue), systemImage: tab.symbol)
                         .tag(tab)
@@ -959,7 +1002,7 @@ private struct PassFSPanel: View {
             .labelsHidden()
             .accessibilityLabel("Section")
 
-            if tab != .advanced {
+            if navigation.tab != .settings {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
@@ -982,7 +1025,7 @@ private struct PassFSPanel: View {
             }
 
             Group {
-                switch tab {
+                switch navigation.tab {
                 case .unprotected:
                     fileList(
                         files: model.filtered(model.unprotected, search: search),
@@ -1006,8 +1049,8 @@ private struct PassFSPanel: View {
                         actionTitle: "Restore",
                         action: { model.restore($0) }
                     )
-                case .advanced:
-                    AdvancedView(model: model)
+                case .settings:
+                    SettingsView(model: model)
                 }
             }
             .frame(minHeight: 330)
@@ -1112,9 +1155,9 @@ private struct PassFSPanel: View {
                 Text(localized(emptyText))
                     .font(.headline)
                 Text(localized(
-                    tab == .unprotected
+                    navigation.tab == .unprotected
                         ? "PassFS scans likely credential and project locations."
-                        : tab == .protected
+                        : navigation.tab == .protected
                             ? "Protect a detected file to see it here."
                             : "Ignored files can be restored to future scans."
                 ))
@@ -1132,6 +1175,9 @@ private struct PassFSPanel: View {
                                     FileRow(
                                         file: file,
                                         actionTitle: actionTitle,
+                                        actionPending: model.pendingFilePaths
+                                            .contains(file.path),
+                                        actionsDisabled: model.busy,
                                         action: { action(file) },
                                         showInFinder: {
                                             showInFinder(file)
@@ -1159,25 +1205,25 @@ private struct PassFSPanel: View {
     }
 
     private var emptyStateSymbol: String {
-        switch tab {
+        switch navigation.tab {
         case .unprotected:
             return "checkmark.shield.fill"
         case .protected:
             return "lock.shield.fill"
         case .ignored:
             return "eye.slash.fill"
-        case .advanced:
+        case .settings:
             return "slider.horizontal.3"
         }
     }
 
     private var emptyStateColor: Color {
-        switch tab {
+        switch navigation.tab {
         case .unprotected:
             return .green
         case .protected:
             return .blue
-        case .ignored, .advanced:
+        case .ignored, .settings:
             return Color(nsColor: .secondaryLabelColor)
         }
     }
@@ -1252,6 +1298,8 @@ private struct ProjectHeader: View {
 private struct FileRow: View {
     let file: PassFSFile
     let actionTitle: String
+    let actionPending: Bool
+    let actionsDisabled: Bool
     let action: () -> Void
     let showInFinder: () -> Void
     let secondaryActionTitle: String?
@@ -1316,13 +1364,22 @@ private struct FileRow: View {
                     .help("Show in Finder")
 
                     Button(action: action) {
-                        Label(
-                            localized(actionTitle),
-                            systemImage: actionSymbol
-                        )
+                        if actionPending {
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                Text(localized("Authorizing…"))
+                            }
+                        } else {
+                            Label(
+                                localized(actionTitle),
+                                systemImage: actionSymbol
+                            )
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .disabled(actionsDisabled)
                 }
                 if let secondaryActionTitle, let secondaryAction {
                     Button(action: secondaryAction) {
@@ -1334,6 +1391,7 @@ private struct FileRow: View {
                     .buttonStyle(.plain)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .disabled(actionsDisabled)
                 }
             }
         }
@@ -1380,7 +1438,7 @@ private struct FileRow: View {
     }
 }
 
-private struct AdvancedView: View {
+private struct SettingsView: View {
     @ObservedObject var model: PassFSModel
 
     var body: some View {
@@ -1415,7 +1473,7 @@ private struct AdvancedView: View {
 
                     HStack {
                         Button {
-                            model.runAction(["init"])
+                            model.start()
                         } label: {
                             Label("Start", systemImage: "play.fill")
                         }
@@ -1566,6 +1624,21 @@ private struct PassFSFile: Identifiable {
             ignored: false
         )
     }
+
+    func withIgnored(_ ignored: Bool) -> PassFSFile {
+        PassFSFile(
+            path: path,
+            title: title,
+            project: project,
+            size: size,
+            lastOpened: lastOpened,
+            preview: ignored
+                ? localized("Ignored by the secret scanner")
+                : preview,
+            protected: false,
+            ignored: ignored
+        )
+    }
 }
 
 private struct ProtectedRecord: Decodable {
@@ -1575,8 +1648,17 @@ private struct ProtectedRecord: Decodable {
     let accessedUnixNano: Int64?
 }
 
-private struct UpdateRecord: Decodable {
-    let available: String?
+private struct UISnapshotRecord: Decodable {
+    let unprotected: [String]?
+    let protected: [ProtectedRecord]
+    let ignored: [String]
+    let touchID: Bool
+    let unlockDurationNanoseconds: Int64
+    let initialized: Bool
+    let mounted: Bool
+    let availableUpdate: String?
+    let stateDirectory: String?
+    let vaultMetadataDirectory: String?
 }
 
 @MainActor
@@ -1590,13 +1672,21 @@ private final class PassFSModel: ObservableObject {
     @Published var mounted = false
     @Published var availableUpdate: String?
     @Published var busy = false
+    @Published private(set) var pendingFilePaths = Set<String>()
     @Published var showsBusyIndicator = false
     @Published var refreshing = false
     @Published var errorMessage: String?
     private var lastRefresh: Date?
     private var refreshInProgress = false
+    private var queuedRefresh = false
+    private var queuedScan = false
+    private var watchedDirectories = Set<String>()
+    private var requestedWatchDirectories = Set<String>()
+    private var managerVisible = false
+    private var filesystemWatchers: [DispatchSourceFileSystemObject] = []
+    private var filesystemRefreshTask: Task<Void, Never>?
+    var keepManagerVisible: (() -> Void)?
 
-    private static let backgroundRefreshInterval = Duration.seconds(5 * 60)
     private static let openRefreshMaximumAge: TimeInterval = 60
 
     init() {
@@ -1628,41 +1718,51 @@ private final class PassFSModel: ObservableObject {
         }
     }
 
-    func runBackgroundRefreshLoop() async {
-        await refresh(silent: true)
-        while !Task.isCancelled {
-            do {
-                try await Task.sleep(for: Self.backgroundRefreshInterval)
-            } catch {
-                return
-            }
-            await refresh(silent: true)
-        }
+    func loadInitialSnapshot() async {
+        await refresh(silent: true, includeScan: false)
     }
 
     func refreshIfStale() async {
         if let lastRefresh,
-           Date().timeIntervalSince(lastRefresh) <
-            Self.openRefreshMaximumAge {
+           Date().timeIntervalSince(lastRefresh) < Self.openRefreshMaximumAge {
             return
         }
-        await refresh(silent: true)
+        // Opening the lightweight menu must never start a repository/home
+        // scan. The manager window performs that work in the background when
+        // the user actually asks to manage secrets.
+        await refresh(silent: true, includeScan: false)
     }
 
-    func refresh(silent: Bool) async {
-        guard !busy, !refreshInProgress else { return }
+    func refresh(silent: Bool, includeScan: Bool = true) async {
+        guard !busy else { return }
+        if refreshInProgress {
+            queuedRefresh = true
+            queuedScan = queuedScan || includeScan
+            return
+        }
         refreshInProgress = true
         refreshing = !silent
         defer {
             refreshInProgress = false
             refreshing = false
+            if queuedRefresh {
+                let scan = queuedScan
+                queuedRefresh = false
+                queuedScan = false
+                Task { [weak self] in
+                    await self?.refresh(silent: true, includeScan: scan)
+                }
+            }
         }
         if !silent { errorMessage = nil }
         do {
-            let snapshot = try await Task.detached(priority: .userInitiated) {
-                try PassFSCommands.loadSnapshot()
+            let priority: TaskPriority = silent ? .utility : .userInitiated
+            let snapshot = try await Task.detached(priority: priority) {
+                try PassFSCommands.loadSnapshot(includeScan: includeScan)
             }.value
-            unprotected = snapshot.unprotected
+            if let refreshedUnprotected = snapshot.unprotected {
+                unprotected = refreshedUnprotected
+            }
             protected = snapshot.protected
             ignored = snapshot.ignored
             touchIDEnabled = snapshot.touchID
@@ -1670,6 +1770,12 @@ private final class PassFSModel: ObservableObject {
             initialized = snapshot.initialized
             mounted = snapshot.mounted
             availableUpdate = snapshot.availableUpdate
+            configureFilesystemWatchers(
+                directories: [
+                    snapshot.stateDirectory,
+                    snapshot.vaultMetadataDirectory,
+                ].compactMap { $0 }
+            )
             lastRefresh = Date()
             if !silent { errorMessage = nil }
         } catch {
@@ -1679,11 +1785,71 @@ private final class PassFSModel: ObservableObject {
         }
     }
 
+    private func configureFilesystemWatchers(
+        directories: [String]
+    ) {
+        let requested = Set(directories.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        })
+        requestedWatchDirectories = requested
+        rebuildFilesystemWatchers()
+    }
+
+    func setManagerVisible(_ visible: Bool) {
+        managerVisible = visible
+        rebuildFilesystemWatchers()
+    }
+
+    private func rebuildFilesystemWatchers() {
+        let requested = managerVisible ? requestedWatchDirectories : []
+        guard requested != watchedDirectories else { return }
+
+        filesystemRefreshTask?.cancel()
+        filesystemRefreshTask = nil
+        filesystemWatchers.forEach { $0.cancel() }
+        filesystemWatchers.removeAll()
+        watchedDirectories = requested
+
+        for directory in requested.sorted() {
+            let descriptor = open(directory, O_EVTONLY)
+            guard descriptor >= 0 else { continue }
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.write, .delete, .rename],
+                queue: .global(qos: .utility)
+            )
+            source.setEventHandler { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.scheduleFilesystemRefresh()
+                }
+            }
+            source.setCancelHandler {
+                close(descriptor)
+            }
+            source.resume()
+            filesystemWatchers.append(source)
+        }
+    }
+
+    private func scheduleFilesystemRefresh() {
+        filesystemRefreshTask?.cancel()
+        filesystemRefreshTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(300))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            await self.refresh(silent: true, includeScan: false)
+        }
+    }
+
     func protect(_ file: PassFSFile) {
         let previousUnprotected = unprotected
         let previousProtected = protected
-        runOptimisticAction(
+        runAuthorizedFileAction(
             ["encrypt", file.path],
+            path: file.path,
             apply: {
                 self.unprotected.removeAll { $0.path == file.path }
                 self.protected.removeAll { $0.path == file.path }
@@ -1698,30 +1864,76 @@ private final class PassFSModel: ObservableObject {
     }
 
     func unprotect(_ file: PassFSFile) {
-        runAction(["unprotect", "--yes", "--prompt", "native", file.path])
+        let previousUnprotected = unprotected
+        let previousProtected = protected
+        runAuthorizedFileAction(
+            ["unprotect", "--yes", "--prompt", "native", file.path],
+            path: file.path,
+            apply: {
+                self.protected.removeAll { $0.path == file.path }
+            },
+            rollback: {
+                self.unprotected = previousUnprotected
+                self.protected = previousProtected
+            }
+        )
     }
 
     func ignore(_ file: PassFSFile) {
-        runAction(["ignore", file.path])
+        let previousUnprotected = unprotected
+        let previousIgnored = ignored
+        runOptimisticAction(
+            ["ignore", file.path],
+            apply: {
+                self.unprotected.removeAll { $0.path == file.path }
+                self.ignored.removeAll { $0.path == file.path }
+                self.ignored.append(file.withIgnored(true))
+                self.ignored.sort { $0.lastOpened > $1.lastOpened }
+            },
+            rollback: {
+                self.unprotected = previousUnprotected
+                self.ignored = previousIgnored
+            }
+        )
     }
 
     func restore(_ file: PassFSFile) {
-        runAction(["unignore", file.path])
+        let previousUnprotected = unprotected
+        let previousIgnored = ignored
+        runOptimisticAction(
+            ["unignore", file.path],
+            apply: {
+                self.ignored.removeAll { $0.path == file.path }
+                self.unprotected.removeAll { $0.path == file.path }
+                self.unprotected.append(file.withIgnored(false))
+                self.unprotected.sort { $0.lastOpened > $1.lastOpened }
+            },
+            rollback: {
+                self.unprotected = previousUnprotected
+                self.ignored = previousIgnored
+            }
+        )
     }
 
     func setTouchID(_ enabled: Bool) {
-        runAction(["touchid", enabled ? "enable" : "disable", "--prompt", "native"])
+        let previous = touchIDEnabled
+        runOptimisticAction(
+            ["touchid", enabled ? "enable" : "disable", "--prompt", "native"],
+            apply: {
+                self.touchIDEnabled = enabled
+            },
+            rollback: {
+                self.touchIDEnabled = previous
+            }
+        )
     }
 
     func applyUnlockDuration() {
         let minutes = max(0, unlockMinutes)
         unlockMinutes = minutes
-        var commands = [[
+        let commands = [[
             "config", "--unlock-for", "\(minutes)m",
         ]]
-        if mounted {
-            commands.append(["reload", "--no-open"])
-        }
         performAction(
             commands,
             showsProgress: true,
@@ -1743,6 +1955,22 @@ private final class PassFSModel: ObservableObject {
         )
     }
 
+    func start() {
+        let previousInitialized = initialized
+        let previousMounted = mounted
+        runOptimisticAction(
+            ["init"],
+            apply: {
+                self.initialized = true
+                self.mounted = true
+            },
+            rollback: {
+                self.initialized = previousInitialized
+                self.mounted = previousMounted
+            }
+        )
+    }
+
     func runAction(_ arguments: [String]) {
         performAction(
             [arguments],
@@ -1754,28 +1982,62 @@ private final class PassFSModel: ObservableObject {
 
     private func runOptimisticAction(
         _ arguments: [String],
-        apply: () -> Void,
-        rollback: @escaping () -> Void
+        apply: @escaping () -> Void,
+        rollback: @escaping () -> Void,
+        completion: @escaping () -> Void = {}
     ) {
         performAction(
             [arguments],
             showsProgress: false,
             apply: apply,
-            rollback: rollback
+            rollback: rollback,
+            completion: completion
+        )
+    }
+
+    private func runAuthorizedFileAction(
+        _ arguments: [String],
+        path: String,
+        apply: @escaping () -> Void,
+        rollback: @escaping () -> Void
+    ) {
+        guard !busy else { return }
+        pendingFilePaths.insert(path)
+        keepManagerVisible?()
+        performAction(
+            [arguments],
+            showsProgress: false,
+            appliesOptimistically: false,
+            apply: { [weak self] in
+                apply()
+                guard let self else { return }
+                self.pendingFilePaths.remove(path)
+                self.keepManagerVisible?()
+            },
+            rollback: rollback,
+            completion: { [weak self] in
+                guard let self else { return }
+                self.pendingFilePaths.remove(path)
+                self.keepManagerVisible?()
+            }
         )
     }
 
     private func performAction(
         _ commands: [[String]],
         showsProgress: Bool,
-        apply: () -> Void,
-        rollback: @escaping () -> Void
+        appliesOptimistically: Bool = true,
+        apply: @escaping () -> Void,
+        rollback: @escaping () -> Void,
+        completion: @escaping () -> Void = {}
     ) {
         guard !busy else { return }
         busy = true
         showsBusyIndicator = showsProgress
         errorMessage = nil
-        apply()
+        if appliesOptimistically {
+            apply()
+        }
         Task {
             do {
                 _ = try await Task.detached(priority: .userInitiated) {
@@ -1783,21 +2045,28 @@ private final class PassFSModel: ObservableObject {
                         _ = try PassFSCommands.run(arguments)
                     }
                 }.value
+                if !appliesOptimistically {
+                    apply()
+                }
                 busy = false
                 showsBusyIndicator = false
-                await refresh(silent: true)
+                await refresh(silent: true, includeScan: false)
+                completion()
             } catch {
-                rollback()
+                if appliesOptimistically {
+                    rollback()
+                }
                 errorMessage = error.localizedDescription
                 busy = false
                 showsBusyIndicator = false
+                completion()
             }
         }
     }
 }
 
 private struct PassFSSnapshot {
-    let unprotected: [PassFSFile]
+    let unprotected: [PassFSFile]?
     let protected: [PassFSFile]
     let ignored: [PassFSFile]
     let touchID: Bool
@@ -1805,6 +2074,25 @@ private struct PassFSSnapshot {
     let initialized: Bool
     let mounted: Bool
     let availableUpdate: String?
+    let stateDirectory: String?
+    let vaultMetadataDirectory: String?
+}
+
+private final class PassFSPipeReader: @unchecked Sendable {
+    private let handle: FileHandle
+    private(set) var data = Data()
+
+    init(_ handle: FileHandle) {
+        self.handle = handle
+    }
+
+    func start(in group: DispatchGroup) {
+        group.enter()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            data = handle.readDataToEndOfFile()
+            group.leave()
+        }
+    }
 }
 
 private enum PassFSCommands {
@@ -1826,13 +2114,24 @@ private enum PassFSCommands {
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment["PASSFS_NO_UPDATE_NOTICE"] = "1"
+        if ProcessInfo.processInfo.isLowPowerModeEnabled {
+            environment["PASSFS_LOW_POWER_MODE"] = "1"
+        } else {
+            environment.removeValue(forKey: "PASSFS_LOW_POWER_MODE")
+        }
         process.environment = environment
         process.standardOutput = output
         process.standardError = errors
         try process.run()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let outputReader = PassFSPipeReader(output.fileHandleForReading)
+        let errorReader = PassFSPipeReader(errors.fileHandleForReading)
+        let readers = DispatchGroup()
+        outputReader.start(in: readers)
+        errorReader.start(in: readers)
         process.waitUntilExit()
-        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+        readers.wait()
+        let data = outputReader.data
+        let errorData = errorReader.data
         if process.terminationStatus != 0 {
             let detail = String(data: errorData, encoding: .utf8) ??
                 "PassFS command failed"
@@ -1842,22 +2141,7 @@ private enum PassFSCommands {
     }
 
     static func fsKitFilesystemMounted() -> Bool {
-        guard let status = try? run(["status"]) else {
-            return false
-        }
-        return filesystemMounted(in: status)
-    }
-
-    private static func filesystemMounted(in status: String) -> Bool {
-        return status.split(separator: "\n").contains {
-            let line = $0.trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("Filesystem:") else {
-                return false
-            }
-            let value = line.dropFirst("Filesystem:".count)
-                .trimmingCharacters(in: .whitespaces)
-            return value == "mounted"
-        }
+        (try? loadSnapshot(includeScan: false).mounted) ?? false
     }
 
     static func gatekeeperAssessment() -> (
@@ -1894,13 +2178,17 @@ private enum PassFSCommands {
         )
     }
 
-    static func loadSnapshot() throws -> PassFSSnapshot {
+    static func loadSnapshot(includeScan: Bool) throws -> PassFSSnapshot {
         let decoder = JSONDecoder()
-        let unprotectedPaths = try decoder.decode(
-            [String].self,
-            from: Data(try run(["scan", "--json"]).utf8)
+        var arguments = ["__ui-status"]
+        if !includeScan {
+            arguments.append("--no-scan")
+        }
+        let snapshot = try decoder.decode(
+            UISnapshotRecord.self,
+            from: Data(try run(arguments).utf8)
         )
-        let unprotected = unprotectedPaths.map {
+        let unprotected = snapshot.unprotected?.map {
             makeFile(
                 path: $0,
                 protected: false,
@@ -1910,11 +2198,7 @@ private enum PassFSCommands {
                 accessed: nil
             )
         }
-        let ignoredPaths = try decoder.decode(
-            [String].self,
-            from: Data(try run(["ignored", "--json"]).utf8)
-        )
-        let ignored = ignoredPaths.map {
+        let ignored = snapshot.ignored.map {
             makeFile(
                 path: $0,
                 protected: false,
@@ -1924,103 +2208,42 @@ private enum PassFSCommands {
                 accessed: nil
             )
         }
-
-        var protected: [PassFSFile] = []
-        var status = "PassFS is not initialized"
-        var touchID = true
-        var unlockMinutes = 0
-        var initialized = false
-        var mounted = false
-        let updateRecord = try? decoder.decode(
-            UpdateRecord.self,
-            from: Data(try run(["__update-status"]).utf8)
-        )
-        do {
-            let records = try decoder.decode(
-                [ProtectedRecord].self,
-                from: Data(try run(["protected", "--json"]).utf8)
+        let protected = snapshot.protected.map {
+            makeFile(
+                path: $0.path,
+                protected: true,
+                ignored: false,
+                size: Int64(clamping: $0.size),
+                modified: Date(
+                    timeIntervalSince1970: Double($0.modifiedUnixNano) / 1_000_000_000
+                ),
+                accessed: $0.accessedUnixNano.flatMap {
+                    $0 > 0
+                        ? Date(
+                            timeIntervalSince1970: Double($0) / 1_000_000_000
+                        )
+                        : nil
+                }
             )
-            protected = records.map {
-                makeFile(
-                    path: $0.path,
-                    protected: true,
-                    ignored: false,
-                    size: Int64(clamping: $0.size),
-                    modified: Date(
-                        timeIntervalSince1970: Double($0.modifiedUnixNano) / 1_000_000_000
-                    ),
-                    accessed: $0.accessedUnixNano.flatMap {
-                        $0 > 0
-                            ? Date(
-                                timeIntervalSince1970: Double($0) / 1_000_000_000
-                            )
-                            : nil
-                    }
-                )
-            }
-            initialized = true
-            status = try run(["status"])
-            mounted = filesystemMounted(in: status)
-            let touchIDStatus = try run(["touchid", "status"])
-            touchID = touchIDStatus.contains("Touch ID:           enabled") ||
-                touchIDStatus.contains("Touch ID: enabled")
-            let configuration = try run(["config"])
-            let unlockDuration = configuration
-                .split(separator: "\n")
-                .first(where: { $0.hasPrefix("Unlock for:") })
-                .map { $0.dropFirst("Unlock for:".count).trimmingCharacters(in: .whitespaces) } ??
-                "0m"
-            unlockMinutes = durationMinutes(unlockDuration)
-        } catch {
-            // Scanning remains useful before the first `passfs init`.
         }
         let newestFirst: (PassFSFile, PassFSFile) -> Bool = {
             $0.lastOpened > $1.lastOpened
         }
         return PassFSSnapshot(
-            unprotected: unprotected.sorted(by: newestFirst),
+            unprotected: unprotected?.sorted(by: newestFirst),
             protected: protected.sorted(by: newestFirst),
             ignored: ignored.sorted(by: newestFirst),
-            touchID: touchID,
-            unlockMinutes: unlockMinutes,
-            initialized: initialized,
-            mounted: mounted,
-            availableUpdate: updateRecord?.available
+            touchID: snapshot.touchID,
+            unlockMinutes: max(
+                0,
+                Int(snapshot.unlockDurationNanoseconds / 60_000_000_000)
+            ),
+            initialized: snapshot.initialized,
+            mounted: snapshot.mounted,
+            availableUpdate: snapshot.availableUpdate,
+            stateDirectory: snapshot.stateDirectory,
+            vaultMetadataDirectory: snapshot.vaultMetadataDirectory
         )
-    }
-
-    private static func durationMinutes(_ value: String) -> Int {
-        let expression = try? NSRegularExpression(
-            pattern: #"(\d+(?:\.\d+)?)(ns|us|µs|μs|ms|s|m|h)"#
-        )
-        let range = NSRange(value.startIndex..., in: value)
-        let matches = expression?.matches(in: value, range: range) ?? []
-        var covered = 0
-        var seconds = 0.0
-        for match in matches {
-            guard match.range.location == covered,
-                  let amountRange = Range(match.range(at: 1), in: value),
-                  let unitRange = Range(match.range(at: 2), in: value),
-                  let amount = Double(value[amountRange]) else {
-                return 0
-            }
-            let multiplier: Double
-            switch value[unitRange] {
-            case "h": multiplier = 60 * 60
-            case "m": multiplier = 60
-            case "s": multiplier = 1
-            case "ms": multiplier = 1e-3
-            case "us", "µs", "μs": multiplier = 1e-6
-            case "ns": multiplier = 1e-9
-            default: return 0
-            }
-            seconds += amount * multiplier
-            covered = NSMaxRange(match.range)
-        }
-        guard covered == range.length, seconds.isFinite, seconds >= 0 else {
-            return 0
-        }
-        return Int((seconds / 60).rounded(.up))
     }
 
     private static func makeFile(

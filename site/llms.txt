@@ -2,8 +2,8 @@
 
 > PassFS keeps selected local files encrypted at rest while applications
 > continue opening them at their original paths. It uses age encryption, one
-> local FUSE filesystem, and symbolic links. Supported platforms are macOS and
-> Linux.
+> local virtual filesystem, and symbolic links. Supported platforms are macOS
+> and Linux.
 
 This document is the canonical machine-readable guide for installing and using
 PassFS. Prefer the commands shown here over inventing configuration files or
@@ -21,7 +21,7 @@ calling internal commands.
   protected file.
 - Both unprotect forms display a warning and require the exact confirmation
   token `UNPROTECT` from a real terminal. Do not bypass this confirmation.
-- Do not edit `~/.config/passfs/config.json`, the vault metadata, ciphertext, or
+- Do not edit `~/.passfs/config.json`, the vault metadata, ciphertext, or
   protected symbolic links directly.
 - Never replace a protected symbolic link with a regular file. Prefer
   `passfs edit FILE` for editors that use atomic replacement.
@@ -35,14 +35,17 @@ Download the signed and notarized universal installer:
 https://getpassfs.com/releases/latest/PassFS-macos-universal.pkg
 
 The package installs `/Applications/PassFS.app` and `/usr/local/bin/passfs`.
-Then run:
+Open PassFS after installation. It initializes and mounts automatically. The
+same operation is available from the terminal:
 
 ```sh
-passfs setup
+passfs init
 ```
 
-`passfs setup` checks macFUSE and gives the required installation instructions.
-PassFS never installs a macOS system extension silently.
+PassFS uses the native Apple FSKit frontend on supported macOS versions. If
+one-time approval is required, the app opens the relevant system control and
+continues automatically afterward. macFUSE remains a compatibility frontend
+for older macOS versions.
 
 ### Linux
 
@@ -58,13 +61,10 @@ when necessary. System package installation may request `sudo`.
 
 ## Initialize and mount
 
-Run these commands once after installation:
+Run once after installation:
 
 ```sh
-passfs setup
 passfs init
-passfs mount
-passfs status
 ```
 
 `passfs init` is interactive. It creates one passphrase-protected age identity
@@ -74,14 +74,15 @@ Touch ID is enabled by default.
 Default paths:
 
 ```text
-Settings:    ~/.config/passfs/config.json
-Vault:       ~/.config/passfs/vault
-Mount point: ~/.config/passfs/mnt
-Backup key:  ~/.config/passfs/vault/.passfs/identity.age
+Settings:    ~/.passfs/config.json
+Vault:       ~/.passfs/vault
+Mount point: ~/.passfs/mnt
+Backup key:  ~/.passfs/vault/.passfs/identity.age
 ```
 
-`passfs mount` starts a supervised background service and returns. Only one
-PassFS filesystem is used for all files.
+`passfs init` also selects the best filesystem frontend, mounts it, and starts
+a supervised background service. Only one PassFS filesystem is used for all
+files.
 
 ## Protect files
 
@@ -110,22 +111,19 @@ passfs doctor
 test -L /absolute/path/to/.env
 ```
 
-### Repository secret audit
+### Find unprotected secrets
 
-When asked to find and protect likely secret files in a repository:
+Run the interactive scanner from a repository or user-data directory:
 
-1. Do not read, print, copy, or transmit file contents or secret values.
-2. Find candidates from filenames, file types, `.gitignore`, and Git metadata.
-3. Consider `.env` and `.env.*`, credentials, secrets, private keys, and local
-   configuration. Exclude examples, templates, tests, dependencies, build
-   output, `.git`, symbolic links, and files already protected by PassFS.
-4. Do not modify tracked candidates. Report them separately because Git history
-   may already contain their contents.
-5. Run `passfs doctor`. If it succeeds, call `passfs encrypt` exactly once with
-   every untracked or ignored regular-file candidate as a separate argument.
-   Insert `--` before the paths.
-6. Verify only that every original pathname is now a symbolic link, then report
-   paths and results without contents.
+```sh
+passfs scan
+passfs scan --all
+```
+
+Results are grouped by project. Git-tracked files, package vendors, build
+output, system trees, examples, tests, and existing protected links are
+excluded. Select candidates to protect or ignore directly from the prompt.
+Secret values are never printed.
 
 ## Edit a protected file
 
@@ -144,10 +142,9 @@ While PassFS is running, a rename or move to another directory on the same
 filesystem is tracked automatically, including a renamed parent directory.
 Deleting the link deletes its ciphertext shortly afterward.
 
-If the link is already missing when PassFS starts, the ciphertext is preserved:
-an offline move and deletion cannot be distinguished safely. Recover an offline
-move by returning the link to its original pathname, starting PassFS, and then
-repeating the move while the service is running.
+When PassFS starts, it reconciles protected links renamed, moved, or deleted
+while the filesystem was stopped. Moved links retain their contents at the new
+pathname; deleted links also remove their encrypted copies.
 
 ## Remove protection from one file
 
@@ -185,24 +182,22 @@ Require authorization for every file open:
 
 ```sh
 passfs config --unlock-for 0
-passfs reload
 ```
 
-Cache authorization for each file for five minutes in PassFS process memory:
+Keep the vault unlocked for five minutes in PassFS process memory:
 
 ```sh
 passfs config --unlock-for 5m
-passfs reload
 ```
 
-The cache is per file and never stored on disk.
+The cache applies to the whole vault and is never stored on disk. A running
+filesystem is restarted automatically so the new duration applies immediately.
 
 ## Service and diagnostics
 
 ```sh
 passfs status
 passfs doctor
-passfs doctor --test-prompt
 passfs reload
 passfs unmount
 passfs mount
@@ -234,7 +229,7 @@ Touch ID is device-local and is not a recovery key.
 Back up this file to secure offline storage:
 
 ```text
-~/.config/passfs/vault/.passfs/identity.age
+~/.passfs/vault/.passfs/identity.age
 ```
 
 It is the single age private identity needed to recover every protected file.

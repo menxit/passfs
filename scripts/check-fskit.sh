@@ -7,21 +7,6 @@ project_root=$(
 		pwd
 )
 
-case "$(uname -m)" in
-	arm64)
-		go_architecture=arm64
-		xcode_architecture=arm64
-		;;
-	x86_64)
-		go_architecture=amd64
-		xcode_architecture=x86_64
-		;;
-	*)
-		echo "unsupported macOS architecture: $(uname -m)" >&2
-		exit 1
-		;;
-esac
-
 build_directory=$(mktemp -d "${TMPDIR:-/tmp}/passfs-fskit-check.XXXXXX")
 cleanup()
 {
@@ -39,6 +24,11 @@ if ! xcrun --find xcodebuild >/dev/null 2>&1; then
 	exit 1
 fi
 
+xcode_architecture=$(
+	"$project_root/scripts/build-fskit-bridge.sh" \
+		"$build_directory/libpassfs_bridge.a" "$(uname -m)"
+)
+
 xcrun swiftc \
 	-parse-as-library \
 	-target "$xcode_architecture-apple-macos13.0" \
@@ -50,21 +40,6 @@ xcrun swiftc \
 	-framework SwiftUI \
 	-o "$build_directory/PassFS" \
 	"$project_root/native/menubar/PassFSMenuApp.swift"
-
-(
-	cd "$project_root"
-	CGO_ENABLED=1 \
-	GOOS=darwin \
-	GOARCH="$go_architecture" \
-	CGO_CFLAGS="-arch $xcode_architecture" \
-	CGO_LDFLAGS="-arch $xcode_architecture" \
-		env -u GOROOT GOWORK=off go build \
-		-trimpath \
-		-buildmode=c-archive \
-		-o "$build_directory/libpassfs_bridge.a" \
-		./cmd/passfs-fskit-bridge
-)
-
 DEVELOPER_DIR=${DEVELOPER_DIR:-$(xcode-select -p)} \
 xcodebuild \
 	-project "$project_root/native/fskit/PassFSFileSystem.xcodeproj" \

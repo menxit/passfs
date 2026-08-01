@@ -61,7 +61,7 @@ func installPlatformUpdate(
 		return platformUpdateResult{}, fmt.Errorf("open macOS Installer: %w", err)
 	}
 	fmt.Fprintf(writer, "Verified PassFS %s and opened macOS Installer.\n", release.Version)
-	fmt.Fprintln(writer, "Installer will reload the passfs service after the upgrade.")
+	fmt.Fprintln(writer, "Installer will migrate and restart the passfs service after the upgrade.")
 	return platformUpdateResult{}, nil
 }
 

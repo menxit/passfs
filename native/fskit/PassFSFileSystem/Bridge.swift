@@ -3,17 +3,17 @@ import Foundation
 
 struct BridgeDirectoryEntry: Decodable {
     let name: String
-    let type: UInt32
-    let inode: UInt64
+    let attributes: BridgeAttributes
 }
 
-struct BridgeAttributes {
+struct BridgeAttributes: Decodable {
     let itemType: UInt32
     let mode: UInt32
     let uid: UInt32
     let gid: UInt32
     let linkCount: UInt32
     let inode: UInt64
+    let parentInode: UInt64
     let size: UInt64
     let blocks: UInt64
     let accessTimeNanoseconds: Int64
@@ -28,6 +28,7 @@ struct BridgeAttributes {
         gid = attributes.gid
         linkCount = attributes.link_count
         inode = attributes.inode
+        parentInode = attributes.parent_inode
         size = attributes.size
         blocks = attributes.blocks
         accessTimeNanoseconds = attributes.access_time_ns
@@ -47,8 +48,29 @@ func throwBridgeError(_ code: Int32) throws {
     }
 }
 
+private func bridgeFailure(
+    _ message: UnsafeMutablePointer<CChar>?,
+    fallback: String,
+    code: Int32
+) -> NSError {
+    defer {
+        if let message {
+            passfs_bridge_free(message)
+        }
+    }
+    return NSError(
+        domain: "com.menxit.passfs.fskit",
+        code: Int(code),
+        userInfo: [
+            NSLocalizedDescriptionKey: message.map { String(cString: $0) }
+                ?? fallback,
+        ]
+    )
+}
+
 final class PassFSBridge {
     private(set) var identifier: UInt64
+    let volumeUUID: UUID
 
     init(
         vaultPath: String,
@@ -65,17 +87,36 @@ final class PassFSBridge {
             )
         }
         guard identifier != 0 else {
-            let message = errorMessage.map { String(cString: $0) }
-                ?? "Unable to load the passfs volume"
-            if let errorMessage {
-                passfs_bridge_free(errorMessage)
-            }
-            throw NSError(
-                domain: "com.menxit.passfs.fskit",
-                code: Int(EIO),
-                userInfo: [NSLocalizedDescriptionKey: message]
+            throw bridgeFailure(
+                errorMessage,
+                fallback: "Unable to load the passfs volume",
+                code: EIO
             )
         }
+        guard let volumeID = passfs_bridge_volume_id(identifier) else {
+            _ = passfs_bridge_close_file_system(identifier)
+            identifier = 0
+            throw NSError(
+                domain: "com.menxit.passfs.fskit",
+                code: Int(EINVAL),
+                userInfo: [
+                    NSLocalizedDescriptionKey: "The passfs vault has an invalid volume identifier"
+                ]
+            )
+        }
+        defer { passfs_bridge_free(volumeID) }
+        guard let parsedUUID = UUID(uuidString: String(cString: volumeID)) else {
+            _ = passfs_bridge_close_file_system(identifier)
+            identifier = 0
+            throw NSError(
+                domain: "com.menxit.passfs.fskit",
+                code: Int(EINVAL),
+                userInfo: [
+                    NSLocalizedDescriptionKey: "The passfs vault has an invalid volume identifier"
+                ]
+            )
+        }
+        volumeUUID = parsedUUID
         if let errorMessage {
             passfs_bridge_free(errorMessage)
         }
@@ -91,6 +132,29 @@ final class PassFSBridge {
         }
         _ = passfs_bridge_close_file_system(identifier)
         identifier = 0
+    }
+
+    func configure(
+        maximumFileSize: Int64,
+        unlockDurationNanoseconds: Int64
+    ) throws {
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let code = passfs_bridge_configure_file_system(
+            identifier,
+            maximumFileSize,
+            unlockDurationNanoseconds,
+            &errorMessage
+        )
+        guard code == 0 else {
+            throw bridgeFailure(
+                errorMessage,
+                fallback: "Unable to configure the passfs volume",
+                code: code
+            )
+        }
+        if let errorMessage {
+            passfs_bridge_free(errorMessage)
+        }
     }
 
     func lookup(path: String) throws -> BridgeAttributes {

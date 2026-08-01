@@ -377,7 +377,7 @@ func TestIdentityPrompterUnlocksWithoutRequestingPassphrase(t *testing.T) {
 	}
 }
 
-func TestUnlockWindowReusesIdentityOnlyInMemory(t *testing.T) {
+func TestUnlockWindowReusesIdentityAcrossFilesInMemory(t *testing.T) {
 	const passphrase = "cached password"
 	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)
 	createTestFile(t, volume, "cached.env", []byte("TOKEN=value\n"))
@@ -403,8 +403,8 @@ func TestUnlockWindowReusesIdentityOnlyInMemory(t *testing.T) {
 		t.Fatalf("open other file: %v", err)
 	}
 	_ = otherHandle.Close(context.Background())
-	if got := prompter.requestCount(); got != 2 {
-		t.Fatalf("prompts for a different path = %d, want 2", got)
+	if got := prompter.requestCount(); got != 1 {
+		t.Fatalf("prompts for a different path within unlock window = %d, want 1", got)
 	}
 
 	cachedVolume.Lock()
@@ -413,8 +413,8 @@ func TestUnlockWindowReusesIdentityOnlyInMemory(t *testing.T) {
 		t.Fatalf("openFile after Lock: %v", err)
 	}
 	_ = handle.Close(context.Background())
-	if got := prompter.requestCount(); got != 3 {
-		t.Fatalf("prompts after Lock = %d, want 3", got)
+	if got := prompter.requestCount(); got != 2 {
+		t.Fatalf("prompts after Lock = %d, want 2", got)
 	}
 }
 

@@ -15,6 +15,12 @@ OUTPUT="${1:-${ROOT}/.pages}"
 	echo "Missing ${RELEASE}/SHA256SUMS." >&2
 	exit 1
 }
+for SIGNED_METADATA in MANIFEST.json MANIFEST.sig; do
+	[[ -f "${RELEASE}/${SIGNED_METADATA}" ]] || {
+		echo "Missing ${RELEASE}/${SIGNED_METADATA}." >&2
+		exit 1
+	}
+done
 case "$(basename "${OUTPUT}")" in
 	.pages | .pages-*)
 		;;
@@ -61,10 +67,14 @@ cp "${ROOT}/packaging/macos/AppIcon-1024.png" \
 cp "${ROOT}/install.sh" "${STAGED_OUTPUT}/site/passfs"
 cp "${RELEASE}/SHA256SUMS" \
 	"${STAGED_OUTPUT}/site/releases/v${VERSION}/SHA256SUMS"
+cp "${RELEASE}/MANIFEST.json" "${RELEASE}/MANIFEST.sig" \
+	"${STAGED_OUTPUT}/site/releases/v${VERSION}/"
 cp "${RELEASE}"/*.gz "${RELEASE}"/*.pkg \
 	"${STAGED_OUTPUT}/site/releases/v${VERSION}/"
 cp "${RELEASE}/SHA256SUMS" \
 	"${STAGED_OUTPUT}/site/releases/latest/SHA256SUMS"
+cp "${RELEASE}/MANIFEST.json" "${RELEASE}/MANIFEST.sig" \
+	"${STAGED_OUTPUT}/site/releases/latest/"
 cp "${RELEASE}"/*.gz "${RELEASE}"/*.pkg \
 	"${STAGED_OUTPUT}/site/releases/latest/"
 grep -Fq 'href="releases/latest/PassFS-macos-universal.pkg"' \
@@ -104,6 +114,11 @@ if [[ "${PASSFS_FETCH_GITHUB_RELEASES:-0}" == "1" ]]; then
 			--pattern 'passfs-linux-*.gz' \
 			--pattern 'PassFS-macos-universal.pkg' \
 			--pattern 'SHA256SUMS'
+		gh release download "${TAG}" \
+			--repo "${GITHUB_REPOSITORY}" \
+			--dir "${DESTINATION}" \
+			--pattern 'MANIFEST.*' \
+			2>/dev/null || true
 	done < <(
 		gh api --paginate \
 			"repos/${GITHUB_REPOSITORY}/releases?per_page=100" \

@@ -25,20 +25,18 @@ func ProtectedFiles(vault string) ([]ProtectedFile, error) {
 		}
 		result = make([]ProtectedFile, 0, len(metadata.Files))
 		for key, file := range metadata.Files {
-			path, err := OriginalPath(filepath.FromSlash(key))
-			if err != nil {
-				return err
-			}
-			target, registered := metadata.Links[key]
-			if !registered || target == "" {
+			path, registered := metadata.Links[key]
+			if !registered || path == "" || metadata.Orphaned[key] != 0 {
 				continue
 			}
 			link, err := inspectProtectedLink(path)
 			if err != nil {
 				return err
 			}
-			if !link.isSymlink ||
-				link.target != filepath.Clean(target) {
+			if !link.isSymlink || !targetMatchesStorage(
+				link.target,
+				filepath.FromSlash(key),
+			) {
 				continue
 			}
 			result = append(result, ProtectedFile{

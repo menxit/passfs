@@ -1,17 +1,75 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log"
 	"strings"
+	"time"
 
 	"passfs/internal/passfs"
 )
 
+type preparedFilesystemService struct {
+	volume       *passfs.Volume
+	synchronizer *passfs.LinkSynchronizer
+	logger       *log.Logger
+	unlockFor    time.Duration
+}
+
+func prepareFilesystemService(
+	ctx context.Context,
+	settings *passfs.Settings,
+	maxFileSize int64,
+	stderr io.Writer,
+) (*preparedFilesystemService, error) {
+	prompter, err := newServicePrompter(settings)
+	if err != nil {
+		return nil, err
+	}
+	if ctx != nil {
+		prompter = passfs.WithCancellation(prompter, ctx)
+	}
+	unlockFor, err := settings.UnlockDuration()
+	if err != nil {
+		return nil, err
+	}
+	volume, err := passfs.LoadVolume(
+		settings.Vault,
+		prompter,
+		maxFileSize,
+		unlockFor,
+	)
+	if err != nil {
+		return nil, err
+	}
+	logger := log.New(stderr, "", log.LstdFlags)
+	synchronizer, err := passfs.NewLinkSynchronizer(
+		volume,
+		settings.MountPoint,
+		logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initialize protected link tracking: %w", err)
+	}
+	synchronizer.EnableGlobalMoveSearch()
+	if err := synchronizer.Prepare(); err != nil {
+		synchronizer.Close()
+		return nil, fmt.Errorf("prepare protected link tracking: %w", err)
+	}
+	return &preparedFilesystemService{
+		volume:       volume,
+		synchronizer: synchronizer,
+		logger:       logger,
+		unlockFor:    unlockFor,
+	}, nil
+}
+
 const (
 	adapterAuto  = "auto"
-	adapterFUSE  = "fuse"
-	adapterFSKit = "fskit"
+	adapterFUSE  = passfs.MountAdapterFUSE
+	adapterFSKit = passfs.MountAdapterFSKit
 )
 
 // filesystemAdapter owns the platform-specific mount lifecycle. The passfs

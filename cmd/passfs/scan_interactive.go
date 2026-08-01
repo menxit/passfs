@@ -23,7 +23,6 @@ type scanDisplayFile struct {
 	index      int
 	path       string
 	title      string
-	project    string
 	size       int64
 	lastOpened time.Time
 	preview    string
@@ -195,7 +194,6 @@ func buildScanDisplayGroups(paths []string) []scanDisplayGroup {
 		groups[project] = append(groups[project], scanDisplayFile{
 			path:       path,
 			title:      filepath.Base(path),
-			project:    project,
 			size:       size,
 			lastOpened: lastOpened,
 			preview:    maskedScanPreview(path),

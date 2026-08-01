@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -23,6 +22,11 @@ import (
 const fsKitExtensionBundleID = "com.menxit.passfs.filesystem"
 
 const liveFSSettingsPath = "/Library/Application Support/livefsd/settings.plist"
+
+const (
+	mountLifecycleSafetyInterval   = time.Hour
+	mountLifecycleFallbackInterval = time.Minute
+)
 
 type fsKitFilesystemAdapter struct{}
 
@@ -174,10 +178,21 @@ func (fsKitFilesystemAdapter) Serve(
 	debug bool,
 	stderr io.Writer,
 ) error {
-	unlockFor, err := settings.UnlockDuration()
+	serviceContext, cancelService := context.WithCancel(context.Background())
+	defer cancelService()
+	prepared, err := prepareFilesystemService(
+		serviceContext,
+		settings,
+		maxFileSize,
+		stderr,
+	)
 	if err != nil {
 		return err
 	}
+	linkSynchronizer := prepared.synchronizer
+	logger := prepared.logger
+	unlockFor := prepared.unlockFor
+	defer linkSynchronizer.Close()
 	options := []string{
 		"nobrowse",
 		"max-file-size=" + strconv.FormatInt(maxFileSize, 10),
@@ -215,40 +230,72 @@ func (fsKitFilesystemAdapter) Serve(
 	); err != nil {
 		return err
 	}
+	linkSyncDone := make(chan struct{})
+	go func() {
+		defer close(linkSyncDone)
+		linkSynchronizer.Run(serviceContext)
+	}()
+	defer func() {
+		cancelService()
+		<-linkSyncDone
+	}()
 
-	logger := log.New(stderr, "", log.LstdFlags)
-	serviceContext, cancelService := context.WithCancel(context.Background())
-	defer cancelService()
 	startUpdateMonitor(serviceContext, logger)
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
 	for {
+		watcher, watchErr := newMountLifecycleWatcher(settings.MountPoint)
+		interval := mountLifecycleSafetyInterval
+		var changed <-chan error
+		if watchErr == nil {
+			changed = watcher.change
+		} else {
+			interval = mountLifecycleFallbackInterval
+			logger.Printf(
+				"watch mount lifecycle; using periodic status checks: %v",
+				watchErr,
+			)
+		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-signals:
-			cancelService()
+			timer.Stop()
+			if watcher != nil {
+				_ = watcher.close()
+			}
 			if err := passfs.UnmountPath(settings.MountPoint); err != nil {
 				return fmt.Errorf("unmount native passfs filesystem: %w", err)
 			}
 			return nil
-		case <-ticker.C:
-			mount, err := inspectMount(settings.MountPoint)
+		case err := <-changed:
 			if err != nil {
-				return err
+				logger.Printf("watch mount lifecycle: %v", err)
 			}
-			if !mount.mounted {
-				return nil
+		case <-timer.C:
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
 			}
-			if !mount.passfs {
-				return fmt.Errorf(
-					"%s was replaced by another filesystem",
-					terminalPath(settings.MountPoint),
-				)
-			}
+		}
+		if watcher != nil {
+			_ = watcher.close()
+		}
+		mounted, adapter, err := passfs.MountAdapterStatus(settings.MountPoint)
+		if err != nil {
+			return err
+		}
+		if !mounted {
+			return nil
+		}
+		if adapter == passfs.MountAdapterUnknown {
+			return fmt.Errorf(
+				"%s was replaced by another filesystem",
+				terminalPath(settings.MountPoint),
+			)
 		}
 	}
 }

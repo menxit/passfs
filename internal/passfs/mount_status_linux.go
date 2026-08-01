@@ -18,11 +18,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func MountStatus(mountPoint string) (mounted bool, passfsMount bool, err error) {
-	mounted, adapter, err := MountAdapterStatus(mountPoint)
-	return mounted, adapter != MountAdapterUnknown, err
-}
-
 func MountAdapterStatus(
 	mountPoint string,
 ) (mounted bool, adapter string, err error) {

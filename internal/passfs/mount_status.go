@@ -11,6 +11,11 @@ const (
 	MountAdapterFSKit   = "fskit"
 )
 
+func MountStatus(mountPoint string) (mounted bool, passfsMount bool, err error) {
+	mounted, adapter, err := MountAdapterStatus(mountPoint)
+	return mounted, adapter != MountAdapterUnknown, err
+}
+
 // canonicalMountPoint resolves aliases in the parent directory without
 // traversing the mount itself. Traversing the mount point would fail for an
 // orphaned FUSE mount, which is precisely when MountStatus is needed most.

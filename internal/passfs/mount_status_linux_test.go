@@ -7,7 +7,7 @@ import "testing"
 func TestMountInfoPathMatchesDoesNotTraverseUnrelatedMount(t *testing.T) {
 	matches, err := mountInfoPathMatches(
 		"/run/docker/netns",
-		"/home/federico/.config/passfs/mnt",
+		"/home/federico/.passfs/mnt",
 	)
 	if err != nil {
 		t.Fatal(err)

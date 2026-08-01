@@ -18,7 +18,7 @@ const metadataLockFileName = "metadata.lock"
 // separate inode because metadata.json itself is replaced atomically.
 func withMetadataFileLock(root string, action func() error) error {
 	lockPath := filepath.Join(root, internalDirName, metadataLockFileName)
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := openCoordinationLock(lockPath)
 	if err != nil {
 		return fmt.Errorf("open metadata lock: %w", err)
 	}
@@ -37,4 +37,19 @@ func withMetadataFileLock(root string, action func() error) error {
 		closeErr = fmt.Errorf("close metadata lock: %w", closeErr)
 	}
 	return errors.Join(actionErr, unlockErr, closeErr)
+}
+
+// Keep the lock descriptor read-only. Merely closing an O_RDWR descriptor
+// produces a filesystem write event on Linux even when no bytes changed,
+// which would wake the metadata watcher and immediately reconcile again.
+func openCoordinationLock(path string) (*os.File, error) {
+	file, err := os.Open(path)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return file, err
+	}
+	file, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDONLY, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return os.Open(path)
+	}
+	return file, err
 }

@@ -47,3 +47,7 @@ func ValidateTouchIDHelperParent(int) error {
 func TouchIDIdentity(string, string) (*age.X25519Identity, error) {
 	return nil, ErrTouchIDUnsupportedBuild
 }
+
+func describeTouchIDReason(request PromptRequest) string {
+	return DescribeBiometricReason(request, "en")
+}

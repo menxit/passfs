@@ -52,25 +52,25 @@ func TestFSKitModuleDisabledOutput(t *testing.T) {
 func TestLiveFSMountRegistrationsContain(t *testing.T) {
 	registrations := []byte(`[
 		{
-			"mountedOn": "/Users/test/.config/passfs/mnt",
+			"mountedOn": "/Users/test/.passfs/mnt",
 			"displayName": "passfs"
 		}
 	]`)
 	if !liveFSMountRegistrationsContain(
 		registrations,
-		"/Users/test/.config/passfs/mnt",
+		"/Users/test/.passfs/mnt",
 	) {
 		t.Fatal("matching LiveFS mount registration was not found")
 	}
 	if liveFSMountRegistrationsContain(
 		registrations,
-		"/Users/other/.config/passfs/mnt",
+		"/Users/other/.passfs/mnt",
 	) {
 		t.Fatal("unrelated LiveFS mount registration matched")
 	}
 	if liveFSMountRegistrationsContain(
 		[]byte("not JSON"),
-		"/Users/test/.config/passfs/mnt",
+		"/Users/test/.passfs/mnt",
 	) {
 		t.Fatal("invalid LiveFS settings matched")
 	}

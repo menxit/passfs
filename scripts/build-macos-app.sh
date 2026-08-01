@@ -6,6 +6,8 @@ project_root=$(
 	cd "$(dirname "$0")/.." &&
 		pwd
 )
+# shellcheck source=macos-signing-common.sh
+. "$project_root/scripts/macos-signing-common.sh"
 bundle_id="com.menxit.passfs"
 profile=${1-}
 signing_identity=${2-}
@@ -67,49 +69,16 @@ cleanup()
 }
 trap cleanup EXIT HUP INT TERM
 
-security cms -D -i "$profile" >"$profile_plist"
-if [ "$signing_identity" = "auto" ]; then
-	plutil -extract DeveloperCertificates.0 raw "$profile_plist" |
-		base64 -D >"$profile_certificate"
-	signing_identity=$(
-		shasum "$profile_certificate" |
-			awk '{ print toupper($1) }'
-	)
-fi
-if ! security find-identity -v -p codesigning |
-	grep -Fq "$signing_identity"; then
-	echo "the profile signing identity is not available in the login Keychain" >&2
-	exit 1
-fi
-team_identifier=$(
-	/usr/libexec/PlistBuddy \
-		-c "Print :TeamIdentifier:0" \
-		"$profile_plist"
-)
-application_identifier=$(
-	/usr/libexec/PlistBuddy \
-		-c "Print :Entitlements:com.apple.application-identifier" \
-		"$profile_plist"
-)
-if [ "$application_identifier" != "$team_identifier.$bundle_id" ]; then
-	echo "profile App ID is $application_identifier, want $team_identifier.$bundle_id" >&2
-	exit 1
-fi
-if ! /usr/libexec/PlistBuddy \
-	-c "Print :Entitlements:keychain-access-groups" \
-	"$profile_plist" |
-	grep -Eq "$team_identifier\\.\\*|$team_identifier\\.$bundle_id"; then
-	echo "profile does not authorize the passfs Keychain access group" >&2
-	exit 1
-fi
-if [ "$(
-	/usr/libexec/PlistBuddy \
-		-c "Print :Entitlements:com.apple.developer.fskit.mount" \
-		"$profile_plist" 2>/dev/null || true
-)" != "true" ]; then
-	echo "profile does not authorize com.apple.developer.fskit.mount" >&2
-	exit 1
-fi
+passfs_decode_provisioning_profile "$profile" "$profile_plist"
+team_identifier=$(passfs_profile_team_identifier "$profile_plist")
+passfs_assert_profile_app_id \
+	"$profile_plist" "$team_identifier" "$bundle_id" "profile"
+passfs_assert_profile_keychain_group \
+	"$profile_plist" "$team_identifier" "$bundle_id" "profile"
+passfs_assert_profile_boolean_entitlement \
+	"$profile_plist" "com.apple.developer.fskit.mount" "profile"
+signing_identity=$(passfs_resolve_signing_identity \
+	"$profile_plist" "$signing_identity" "$profile_certificate")
 
 sed "s/__TEAM_IDENTIFIER__/$team_identifier/g" \
 	"$project_root/packaging/macos/passfs.entitlements.in" >"$entitlements"

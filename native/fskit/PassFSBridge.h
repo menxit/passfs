@@ -32,6 +32,7 @@ typedef struct passfs_attributes {
     uint32_t link_count;
     uint32_t reserved;
     uint64_t inode;
+    uint64_t parent_inode;
     uint64_t size;
     uint64_t blocks;
     int64_t access_time_ns;
@@ -64,6 +65,15 @@ typedef struct passfs_statistics {
 
 uint64_t passfs_bridge_open_file_system(
     const char *vault_path,
+    int64_t maximum_file_size,
+    int64_t unlock_duration_ns,
+    char **error_message
+);
+
+char *passfs_bridge_volume_id(uint64_t file_system);
+
+int passfs_bridge_configure_file_system(
+    uint64_t file_system,
     int64_t maximum_file_size,
     int64_t unlock_duration_ns,
     char **error_message

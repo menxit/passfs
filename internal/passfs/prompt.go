@@ -18,6 +18,20 @@ import (
 
 var ErrPromptCancelled = errors.New("authorization cancelled")
 
+const assuanCancelledCode = "83886179"
+
+type assuanError struct {
+	response string
+}
+
+func (err *assuanError) Error() string { return err.response }
+
+func (err *assuanError) cancelled() bool {
+	fields := strings.Fields(err.response)
+	return len(fields) >= 2 && fields[0] == "ERR" &&
+		fields[1] == assuanCancelledCode
+}
+
 type PromptRequest struct {
 	Path        string
 	Operation   string
@@ -167,7 +181,11 @@ func (p *PinentryPrompter) Prompt(ctx context.Context, request PromptRequest) (s
 		_, _ = io.WriteString(stdin, "BYE\n")
 		_ = stdin.Close()
 		_ = command.Wait()
-		return "", ErrPromptCancelled
+		var protocolError *assuanError
+		if errors.As(err, &protocolError) && protocolError.cancelled() {
+			return "", ErrPromptCancelled
+		}
+		return "", fmt.Errorf("pinentry GETPIN: %w", err)
 	}
 	_, _ = io.WriteString(stdin, "BYE\n")
 	_ = stdin.Close()
@@ -280,7 +298,7 @@ func readAssuanResponse(scanner *bufio.Scanner) (string, error) {
 		case strings.HasPrefix(line, "D "):
 			data.WriteString(strings.TrimPrefix(line, "D "))
 		case strings.HasPrefix(line, "ERR "):
-			return "", errors.New(line)
+			return "", &assuanError{response: line}
 		}
 	}
 	if err := scanner.Err(); err != nil {

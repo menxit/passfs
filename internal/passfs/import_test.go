@@ -141,6 +141,93 @@ func TestImportFileRecoversInterruptedEmptyTarget(t *testing.T) {
 	}
 }
 
+func TestValidateExistingImportTargetAllowsInterruptedEmptyTarget(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, ".env")
+	targetPath := filepath.Join(root, "mount", ".env")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, []byte("TOKEN=new-plaintext\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetInfo, err := os.Lstat(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateExistingImportTarget(
+		sourcePath,
+		targetPath,
+		targetInfo,
+		1024,
+	); err != nil {
+		t.Fatalf("validateExistingImportTarget: %v", err)
+	}
+}
+
+func TestValidateExistingImportTargetRejectsAmbiguousEmptyFiles(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, ".env")
+	targetPath := filepath.Join(root, "mount", ".env")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetInfo, err := os.Lstat(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateExistingImportTarget(
+		sourcePath,
+		targetPath,
+		targetInfo,
+		1024,
+	); err == nil || !strings.Contains(
+		err.Error(),
+		"is not the passfs protected link",
+	) {
+		t.Fatalf("validateExistingImportTarget error = %v", err)
+	}
+}
+
+func TestValidateExistingImportTargetRejectsTargetWithData(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, ".env")
+	targetPath := filepath.Join(root, "mount", ".env")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, []byte("new plaintext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, []byte("existing protected data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetInfo, err := os.Lstat(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateExistingImportTarget(
+		sourcePath,
+		targetPath,
+		targetInfo,
+		1024,
+	); err == nil || !strings.Contains(
+		err.Error(),
+		"is not the passfs protected link",
+	) {
+		t.Fatalf("validateExistingImportTarget error = %v", err)
+	}
+}
+
 func TestImportFilePreservesExistingEmptyTargetForEmptySource(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, ".env")

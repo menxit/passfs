@@ -6,6 +6,8 @@ project_root=$(
 	cd "$(dirname "$0")/.." &&
 		pwd
 )
+# shellcheck source=macos-signing-common.sh
+. "$project_root/scripts/macos-signing-common.sh"
 profile=${1-}
 signing_identity=${2-}
 output=${3-}
@@ -37,8 +39,8 @@ output_parent=$(
 output="$output_parent/$(basename "$output")"
 build_directory=$(mktemp -d "$output_parent/.passfs-fskit-build.XXXXXX")
 profile_plist="$build_directory/profile.plist"
+profile_certificate="$build_directory/profile-certificate.der"
 entitlements="$build_directory/extension.entitlements"
-archive_directory="$build_directory/archives"
 derived_data="$build_directory/DerivedData"
 universal_archive="$build_directory/libpassfs_bridge.a"
 
@@ -48,36 +50,16 @@ cleanup()
 }
 trap cleanup EXIT HUP INT TERM
 
-security cms -D -i "$profile" >"$profile_plist"
-team_identifier=$(
-	/usr/libexec/PlistBuddy \
-		-c "Print :TeamIdentifier:0" \
-		"$profile_plist"
-)
-application_identifier=$(
-	/usr/libexec/PlistBuddy \
-		-c "Print :Entitlements:com.apple.application-identifier" \
-		"$profile_plist"
-)
-if [ "$application_identifier" != "$team_identifier.$bundle_id" ]; then
-	echo "FSKit profile App ID is $application_identifier, want $team_identifier.$bundle_id" >&2
-	exit 1
-fi
-if [ "$(
-	/usr/libexec/PlistBuddy \
-		-c "Print :Entitlements:com.apple.developer.fskit.fsmodule" \
-		"$profile_plist" 2>/dev/null || true
-)" != "true" ]; then
-	echo "FSKit profile does not authorize com.apple.developer.fskit.fsmodule" >&2
-	exit 1
-fi
-if ! /usr/libexec/PlistBuddy \
-	-c "Print :Entitlements:keychain-access-groups" \
-	"$profile_plist" |
-	grep -Eq "$team_identifier\\.\\*|$team_identifier\\.$keychain_group_id"; then
-	echo "FSKit profile does not authorize the passfs Keychain access group" >&2
-	exit 1
-fi
+passfs_decode_provisioning_profile "$profile" "$profile_plist"
+team_identifier=$(passfs_profile_team_identifier "$profile_plist")
+passfs_assert_profile_app_id \
+	"$profile_plist" "$team_identifier" "$bundle_id" "FSKit profile"
+passfs_assert_profile_boolean_entitlement \
+	"$profile_plist" "com.apple.developer.fskit.fsmodule" "FSKit profile"
+passfs_assert_profile_keychain_group \
+	"$profile_plist" "$team_identifier" "$keychain_group_id" "FSKit profile"
+signing_identity=$(passfs_resolve_signing_identity \
+	"$profile_plist" "$signing_identity" "$profile_certificate")
 plutil -extract Entitlements xml1 -o "$entitlements" "$profile_plist"
 /usr/libexec/PlistBuddy \
 	-c "Delete :keychain-access-groups" \
@@ -100,47 +82,10 @@ else
 		"$entitlements"
 fi
 
-mkdir -p "$archive_directory"
-archive_count=0
-xcode_architectures=
-for architecture in $architectures; do
-	case "$architecture" in
-		arm64)
-			go_architecture=arm64
-			xcode_architecture=arm64
-			;;
-		amd64 | x86_64)
-			go_architecture=amd64
-			xcode_architecture=x86_64
-			;;
-		*)
-			echo "unsupported macOS architecture: $architecture" >&2
-			exit 1
-			;;
-	esac
-	archive_count=$((archive_count + 1))
-	xcode_architectures="${xcode_architectures}${xcode_architectures:+ }$xcode_architecture"
-	(
-		cd "$project_root"
-		CGO_ENABLED=1 \
-		GOOS=darwin \
-		GOARCH="$go_architecture" \
-		CGO_CFLAGS="-arch $xcode_architecture" \
-		CGO_LDFLAGS="-arch $xcode_architecture" \
-			env -u GOROOT GOWORK=off go build \
-			-trimpath \
-			-buildmode=c-archive \
-			-o "$archive_directory/libpassfs_bridge-$xcode_architecture.a" \
-			./cmd/passfs-fskit-bridge
-	)
-done
-
-if [ "$archive_count" -eq 1 ]; then
-	cp "$archive_directory"/libpassfs_bridge-*.a "$universal_archive"
-else
-	lipo -create "$archive_directory"/libpassfs_bridge-*.a \
-		-output "$universal_archive"
-fi
+xcode_architectures=$(
+	"$project_root/scripts/build-fskit-bridge.sh" \
+		"$universal_archive" "$architectures"
+)
 
 if [ -z "${DEVELOPER_DIR:-}" ] &&
 	[ -d /Applications/Xcode.app/Contents/Developer ]; then

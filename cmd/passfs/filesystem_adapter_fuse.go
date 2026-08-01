@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -36,11 +35,16 @@ func (fuseFilesystemAdapter) SupportsProcessSessions() bool {
 }
 
 func (fuseFilesystemAdapter) RegisterProtectedLink(
-	_ *passfs.Settings,
-	_ string,
+	settings *passfs.Settings,
+	sourcePath string,
 	targetPath string,
 ) error {
-	return passfs.MarkProtectedLink(targetPath)
+	return passfs.RegisterProtectedLinkInVault(
+		settings.Vault,
+		settings.MountPoint,
+		sourcePath,
+		targetPath,
+	)
 }
 
 func (fuseFilesystemAdapter) UnavailableError(
@@ -63,38 +67,21 @@ func (fuseFilesystemAdapter) Serve(
 	debug bool,
 	stderr io.Writer,
 ) error {
-	prompter, err := newServicePrompter(settings)
-	if err != nil {
-		return err
-	}
 	serviceContext, cancelService := context.WithCancel(context.Background())
 	defer cancelService()
-	prompter = passfs.WithCancellation(prompter, serviceContext)
-	unlockFor, err := settings.UnlockDuration()
-	if err != nil {
-		return err
-	}
-	volume, err := passfs.LoadVolume(
-		settings.Vault,
-		prompter,
+	prepared, err := prepareFilesystemService(
+		serviceContext,
+		settings,
 		maxFileSize,
-		unlockFor,
+		stderr,
 	)
 	if err != nil {
 		return err
 	}
-
-	logger := log.New(stderr, "", log.LstdFlags)
-	linkSynchronizer, err := passfs.NewLinkSynchronizer(
-		volume,
-		settings.MountPoint,
-		logger,
-	)
-	if err != nil {
-		return fmt.Errorf("initialize protected link tracking: %w", err)
-	}
+	volume := prepared.volume
+	linkSynchronizer := prepared.synchronizer
+	logger := prepared.logger
 	defer linkSynchronizer.Close()
-	linkSynchronizer.Synchronize()
 
 	zero := time.Duration(0)
 	server, err := fs.Mount(
@@ -125,7 +112,9 @@ func (fuseFilesystemAdapter) Serve(
 		)
 	}
 
-	go linkSynchronizer.Run(serviceContext)
+	go func() {
+		linkSynchronizer.Run(serviceContext)
+	}()
 	startUpdateMonitor(serviceContext, logger)
 
 	signals := make(chan os.Signal, 1)
@@ -167,6 +156,9 @@ func (fuseFilesystemAdapter) Serve(
 	}
 	cancelService()
 	linkSynchronizer.Close()
+	if err := volume.FlushAccessTimes(); err != nil {
+		logger.Printf("flush access metadata: %v", err)
+	}
 	volume.Lock()
 	return nil
 }

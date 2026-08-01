@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"passfs/internal/updater"
@@ -78,9 +77,6 @@ func installPlatformUpdate(
 	if err := staged.Close(); err != nil {
 		return platformUpdateResult{}, err
 	}
-	if err := verifyLinuxUpdateVersion(stagedPath, release.Version); err != nil {
-		return platformUpdateResult{}, err
-	}
 	if err := os.Rename(stagedPath, executable); err != nil {
 		return platformUpdateResult{}, fmt.Errorf("replace passfs executable: %w", err)
 	}
@@ -120,22 +116,6 @@ func extractLinuxUpdate(archivePath string, destination io.Writer) error {
 	}
 	if count > maxLinuxBinaryBytes {
 		return errors.New("passfs update binary is too large")
-	}
-	return nil
-}
-
-func verifyLinuxUpdateVersion(path, expected string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(ctx, path, "version").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("verify downloaded passfs executable: %w", err)
-	}
-	if strings.TrimSpace(string(output)) != "passfs "+expected {
-		return fmt.Errorf(
-			"downloaded executable reported unexpected version %q",
-			strings.TrimSpace(string(output)),
-		)
 	}
 	return nil
 }

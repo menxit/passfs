@@ -27,7 +27,7 @@ MACOS_PACKAGE := $(RELEASE_DIR)/PassFS-macos-universal.pkg
 DOCKER ?= docker
 SERVER_TEST_IMAGE ?= passfs-server-test
 
-.PHONY: all build install install-unsigned macos-app macos-package macos-release linux-release release-checksums pages docker-server docker-server-shell test test-scripts test-race vet cross-build-linux fskit-check check clean
+.PHONY: all build install install-unsigned macos-app macos-package macos-release linux-release release-checksums release-signature pages docker-server docker-server-shell test test-scripts test-race vet cross-build-linux fskit-check check clean
 
 all: build
 
@@ -85,6 +85,9 @@ linux-release:
 
 release-checksums:
 	./scripts/checksums.sh "$(RELEASE_DIR)"
+
+release-signature: release-checksums
+	./scripts/sign-release.sh "$(RELEASE_DIR)"
 
 pages:
 	PASSFS_VERSION="$(RELEASE_VERSION)" ./scripts/prepare-pages.sh

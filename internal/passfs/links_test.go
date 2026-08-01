@@ -1,7 +1,7 @@
 package passfs
 
 import (
-	"context"
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,10 +10,7 @@ import (
 	"time"
 )
 
-func synchronizeLinksOnce(volume *Volume, mountPoint string) map[string]error {
-	return synchronizeLinksOnceTracked(volume, mountPoint, nil)
-}
-
+// testStoragePath remains available for v1 migration fixtures.
 func testStoragePath(t *testing.T, absolutePath string) string {
 	t.Helper()
 	if !filepath.IsAbs(absolutePath) {
@@ -28,19 +25,33 @@ func initializeLinkedTestFile(
 ) (volume *Volume, sourcePath, storagePath, mountPoint string) {
 	t.Helper()
 	volume, _ = initializeTestVolume(t, "link synchronization password", 1024*1024)
-	projectDirectory := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	projectDirectory := filepath.Join(home, "project")
+	if err := os.MkdirAll(projectDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	sourcePath = filepath.Join(projectDirectory, ".env")
-	storagePath = testStoragePath(t, sourcePath)
+	resolvedSource, err := ResolvePathEntry(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePath = resolvedSource
+	objectID, err := newObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storagePath, _ = objectStoragePath(objectID)
 	mountPoint = t.TempDir()
 	createTestFile(t, volume, storagePath, []byte("TOKEN=encrypted\n"))
-	targetPath, err := MountedPath(mountPoint, sourcePath)
+	targetPath, err := mountedObjectPath(mountPoint, objectID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := EnsureProtectedLink(sourcePath, targetPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := volume.setLinkTarget(storagePath, targetPath); err != nil {
+	if err := volume.setLinkSource(storagePath, sourcePath); err != nil {
 		t.Fatal(err)
 	}
 	return volume, sourcePath, storagePath, mountPoint
@@ -53,252 +64,225 @@ func assertNoLinkSyncIssues(t *testing.T, issues map[string]error) {
 	}
 }
 
-func TestLinkSynchronizerDoesNotPublishUnregisteredMountedFile(t *testing.T) {
-	volume, _ := initializeTestVolume(t, "unregistered file password", 1024*1024)
-	projectDirectory := t.TempDir()
-	sourcePath := filepath.Join(projectDirectory, ".env.swp")
-	storagePath := testStoragePath(t, sourcePath)
-	mountPoint := t.TempDir()
-	createTestFile(t, volume, storagePath, nil)
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
-
-	link, err := inspectProtectedLink(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if link.exists {
-		t.Fatalf("unregistered mounted file was published: %#v", link)
-	}
-	records := volume.linkRecords()
-	if len(records) != 1 ||
-		records[0].relative != storagePath ||
-		records[0].linkTarget != "" {
-		t.Fatalf("link records = %#v", records)
-	}
-}
-
-func TestDeletingProtectedLinkDeletesEncryptedFile(t *testing.T) {
-	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
-
-	if err := os.Remove(sourcePath); err != nil {
-		t.Fatal(err)
-	}
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
-
-	cipherPath, err := volume.encryptedPath(storagePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(cipherPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("encrypted file still exists or returned an unexpected error: %v", err)
-	}
-	if records := volume.linkRecords(); len(records) != 0 {
-		t.Fatalf("link records remain after deletion: %#v", records)
-	}
-}
-
-func TestMissingLinkAtReloadPreservesCiphertext(t *testing.T) {
-	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
-	if err := os.Remove(sourcePath); err != nil {
-		t.Fatal(err)
-	}
-
-	reloaded, err := LoadVolume(
-		volume.root,
-		&recordingPrompter{fallback: "link synchronization password"},
-		1024*1024,
-		0,
-	)
-	if err != nil {
-		t.Fatalf("LoadVolume: %v", err)
-	}
-	synchronizer, err := NewLinkSynchronizer(reloaded, mountPoint, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	synchronizer.Synchronize()
-	defer synchronizer.Close()
-	cipherPath, err := reloaded.encryptedPath(storagePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(cipherPath); err != nil {
-		t.Fatalf("reloaded volume did not preserve the ciphertext: %v", err)
-	}
-	records := reloaded.linkRecords()
-	if len(records) != 1 || !records[0].protected {
-		t.Fatalf("preserved link records = %#v", records)
-	}
-}
-
-func TestReloadReconcilesCiphertextRemovedOutsidePassfs(t *testing.T) {
-	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
-	cipherPath, err := volume.encryptedPath(storagePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(cipherPath); err != nil {
-		t.Fatal(err)
-	}
-
-	reloaded, err := LoadVolume(
-		volume.root,
-		&recordingPrompter{fallback: "link synchronization password"},
-		1024*1024,
-		0,
-	)
-	if err != nil {
-		t.Fatalf("LoadVolume: %v", err)
-	}
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(reloaded, mountPoint))
-	if _, err := os.Lstat(sourcePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("dangling protected link remains: %v", err)
-	}
-	if records := reloaded.linkRecords(); len(records) != 0 {
-		t.Fatalf("stale records remain: %#v", records)
-	}
-}
-
-func TestReloadRecoversCiphertextMissingFromMetadata(t *testing.T) {
-	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
-	volume.metadataMu.Lock()
-	delete(volume.metadata.Files, metadataKey(storagePath))
-	if err := saveMetadata(volume.root, volume.metadata); err != nil {
-		volume.metadataMu.Unlock()
-		t.Fatal(err)
-	}
-	volume.metadataMu.Unlock()
-
-	reloaded, err := LoadVolume(
-		volume.root,
-		&recordingPrompter{fallback: "link synchronization password"},
-		1024*1024,
-		0,
-	)
-	if err != nil {
-		t.Fatalf("LoadVolume: %v", err)
-	}
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(reloaded, mountPoint))
-	link, err := inspectProtectedLink(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !link.isSymlink {
-		t.Fatal("registered link disappeared while metadata was reconciled")
-	}
-	records := reloaded.linkRecords()
-	if len(records) != 1 || !records[0].protected {
-		t.Fatalf("reconciled records = %#v", records)
-	}
-}
-
-func TestReplacingProtectedLinkPreservesEncryptedFile(t *testing.T) {
-	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
-	if err := os.Remove(sourcePath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(sourcePath, []byte("TOKEN=accidental-plaintext\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	issues := synchronizeLinksOnce(volume, mountPoint)
-	if len(issues) != 1 {
-		t.Fatalf("link synchronization issues = %v, want one conflict", issues)
-	}
-	cipherPath, err := volume.encryptedPath(storagePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(cipherPath); err != nil {
-		t.Fatalf("encrypted file was not preserved: %v", err)
-	}
-	data, err := os.ReadFile(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := string(data), "TOKEN=accidental-plaintext\n"; got != want {
-		t.Fatalf("replacement file = %q, want %q", got, want)
-	}
-}
-
-func TestRemovingEncryptedFileRemovesItsLink(t *testing.T) {
-	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
-	if err := volume.removeProtectedFile(storagePath); err != nil {
-		t.Fatalf("removeProtectedFile: %v", err)
-	}
-
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, mountPoint))
-	if _, err := os.Lstat(sourcePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("project-side link still exists or returned an unexpected error: %v", err)
-	}
-}
-
-func TestChangingMountPointUpdatesOwnedLink(t *testing.T) {
-	volume, sourcePath, _, firstMountPoint := initializeLinkedTestFile(t)
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, firstMountPoint))
-
-	secondMountPoint := t.TempDir()
-	assertNoLinkSyncIssues(t, synchronizeLinksOnce(volume, secondMountPoint))
-	secondTarget, err := MountedPath(secondMountPoint, sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	link, err := inspectProtectedLink(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !link.isSymlink || link.target != secondTarget {
-		t.Fatalf("updated link = %#v, want target %q", link, secondTarget)
-	}
-}
-
-func TestBackgroundLinkSynchronizerAppliesDeletion(t *testing.T) {
-	volume, sourcePath, storagePath, mountPoint := initializeLinkedTestFile(t)
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
+func newGlobalTestSynchronizer(
+	t *testing.T,
+	volume *Volume,
+	mountPoint string,
+) *LinkSynchronizer {
+	t.Helper()
 	synchronizer, err := NewLinkSynchronizer(volume, mountPoint, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	synchronizer.Synchronize()
-	go func() {
-		defer close(done)
-		synchronizer.Run(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-
-	waitForTestCondition(t, 3*time.Second, func() bool {
-		link, err := inspectProtectedLink(sourcePath)
-		return err == nil && link.isSymlink
-	})
-	if err := os.Remove(sourcePath); err != nil {
+	synchronizer.EnableGlobalMoveSearch()
+	if err := synchronizer.Prepare(); err != nil {
+		synchronizer.Close()
 		t.Fatal(err)
 	}
-	cipherPath, err := volume.encryptedPath(storagePath)
+	t.Cleanup(synchronizer.Close)
+	return synchronizer
+}
+
+func TestOpaqueLinkRenameKeepsCiphertextAndTargetStable(t *testing.T) {
+	volume, sourcePath, storage, mountPoint := initializeLinkedTestFile(t)
+	synchronizer := newGlobalTestSynchronizer(t, volume, mountPoint)
+	target, err := os.Readlink(sourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForTestCondition(t, 3*time.Second, func() bool {
-		_, err := os.Lstat(cipherPath)
-		return errors.Is(err, os.ErrNotExist)
-	})
+	cipherPath, err := volume.encryptedPath(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(cipherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destination := filepath.Join(filepath.Dir(sourcePath), "renamed.env")
+	if err := os.Rename(sourcePath, destination); err != nil {
+		t.Fatal(err)
+	}
+	if retry := synchronizer.Synchronize(); retry {
+		t.Fatal("rename reconciliation unexpectedly requested a retry")
+	}
+	afterTarget, err := os.Readlink(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(cipherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != afterTarget || !bytes.Equal(before, after) {
+		t.Fatal("project rename changed immutable target or ciphertext")
+	}
+	records := volume.linkRecords()
+	if len(records) != 1 || records[0].sourcePath != destination {
+		t.Fatalf("records after rename = %#v", records)
+	}
 }
 
-func waitForTestCondition(t *testing.T, timeout time.Duration, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for !condition() {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for condition")
-		}
-		time.Sleep(20 * time.Millisecond)
+func TestOfflineParentMoveUpdatesOnlyLinkIndex(t *testing.T) {
+	volume, sourcePath, storage, mountPoint := initializeLinkedTestFile(t)
+	oldParent := filepath.Dir(sourcePath)
+	newParent := filepath.Join(filepath.Dir(oldParent), "project-moved")
+	if err := os.Rename(oldParent, newParent); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(newParent, filepath.Base(sourcePath))
+
+	synchronizer := newGlobalTestSynchronizer(t, volume, mountPoint)
+	if retry := synchronizer.Synchronize(); retry {
+		t.Fatal("offline move reconciliation unexpectedly requested a retry")
+	}
+	records := volume.linkRecords()
+	if len(records) != 1 || records[0].relative != storage ||
+		records[0].sourcePath != destination {
+		t.Fatalf("records after offline parent move = %#v", records)
+	}
+	if link, err := inspectProtectedLink(destination); err != nil ||
+		!link.isSymlink || !targetMatchesStorage(link.target, storage) {
+		t.Fatalf("moved link = %#v, %v", link, err)
+	}
+}
+
+func TestDeletedProtectedLinkDeletesObjectAfterGlobalConfirmation(t *testing.T) {
+	volume, sourcePath, storage, mountPoint := initializeLinkedTestFile(t)
+	synchronizer := newGlobalTestSynchronizer(t, volume, mountPoint)
+	if err := os.Remove(sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	if retry := synchronizer.Synchronize(); !retry {
+		t.Fatal("link deletion was not given a race-settling retry")
+	}
+	time.Sleep(trackedLinkDeletionGrace + 20*time.Millisecond)
+	if retry := synchronizer.Synchronize(); retry {
+		t.Fatal("settled deletion unexpectedly requested another retry")
+	}
+	cipherPath, _ := volume.encryptedPath(storage)
+	if _, err := os.Lstat(cipherPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ciphertext after link deletion: %v", err)
+	}
+	if records := volume.linkRecords(); len(records) != 0 {
+		t.Fatalf("records after deletion = %#v", records)
+	}
+}
+
+func TestRegularReplacementPreservesObjectAsOrphan(t *testing.T) {
+	volume, sourcePath, storage, mountPoint := initializeLinkedTestFile(t)
+	synchronizer := newGlobalTestSynchronizer(t, volume, mountPoint)
+	if err := os.Remove(sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	synchronizer.Synchronize()
+	cipherPath, _ := volume.encryptedPath(storage)
+	if _, err := os.Lstat(cipherPath); err != nil {
+		t.Fatalf("replacement removed ciphertext: %v", err)
+	}
+	records := volume.linkRecords()
+	if len(records) != 1 || records[0].orphanedAt == 0 {
+		t.Fatalf("replacement records = %#v", records)
+	}
+}
+
+func TestChangingMountPointRetargetsOpaqueLink(t *testing.T) {
+	volume, sourcePath, storage, _ := initializeLinkedTestFile(t)
+	newMountPoint := t.TempDir()
+	synchronizer := newGlobalTestSynchronizer(t, volume, newMountPoint)
+	if retry := synchronizer.Synchronize(); retry {
+		t.Fatal("mount point update unexpectedly requested a retry")
+	}
+	link, err := inspectProtectedLink(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := mountedPathForStorage(newMountPoint, storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !link.isSymlink || link.target != expected {
+		t.Fatalf("retargeted link = %#v, want %s", link, expected)
+	}
+}
+
+func TestPendingUnregisteredObjectIsNotCollected(t *testing.T) {
+	volume, _ := initializeTestVolume(t, "pending object password", 1024*1024)
+	t.Setenv("HOME", t.TempDir())
+	objectID, err := newObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage, _ := objectStoragePath(objectID)
+	createTestFile(t, volume, storage, []byte("pending\n"))
+	synchronizer := newGlobalTestSynchronizer(t, volume, t.TempDir())
+	if retry := synchronizer.Synchronize(); !retry {
+		t.Fatal("pending object did not request a registration retry")
+	}
+	cipherPath, _ := volume.encryptedPath(storage)
+	if _, err := os.Lstat(cipherPath); err != nil {
+		t.Fatalf("pending object was collected: %v", err)
+	}
+}
+
+func TestLegacyMetadataMigratesCiphertextWithoutReencrypting(t *testing.T) {
+	volume, _ := initializeTestVolume(t, "migration password", 1024*1024)
+	sourcePath := filepath.Join(t.TempDir(), ".env")
+	legacyStorage := testStoragePath(t, sourcePath)
+	createTestFile(t, volume, legacyStorage, []byte("TOKEN=legacy\n"))
+	legacyCipher, _ := volume.encryptedPath(legacyStorage)
+	before, err := os.ReadFile(legacyCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountPoint := t.TempDir()
+	legacyTarget, err := MountedPath(mountPoint, sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureProtectedLink(sourcePath, legacyTarget); err != nil {
+		t.Fatal(err)
+	}
+	meta := volume.fileMeta(legacyStorage, nil)
+	legacy := Metadata{
+		Version: legacyMetadataFormatVersion,
+		Files:   map[string]FileMeta{metadataKey(legacyStorage): meta},
+		Links:   map[string]string{metadataKey(legacyStorage): legacyTarget},
+	}
+	if err := saveMetadata(volume.root, legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := LoadVolume(
+		volume.root,
+		&recordingPrompter{fallback: "migration password"},
+		1024*1024,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := migrated.linkRecords()
+	if len(records) != 1 || records[0].sourcePath != sourcePath {
+		t.Fatalf("migrated records = %#v", records)
+	}
+	newCipher, err := migrated.encryptedPath(records[0].relative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(newCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("migration rewrote ciphertext")
+	}
+	link, err := inspectProtectedLink(sourcePath)
+	if err != nil || !link.isSymlink ||
+		!targetMatchesStorage(link.target, records[0].relative) {
+		t.Fatalf("migrated link = %#v, %v", link, err)
 	}
 }

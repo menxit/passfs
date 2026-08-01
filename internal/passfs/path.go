@@ -36,6 +36,22 @@ func ResolvePath(path string) (string, error) {
 	}
 }
 
+// ResolvePathEntry resolves symbolic links in the parent directory without
+// following the final path component. External protected paths need this form:
+// macOS aliases such as /tmp must share one vault namespace, while an existing
+// protected link must continue to identify its original pathname.
+func ResolvePathEntry(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolvedParent, err := ResolvePath(filepath.Dir(absolute))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolvedParent, filepath.Base(absolute)), nil
+}
+
 func PathWithin(root, path string) bool {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)

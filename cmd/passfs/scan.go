@@ -40,13 +40,6 @@ type secretScanner struct {
 	ignored             map[string]struct{}
 }
 
-var secretTokenPattern = regexp.MustCompile(
-	`(?i)(AKIA|ASIA)[A-Z0-9]{16}|` +
-		`github_pat_[A-Za-z0-9_]{40,}|gh[oprsu]_[A-Za-z0-9]{30,}|` +
-		`xox[baprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{16,}|` +
-		`-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----`,
-)
-
 var assignmentPattern = regexp.MustCompile(
 	`^\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_. -]+))\s*(?:=|:|\s)\s*(.+?)\s*$`,
 )
@@ -237,7 +230,15 @@ func (scanner *secretScanner) scan(roots []scanRoot) ([]string, error) {
 	fileJobs := make(chan string, 256)
 	findings := make(map[string]struct{})
 	var findingsMu sync.Mutex
-	fileWorkers := platformScanFileWorkers(runtime.NumCPU())
+	cpuCount := runtime.NumCPU()
+	directoryWorkers := platformScanDirectoryWorkers(cpuCount)
+	fileWorkers := platformScanFileWorkers(cpuCount)
+	if os.Getenv("PASSFS_LOW_POWER_MODE") == "1" {
+		// Keep enough concurrency to overlap metadata and file reads without
+		// fanning a background UI refresh across every performance core.
+		directoryWorkers = 2
+		fileWorkers = 2
+	}
 	var filesWG sync.WaitGroup
 	for range fileWorkers {
 		filesWG.Add(1)
@@ -283,7 +284,7 @@ func (scanner *secretScanner) scan(roots []scanRoot) ([]string, error) {
 			maxDepth: root.maxDepth,
 		})
 	}
-	scanner.walkDirectories(directories, fileJobs)
+	scanner.walkDirectories(directories, fileJobs, directoryWorkers)
 	close(fileJobs)
 	filesWG.Wait()
 
@@ -293,6 +294,7 @@ func (scanner *secretScanner) scan(roots []scanRoot) ([]string, error) {
 func (scanner *secretScanner) walkDirectories(
 	initial []scanDirectory,
 	fileJobs chan<- string,
+	workerCount int,
 ) {
 	if len(initial) == 0 {
 		return
@@ -301,10 +303,9 @@ func (scanner *secretScanner) walkDirectories(
 	pending := len(queue)
 	var mutex sync.Mutex
 	condition := sync.NewCond(&mutex)
-	workers := platformScanDirectoryWorkers(runtime.NumCPU())
 	var workersWG sync.WaitGroup
 
-	for range workers {
+	for range workerCount {
 		workersWG.Add(1)
 		go func() {
 			defer workersWG.Done()
@@ -420,15 +421,11 @@ func (scanner *secretScanner) loadTrackedFilesForPath(path string) {
 	if err == nil && !info.IsDir() {
 		path = filepath.Dir(path)
 	}
-	output, err := exec.Command(
-		"git", "-C", path, "rev-parse", "--show-toplevel",
-	).Output()
-	if err != nil {
+	root := gitRepositoryRoot(path)
+	if root == "" {
 		return
 	}
-	scanner.loadTrackedFilesForRepository(
-		filepath.Clean(strings.TrimSpace(string(output))),
-	)
+	scanner.loadTrackedFilesForRepository(root)
 }
 
 func (scanner *secretScanner) loadTrackedFilesForRepository(root string) {
@@ -444,22 +441,7 @@ func (scanner *secretScanner) loadTrackedFilesForRepository(root string) {
 	scanner.trackedRepositories[root] = struct{}{}
 	scanner.trackedMu.Unlock()
 
-	output, err := exec.Command(
-		"git", "-C", root, "ls-files", "-z", "--cached",
-	).Output()
-	if err != nil {
-		return
-	}
-	paths := make([]string, 0)
-	for _, relative := range bytes.Split(output, []byte{0}) {
-		if len(relative) == 0 {
-			continue
-		}
-		paths = append(
-			paths,
-			filepath.Clean(filepath.Join(root, string(relative))),
-		)
-	}
+	paths := gitTrackedFilePaths(root)
 	scanner.trackedMu.Lock()
 	if scanner.tracked == nil {
 		scanner.tracked = make(map[string]struct{}, len(paths))
@@ -478,26 +460,44 @@ func pathWithinLexically(root string, path string) bool {
 
 func currentGitTrackedFiles(cwd string) (map[string]struct{}, string) {
 	result := make(map[string]struct{})
-	rootOutput, err := exec.Command(
-		"git", "-C", cwd, "rev-parse", "--show-toplevel",
-	).Output()
-	if err != nil {
+	root := gitRepositoryRoot(cwd)
+	if root == "" {
 		return result, ""
 	}
-	root := strings.TrimSpace(string(rootOutput))
+	for _, path := range gitTrackedFilePaths(root) {
+		result[path] = struct{}{}
+	}
+	return result, root
+}
+
+func gitRepositoryRoot(path string) string {
+	output, err := exec.Command(
+		"git", "-C", path, "rev-parse", "--show-toplevel",
+	).Output()
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(strings.TrimSpace(string(output)))
+}
+
+func gitTrackedFilePaths(root string) []string {
 	output, err := exec.Command(
 		"git", "-C", root, "ls-files", "-z", "--cached",
 	).Output()
 	if err != nil {
-		return result, root
+		return nil
 	}
+	paths := make([]string, 0)
 	for _, relative := range bytes.Split(output, []byte{0}) {
 		if len(relative) == 0 {
 			continue
 		}
-		result[filepath.Clean(filepath.Join(root, string(relative)))] = struct{}{}
+		paths = append(
+			paths,
+			filepath.Clean(filepath.Join(root, string(relative))),
+		)
 	}
-	return result, root
+	return paths
 }
 
 func excludedScanDirectory(path string, name string) bool {
@@ -713,7 +713,7 @@ func fileContainsLikelySecret(path string) (bool, error) {
 	if bytes.Contains(lower, []byte("age-encryption.org/v1")) {
 		return false, nil
 	}
-	if secretTokenPattern.Match(data) {
+	if contentContainsSecretToken(data, lower) {
 		return true, nil
 	}
 	for _, line := range strings.Split(string(data), "\n") {
@@ -810,6 +810,18 @@ func isSensitiveKey(key string) bool {
 	return false
 }
 
+// Unresolved substitution and template forms, adapted from the gitleaks
+// global allowlist (https://github.com/gitleaks/gitleaks, MIT License).
+var placeholderValuePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`^\$(?:\d+|\{\d+\})$`),
+	regexp.MustCompile(`^\$[A-Za-z_][A-Za-z0-9_]*$`),
+	regexp.MustCompile(`^\{\{[ \t]*[\w ().|]+[ \t]*\}\}$`),
+	regexp.MustCompile(`^%[A-Za-z_][A-Za-z0-9_]*%$`),
+	regexp.MustCompile(`^@[A-Za-z_][A-Za-z0-9_]*@$`),
+	regexp.MustCompile(`^%[+\-# 0]?[bcdeEfFgGoOpqstTUvxX]$`),
+	regexp.MustCompile(`^<[^<>]+>$`),
+}
+
 func isPlaceholderSecret(value string) bool {
 	value = strings.TrimSpace(strings.TrimRight(value, ","))
 	value = strings.Trim(value, `"'`)
@@ -821,6 +833,11 @@ func isPlaceholderSecret(value string) bool {
 		strings.HasPrefix(lower, "process.env") ||
 		strings.HasPrefix(lower, "os.environ") {
 		return true
+	}
+	for _, pattern := range placeholderValuePatterns {
+		if pattern.MatchString(value) {
+			return true
+		}
 	}
 	for _, placeholder := range []string{
 		"changeme", "change-me", "example", "placeholder", "redacted",

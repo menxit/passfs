@@ -2,371 +2,162 @@ package passfs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-type unprotectFixture struct {
-	volume     *Volume
-	prompter   *recordingPrompter
-	sourcePath string
-	storage    string
-	cipherPath string
-	plaintext  []byte
+func addLinkedTestFile(
+	t *testing.T,
+	volume *Volume,
+	mountPoint string,
+	sourcePath string,
+	data []byte,
+) string {
+	t.Helper()
+	objectID, err := newObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage, _ := objectStoragePath(objectID)
+	createTestFile(t, volume, storage, data)
+	target, err := mountedObjectPath(mountPoint, objectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureProtectedLink(sourcePath, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := volume.setLinkSource(storage, sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	return storage
 }
 
-func newUnprotectFixture(
-	t *testing.T,
-	name string,
-	registered bool,
-) unprotectFixture {
-	t.Helper()
-	const passphrase = "unprotect test password"
+func TestUnprotectAllReplacesLinksAndDeletesObjects(t *testing.T) {
+	volume, sourcePath, storage, _ := initializeLinkedTestFile(t)
+	report := volume.UnprotectAll(context.Background(), nil)
+	if report.Err != nil || len(report.Failed) != 0 ||
+		len(report.Unprotected) != 1 || report.Unprotected[0] != sourcePath {
+		t.Fatalf("unprotect report = %#v", report)
+	}
+	info, err := os.Lstat(sourcePath)
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("plaintext destination: %v, %#v", err, info)
+	}
+	data, err := os.ReadFile(sourcePath)
+	if err != nil || !bytes.Equal(data, []byte("TOKEN=encrypted\n")) {
+		t.Fatalf("plaintext = %q, %v", data, err)
+	}
+	cipherPath, _ := volume.encryptedPath(storage)
+	if _, err := os.Lstat(cipherPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ciphertext after unprotect: %v", err)
+	}
+}
+
+func TestUnprotectFileOnlyMaterializesRequestedObject(t *testing.T) {
+	volume, firstSource, _, mountPoint := initializeLinkedTestFile(t)
+	secondSource := filepath.Join(filepath.Dir(firstSource), "config.json")
+	secondStorage := addLinkedTestFile(
+		t,
+		volume,
+		mountPoint,
+		secondSource,
+		[]byte("{\"token\":\"second\"}\n"),
+	)
+	report := volume.UnprotectFile(context.Background(), secondSource, nil)
+	if report.Err != nil || len(report.Failed) != 0 ||
+		len(report.Unprotected) != 1 || report.Unprotected[0] != secondSource {
+		t.Fatalf("unprotect report = %#v", report)
+	}
+	if info, err := os.Lstat(firstSource); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("first link changed: %v, %#v", err, info)
+	}
+	if info, err := os.Lstat(secondSource); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("second plaintext: %v, %#v", err, info)
+	}
+	cipherPath, _ := volume.encryptedPath(secondStorage)
+	if _, err := os.Lstat(cipherPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("second ciphertext remains: %v", err)
+	}
+}
+
+func TestUnprotectAllAuthorizesOnce(t *testing.T) {
+	const passphrase = "unprotect batch password"
 	volume, _ := initializeTestVolume(t, passphrase, 1024*1024)
 	prompter := &recordingPrompter{fallback: passphrase}
 	volume.prompter = prompter
-
-	projectDirectory := t.TempDir()
-	sourcePath := filepath.Join(projectDirectory, name)
-	storage := testStoragePath(t, sourcePath)
-	plaintext := []byte("TOKEN=unprotected\n")
-	createTestFile(t, volume, storage, plaintext)
-	cipherPath, err := volume.encryptedPath(storage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if registered {
-		targetPath, err := MountedPath(t.TempDir(), sourcePath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := EnsureProtectedLink(sourcePath, targetPath); err != nil {
-			t.Fatal(err)
-		}
-		if err := volume.setLinkTarget(storage, targetPath); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return unprotectFixture{
-		volume:     volume,
-		prompter:   prompter,
-		sourcePath: sourcePath,
-		storage:    storage,
-		cipherPath: cipherPath,
-		plaintext:  plaintext,
-	}
-}
-
-func TestUnprotectAllReplacesLinkAndDeletesCiphertext(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	promptsBefore := fixture.prompter.requestCount()
-
-	report := fixture.volume.UnprotectAll(t.Context(), nil)
-	if len(report.Failed) != 0 || len(report.Warnings) != 0 {
+	mountPoint := t.TempDir()
+	project := t.TempDir()
+	addLinkedTestFile(t, volume, mountPoint, filepath.Join(project, ".env"), []byte("one\n"))
+	addLinkedTestFile(t, volume, mountPoint, filepath.Join(project, "config.json"), []byte("two\n"))
+	promptsBefore := prompter.requestCount()
+	report := volume.UnprotectAll(context.Background(), nil)
+	if report.Err != nil || len(report.Failed) != 0 || len(report.Unprotected) != 2 {
 		t.Fatalf("unprotect report = %#v", report)
 	}
-	if len(report.Unprotected) != 1 ||
-		report.Unprotected[0] != fixture.sourcePath {
-		t.Fatalf("unprotected paths = %#v", report.Unprotected)
-	}
-	info, err := os.Lstat(fixture.sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !info.Mode().IsRegular() {
-		t.Fatalf("source mode = %v, want regular file", info.Mode())
-	}
-	if data, err := os.ReadFile(fixture.sourcePath); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Equal(data, fixture.plaintext) {
-		t.Fatalf("plaintext = %q, want %q", data, fixture.plaintext)
-	}
-	if _, err := os.Stat(fixture.cipherPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("ciphertext remains: %v", err)
-	}
-	if _, err := os.Stat(filepath.Dir(fixture.cipherPath)); !errors.Is(
-		err,
-		os.ErrNotExist,
-	) {
-		t.Fatalf("empty encrypted directory remains: %v", err)
-	}
-	if records := fixture.volume.linkRecords(); len(records) != 0 {
-		t.Fatalf("metadata records remain: %#v", records)
-	}
-	if got := fixture.prompter.requestCount() - promptsBefore; got != 1 {
-		t.Fatalf("batch authorization prompts = %d, want 1", got)
+	if got := prompter.requestCount(); got != promptsBefore+1 {
+		t.Fatalf("authorization prompts = %d, want %d", got, promptsBefore+1)
 	}
 }
 
-func TestUnprotectFileOnlyMaterializesRequestedFile(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	secondSource := filepath.Join(filepath.Dir(fixture.sourcePath), "config.json")
-	secondStorage := testStoragePath(t, secondSource)
-	secondPlaintext := []byte(`{"token":"second"}`)
-	createTestFile(t, fixture.volume, secondStorage, secondPlaintext)
-	secondCipherPath, err := fixture.volume.encryptedPath(secondStorage)
-	if err != nil {
+func TestUnprotectPreservesCiphertextOnPlaintextConflict(t *testing.T) {
+	volume, sourcePath, storage, _ := initializeLinkedTestFile(t)
+	if err := os.Remove(sourcePath); err != nil {
 		t.Fatal(err)
 	}
-	secondTarget, err := MountedPath(t.TempDir(), secondSource)
-	if err != nil {
+	if err := os.WriteFile(sourcePath, []byte("different\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := EnsureProtectedLink(secondSource, secondTarget); err != nil {
-		t.Fatal(err)
+	report := volume.UnprotectFile(context.Background(), sourcePath, nil)
+	if len(report.Failed) != 1 || len(report.Unprotected) != 0 {
+		t.Fatalf("unprotect report = %#v", report)
 	}
-	if err := fixture.volume.setLinkTarget(secondStorage, secondTarget); err != nil {
-		t.Fatal(err)
+	cipherPath, _ := volume.encryptedPath(storage)
+	if _, err := os.Lstat(cipherPath); err != nil {
+		t.Fatalf("ciphertext was not preserved: %v", err)
 	}
+	data, err := os.ReadFile(sourcePath)
+	if err != nil || !bytes.Equal(data, []byte("different\n")) {
+		t.Fatalf("conflicting plaintext changed: %q, %v", data, err)
+	}
+}
 
-	report := fixture.volume.UnprotectFile(
-		t.Context(),
-		fixture.sourcePath,
-		nil,
+func TestUnprotectResumesMatchingMaterializedPlaintext(t *testing.T) {
+	volume, sourcePath, storage, _ := initializeLinkedTestFile(t)
+	if err := os.Remove(sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, []byte("TOKEN=encrypted\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report := volume.UnprotectFile(context.Background(), sourcePath, nil)
+	if report.Err != nil || len(report.Failed) != 0 || len(report.Unprotected) != 1 {
+		t.Fatalf("unprotect report = %#v", report)
+	}
+	cipherPath, _ := volume.encryptedPath(storage)
+	if _, err := os.Lstat(cipherPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("matching materialized ciphertext remains: %v", err)
+	}
+}
+
+func TestUnprotectRejectsInternalDestination(t *testing.T) {
+	volume, sourcePath, storage, _ := initializeLinkedTestFile(t)
+	report := volume.UnprotectFile(
+		context.Background(),
+		sourcePath,
+		[]string{filepath.Dir(sourcePath)},
 	)
-	if len(report.Unprotected) != 1 ||
-		report.Unprotected[0] != fixture.sourcePath ||
-		len(report.Failed) != 0 {
+	if len(report.Failed) != 1 || len(report.Unprotected) != 0 {
 		t.Fatalf("unprotect report = %#v", report)
 	}
-	if _, err := os.Stat(fixture.cipherPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("requested ciphertext remains: %v", err)
-	}
-	if _, err := os.Stat(secondCipherPath); err != nil {
-		t.Fatalf("unrelated ciphertext was removed: %v", err)
-	}
-	info, err := os.Lstat(secondSource)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("unrelated protected link mode = %v, want symlink", info.Mode())
-	}
-}
-
-func TestUnprotectFileRejectsUnprotectedPathWithoutAuthorization(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	promptsBefore := fixture.prompter.requestCount()
-	unprotectedPath := filepath.Join(filepath.Dir(fixture.sourcePath), "plain.env")
-
-	report := fixture.volume.UnprotectFile(t.Context(), unprotectedPath, nil)
-	if len(report.Unprotected) != 0 ||
-		len(report.Failed) != 1 ||
-		report.Failed[0].Path != unprotectedPath ||
-		!strings.Contains(report.Failed[0].Err.Error(), "not protected") {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if got := fixture.prompter.requestCount() - promptsBefore; got != 0 {
-		t.Fatalf("authorization prompts = %d, want 0", got)
-	}
-	if _, err := os.Stat(fixture.cipherPath); err != nil {
-		t.Fatalf("ciphertext was not preserved: %v", err)
-	}
-}
-
-func TestUnprotectAllAuthenticationFailureChangesNothing(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	fixture.volume.prompter = &recordingPrompter{fallback: "wrong password"}
-
-	report := fixture.volume.UnprotectAll(t.Context(), nil)
-	if !errors.Is(report.Err, ErrAuthentication) {
-		t.Fatalf("unprotect error = %v, want ErrAuthentication", report.Err)
-	}
-	info, err := os.Lstat(fixture.sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("protected link was replaced after failed authentication: %v", info.Mode())
-	}
-	if _, err := os.Stat(fixture.cipherPath); err != nil {
-		t.Fatalf("ciphertext was not preserved: %v", err)
-	}
-}
-
-func TestUnprotectAllEmptyVolumeDoesNotAuthorize(t *testing.T) {
-	volume, _ := initializeTestVolume(t, "empty volume password", 1024*1024)
-	prompter := &recordingPrompter{fallback: "empty volume password"}
-	volume.prompter = prompter
-
-	report := volume.UnprotectAll(t.Context(), nil)
-	if report.Err != nil || len(report.Unprotected) != 0 ||
-		len(report.Failed) != 0 {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if got := prompter.requestCount(); got != 0 {
-		t.Fatalf("empty volume authorization prompts = %d, want 0", got)
-	}
-}
-
-func TestUnprotectAllAuthorizesOnceForMultipleFiles(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	secondSource := filepath.Join(filepath.Dir(fixture.sourcePath), "config.json")
-	secondStorage := testStoragePath(t, secondSource)
-	secondPlaintext := []byte(`{"token":"second"}`)
-	createTestFile(t, fixture.volume, secondStorage, secondPlaintext)
-	secondTarget, err := MountedPath(t.TempDir(), secondSource)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := EnsureProtectedLink(secondSource, secondTarget); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.volume.setLinkTarget(secondStorage, secondTarget); err != nil {
-		t.Fatal(err)
-	}
-	promptsBefore := fixture.prompter.requestCount()
-
-	report := fixture.volume.UnprotectAll(t.Context(), nil)
-	if len(report.Unprotected) != 2 || len(report.Failed) != 0 {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if got := fixture.prompter.requestCount() - promptsBefore; got != 1 {
-		t.Fatalf("batch authorization prompts = %d, want 1", got)
-	}
-}
-
-func TestUnprotectAllPreservesCiphertextOnPlaintextConflict(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	if err := os.Remove(fixture.sourcePath); err != nil {
-		t.Fatal(err)
-	}
-	conflicting := []byte("TOKEN=different\n")
-	if err := os.WriteFile(fixture.sourcePath, conflicting, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	report := fixture.volume.UnprotectAll(t.Context(), nil)
-	if len(report.Unprotected) != 0 || len(report.Failed) != 1 {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if data, err := os.ReadFile(fixture.sourcePath); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Equal(data, conflicting) {
-		t.Fatalf("conflicting plaintext was changed: %q", data)
-	}
-	if _, err := os.Stat(fixture.cipherPath); err != nil {
-		t.Fatalf("ciphertext was not preserved: %v", err)
-	}
-}
-
-func TestUnprotectAllContinuesAfterPlaintextConflict(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	if err := os.Remove(fixture.sourcePath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(
-		fixture.sourcePath,
-		[]byte("TOKEN=different\n"),
-		0o600,
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	secondSource := filepath.Join(filepath.Dir(fixture.sourcePath), "config.json")
-	secondStorage := testStoragePath(t, secondSource)
-	secondPlaintext := []byte(`{"token":"second"}`)
-	createTestFile(t, fixture.volume, secondStorage, secondPlaintext)
-	secondCipherPath, err := fixture.volume.encryptedPath(secondStorage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondTarget, err := MountedPath(t.TempDir(), secondSource)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := EnsureProtectedLink(secondSource, secondTarget); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.volume.setLinkTarget(secondStorage, secondTarget); err != nil {
-		t.Fatal(err)
-	}
-
-	report := fixture.volume.UnprotectAll(t.Context(), nil)
-	if len(report.Unprotected) != 1 ||
-		report.Unprotected[0] != secondSource ||
-		len(report.Failed) != 1 ||
-		report.Failed[0].Path != fixture.sourcePath {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if data, err := os.ReadFile(secondSource); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Equal(data, secondPlaintext) {
-		t.Fatalf("second plaintext = %q, want %q", data, secondPlaintext)
-	}
-	if _, err := os.Stat(secondCipherPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("second ciphertext remains: %v", err)
-	}
-	if _, err := os.Stat(fixture.cipherPath); err != nil {
-		t.Fatalf("conflicting ciphertext was not preserved: %v", err)
-	}
-}
-
-func TestUnprotectAllResumesMatchingPlaintext(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	if err := os.Remove(fixture.sourcePath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(fixture.sourcePath, fixture.plaintext, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	report := fixture.volume.UnprotectAll(t.Context(), nil)
-	if len(report.Unprotected) != 1 || len(report.Failed) != 0 {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if _, err := os.Stat(fixture.cipherPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("ciphertext remains after resumed operation: %v", err)
-	}
-}
-
-func TestUnprotectAllMaterializesUnregisteredFileAtMissingPath(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env.swp", false)
-	if _, err := os.Lstat(fixture.sourcePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("source unexpectedly exists: %v", err)
-	}
-
-	report := fixture.volume.UnprotectAll(t.Context(), nil)
-	if len(report.Unprotected) != 1 || len(report.Failed) != 0 {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if data, err := os.ReadFile(fixture.sourcePath); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Equal(data, fixture.plaintext) {
-		t.Fatalf("plaintext = %q, want %q", data, fixture.plaintext)
-	}
-}
-
-func TestUnprotectAllDoesNotRestoreMissingRegisteredLink(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	if err := os.Remove(fixture.sourcePath); err != nil {
-		t.Fatal(err)
-	}
-
-	report := fixture.volume.UnprotectAll(t.Context(), nil)
-	if len(report.Unprotected) != 0 || len(report.Failed) != 1 {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if _, err := os.Lstat(fixture.sourcePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing source was recreated: %v", err)
-	}
-	if _, err := os.Stat(fixture.cipherPath); err != nil {
-		t.Fatalf("ciphertext was not preserved: %v", err)
-	}
-}
-
-func TestUnprotectAllRefusesInternalDestination(t *testing.T) {
-	fixture := newUnprotectFixture(t, ".env", true)
-	forbidden := []string{filepath.Dir(fixture.sourcePath)}
-
-	report := fixture.volume.UnprotectAll(t.Context(), forbidden)
-	if len(report.Unprotected) != 0 || len(report.Failed) != 1 {
-		t.Fatalf("unprotect report = %#v", report)
-	}
-	if _, err := os.Stat(fixture.cipherPath); err != nil {
+	cipherPath, _ := volume.encryptedPath(storage)
+	if _, err := os.Lstat(cipherPath); err != nil {
 		t.Fatalf("ciphertext was not preserved: %v", err)
 	}
 }

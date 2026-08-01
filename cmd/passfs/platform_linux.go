@@ -34,11 +34,14 @@ func platformFilesystemApprovalRequired(string, string, int64) bool {
 
 func completePlatformFilesystemApproval(
 	_ *passfs.Settings,
-	_ string,
+	adapterName string,
 	_ bool,
 	_ io.Writer,
 ) error {
-	return errPlatformFilesystemApprovalRequired
+	return fmt.Errorf(
+		"filesystem approval is not supported for adapter %q on Linux",
+		adapterName,
+	)
 }
 
 func platformFUSECapability() platformCapability {

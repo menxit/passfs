@@ -187,7 +187,10 @@ func completePlatformFilesystemApproval(
 	writer io.Writer,
 ) error {
 	if adapterName != adapterFSKit {
-		return errPlatformFilesystemApprovalRequired
+		return fmt.Errorf(
+			"filesystem adapter %q does not require macOS approval",
+			adapterName,
+		)
 	}
 	writeSetupLines(
 		writer,

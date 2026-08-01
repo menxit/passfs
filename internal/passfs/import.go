@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 )
 
@@ -31,6 +30,7 @@ type ProtectedLinkRegistrar func(sourcePath, targetPath string) error
 // verified project-side symbolic link.
 func ImportThroughMount(
 	sourcePath string,
+	vault string,
 	mountPoint string,
 	maxFileSize int64,
 	register ProtectedLinkRegistrar,
@@ -41,7 +41,7 @@ func ImportThroughMount(
 	if register == nil {
 		return result, errors.New("protected link registrar is required")
 	}
-	sourcePath, targetPath, err := resolveImportPaths(sourcePath, mountPoint)
+	sourcePath, targetPath, err := resolveImportPaths(sourcePath, vault, mountPoint, true)
 	if err != nil {
 		return result, err
 	}
@@ -62,11 +62,11 @@ func ImportThroughMount(
 // ValidateImportThroughMount checks whether an import can proceed without
 // changing either the source file or the mounted volume. ImportThroughMount
 // still repeats every check to protect against changes after validation.
-func ValidateImportThroughMount(sourcePath, mountPoint string, maxFileSize int64) error {
+func ValidateImportThroughMount(sourcePath, vault, mountPoint string, maxFileSize int64) error {
 	if maxFileSize <= 0 {
 		return errors.New("maximum file size must be greater than zero")
 	}
-	sourcePath, targetPath, err := resolveImportPaths(sourcePath, mountPoint)
+	sourcePath, targetPath, err := resolveImportPaths(sourcePath, vault, mountPoint, true)
 	if err != nil {
 		return err
 	}
@@ -76,28 +76,12 @@ func ValidateImportThroughMount(sourcePath, mountPoint string, maxFileSize int64
 		if !targetInfo.Mode().IsRegular() {
 			return fmt.Errorf("protected target %s is not a regular file", targetPath)
 		}
-		link, err := inspectProtectedLink(sourcePath)
-		if err != nil {
-			return fmt.Errorf("inspect protected path %s: %w", sourcePath, err)
-		}
-		if !link.exists {
-			return nil
-		}
-		if !link.isSymlink {
-			return fmt.Errorf(
-				"%s already exists and is not the passfs protected link",
-				sourcePath,
-			)
-		}
-		if link.target != filepath.Clean(targetPath) {
-			return fmt.Errorf(
-				"%s points to %s instead of the passfs target %s",
-				sourcePath,
-				link.target,
-				targetPath,
-			)
-		}
-		return nil
+		return validateExistingImportTarget(
+			sourcePath,
+			targetPath,
+			targetInfo,
+			maxFileSize,
+		)
 	case !errors.Is(targetErr, os.ErrNotExist):
 		return fmt.Errorf("check encrypted target: %w", targetErr)
 	}
@@ -109,7 +93,57 @@ func ValidateImportThroughMount(sourcePath, mountPoint string, maxFileSize int64
 	return file.Close()
 }
 
-func resolveImportPaths(sourcePath, mountPoint string) (string, string, error) {
+func validateExistingImportTarget(
+	sourcePath string,
+	targetPath string,
+	targetInfo os.FileInfo,
+	maxFileSize int64,
+) error {
+	link, err := inspectProtectedLink(sourcePath)
+	if err != nil {
+		return fmt.Errorf("inspect protected path %s: %w", sourcePath, err)
+	}
+	if !link.exists {
+		return nil
+	}
+	if !link.isSymlink {
+		if targetInfo.Size() == 0 {
+			source, sourceInfo, sourceErr := openValidatedSource(
+				sourcePath,
+				maxFileSize,
+			)
+			if sourceErr != nil {
+				return sourceErr
+			}
+			if closeErr := source.Close(); closeErr != nil {
+				return closeErr
+			}
+			if sourceInfo.Size() > 0 {
+				return nil
+			}
+		}
+		return fmt.Errorf(
+			"%s already exists and is not the passfs protected link",
+			sourcePath,
+		)
+	}
+	if link.target != filepath.Clean(targetPath) {
+		return fmt.Errorf(
+			"%s points to %s instead of the passfs target %s",
+			sourcePath,
+			link.target,
+			targetPath,
+		)
+	}
+	return nil
+}
+
+func resolveImportPaths(
+	sourcePath string,
+	vault string,
+	mountPoint string,
+	allocate bool,
+) (string, string, error) {
 	absoluteMountPoint, err := filepath.Abs(mountPoint)
 	if err != nil {
 		return "", "", err
@@ -126,42 +160,19 @@ func resolveImportPaths(sourcePath, mountPoint string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	targetPath, err := MountedPath(mountPoint, sourcePath)
+	_, targetPath, err := protectedObjectForSource(
+		vault,
+		mountPoint,
+		sourcePath,
+		allocate,
+	)
 	if err != nil {
 		return "", "", err
 	}
 	if PathWithin(mountPoint, sourcePath) {
 		return "", "", errors.New("cannot import a file from inside the passfs mount")
 	}
-	if err := validateImportTarget(mountPoint, targetPath); err != nil {
-		return "", "", err
-	}
 	return sourcePath, targetPath, nil
-}
-
-func validateImportTarget(mountPoint, targetPath string) error {
-	relative, err := filepath.Rel(mountPoint, targetPath)
-	if err != nil {
-		return err
-	}
-	components := strings.Split(filepath.Clean(relative), string(os.PathSeparator))
-	for _, component := range components[:len(components)-1] {
-		if strings.HasSuffix(component, encryptedSuffix) {
-			return fmt.Errorf(
-				"cannot protect files below directory %q because passfs reserves the %s suffix for encrypted files",
-				component,
-				encryptedSuffix,
-			)
-		}
-	}
-	name := components[len(components)-1]
-	if len([]byte(name))+len(encryptedSuffix) > 255 {
-		return fmt.Errorf(
-			"file name is too long after adding passfs encrypted suffix %s",
-			encryptedSuffix,
-		)
-	}
-	return nil
 }
 
 // ReconcileProtectedEdit restores the protected link after an editor replaces
@@ -365,7 +376,15 @@ func recoverInterruptedEmptyImport(
 	}
 	source, sourceInfo, err := openValidatedSource(sourcePath, maxFileSize)
 	if err != nil {
-		return false, nil
+		if errors.Is(err, os.ErrNotExist) {
+			// A missing source is the normal legacy case: the empty protected
+			// target is authoritative and its project-side link can be restored.
+			return false, nil
+		}
+		return false, fmt.Errorf(
+			"validate source while recovering an interrupted import: %w",
+			err,
+		)
 	}
 	if err := source.Close(); err != nil {
 		return false, fmt.Errorf("close source after interrupted import check: %w", err)

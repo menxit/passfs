@@ -75,23 +75,6 @@ func (tracker *protectedLinkTracker) replace(
 	return nil
 }
 
-func (tracker *protectedLinkTracker) rekey(moves map[string]string) {
-	references := make(map[string]protectedLinkReference, len(moves))
-	for oldRelative := range moves {
-		oldKey := metadataKey(oldRelative)
-		if reference := tracker.references[oldKey]; reference != nil {
-			references[oldKey] = reference
-			delete(tracker.references, oldKey)
-		}
-	}
-	for oldRelative, newRelative := range moves {
-		oldKey := metadataKey(oldRelative)
-		if reference := references[oldKey]; reference != nil {
-			tracker.references[metadataKey(newRelative)] = reference
-		}
-	}
-}
-
 func (tracker *protectedLinkTracker) forget(relative string) {
 	key := metadataKey(relative)
 	if reference := tracker.references[key]; reference != nil {

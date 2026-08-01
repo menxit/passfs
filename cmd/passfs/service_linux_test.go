@@ -10,7 +10,7 @@ import (
 func TestSystemdUnitRunsForegroundServer(t *testing.T) {
 	data, err := systemdUnitDefinition(
 		"/home/menxit/bin/passfs",
-		"/home/menxit/.config/passfs/config.json",
+		"/home/menxit/.passfs/config.json",
 		"fuse",
 	)
 	if err != nil {
@@ -18,7 +18,7 @@ func TestSystemdUnitRunsForegroundServer(t *testing.T) {
 	}
 	unit := string(data)
 	for _, expected := range []string{
-		`ExecStart="/home/menxit/bin/passfs" serve --config "/home/menxit/.config/passfs/config.json" --adapter "fuse"`,
+		`ExecStart="/home/menxit/bin/passfs" serve --config "/home/menxit/.passfs/config.json" --adapter "fuse"`,
 		"Type=simple",
 		"Restart=always",
 		"WantedBy=default.target",

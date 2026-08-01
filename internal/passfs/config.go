@@ -87,20 +87,20 @@ func initVolume(
 	}
 
 	internalDir := filepath.Join(cipherDir, internalDirName)
-	filesDir := filepath.Join(cipherDir, "files")
+	objectsDir := filepath.Join(cipherDir, objectStorageDirectory)
 	initialized := false
 	defer func() {
 		if initialized {
 			return
 		}
 		_ = os.RemoveAll(internalDir)
-		_ = os.RemoveAll(filesDir)
+		_ = os.RemoveAll(objectsDir)
 	}()
 	if err := os.MkdirAll(internalDir, 0o700); err != nil {
 		return fmt.Errorf("create internal directory: %w", err)
 	}
-	if err := os.MkdirAll(filesDir, 0o700); err != nil {
-		return fmt.Errorf("create encrypted file directory: %w", err)
+	if err := os.MkdirAll(objectsDir, 0o700); err != nil {
+		return fmt.Errorf("create encrypted object directory: %w", err)
 	}
 
 	public := PublicConfig{
@@ -114,12 +114,11 @@ func initVolume(
 		Identity: identity.String(),
 	}
 
-	publicData, err := json.MarshalIndent(public, "", "  ")
-	if err != nil {
-		return err
-	}
-	publicData = append(publicData, '\n')
-	if err := WriteFileAtomic(filepath.Join(internalDir, publicConfigName), publicData, 0o600); err != nil {
+	if err := WriteJSONFileAtomic(
+		filepath.Join(internalDir, publicConfigName),
+		public,
+		0o600,
+	); err != nil {
 		return fmt.Errorf("write public config: %w", err)
 	}
 
@@ -133,16 +132,17 @@ func initVolume(
 	}
 
 	metadata := Metadata{
-		Version: formatVersion,
-		Files:   make(map[string]FileMeta),
-		Links:   make(map[string]string),
+		Version:       metadataFormatVersion,
+		Files:         make(map[string]FileMeta),
+		Links:         make(map[string]string),
+		Orphaned:      make(map[string]int64),
+		LegacyTargets: make(map[string]string),
 	}
-	metadataData, err := json.MarshalIndent(metadata, "", "  ")
-	if err != nil {
-		return err
-	}
-	metadataData = append(metadataData, '\n')
-	if err := WriteFileAtomic(filepath.Join(internalDir, metadataFileName), metadataData, 0o600); err != nil {
+	if err := WriteJSONFileAtomic(
+		filepath.Join(internalDir, metadataFileName),
+		metadata,
+		0o600,
+	); err != nil {
 		return fmt.Errorf("write metadata: %w", err)
 	}
 	if identityHook != nil {
@@ -376,6 +376,17 @@ func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return syncDirectory(directory)
 }
 
+// WriteJSONFileAtomic encodes indented JSON and publishes it with the same
+// durability guarantees as WriteFileAtomic.
+func WriteJSONFileAtomic(path string, value any, mode os.FileMode) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return WriteFileAtomic(path, data, mode)
+}
+
 func syncDirectory(path string) error {
 	directory, err := os.Open(path)
 	if err != nil {
@@ -402,7 +413,5 @@ func decodeBoundedJSON(reader io.Reader, maximum int64, destination any) error {
 }
 
 func wipe(data []byte) {
-	for index := range data {
-		data[index] = 0
-	}
+	clear(data)
 }

@@ -12,6 +12,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,26 @@ const maximumCGoBytesLength = uint64(1<<31 - 1)
 type mountedFileSystem struct {
 	volume     *passfs.Volume
 	fileSystem fsapi.FileSystem
+}
+
+//export passfs_bridge_volume_id
+func passfs_bridge_volume_id(identifier C.uint64_t) *C.char {
+	fileSystem, ok := bridgeFileSystem(uint64(identifier))
+	if !ok {
+		return nil
+	}
+	decoded, err := hex.DecodeString(fileSystem.volume.VolumeID())
+	if err != nil || len(decoded) != 16 {
+		return nil
+	}
+	return C.CString(fmt.Sprintf(
+		"%x-%x-%x-%x-%x",
+		decoded[0:4],
+		decoded[4:6],
+		decoded[6:8],
+		decoded[8:10],
+		decoded[10:16],
+	))
 }
 
 type ownedHandle struct {
@@ -111,10 +132,7 @@ func storeBridgeError(destination **C.char, err error) {
 }
 
 func bridgeContext() context.Context {
-	return fsapi.WithCaller(context.Background(), fsapi.Caller{
-		UID: uint32(syscall.Getuid()),
-		GID: uint32(syscall.Getgid()),
-	})
+	return context.Background()
 }
 
 func bridgeErrno(errno syscall.Errno) C.int {
@@ -132,19 +150,33 @@ func fillAttributes(destination *C.passfs_attributes, source fsapi.Attributes) {
 	if destination == nil {
 		return
 	}
-	destination.item_type = C.uint32_t(source.Type)
+	destination.item_type = bridgeItemType(source.Type)
 	destination.mode = C.uint32_t(source.Mode)
 	destination.uid = C.uint32_t(source.UID)
 	destination.gid = C.uint32_t(source.GID)
 	destination.link_count = C.uint32_t(source.LinkCount)
 	destination.reserved = 0
 	destination.inode = C.uint64_t(source.Inode)
+	destination.parent_inode = C.uint64_t(source.ParentInode)
 	destination.size = C.uint64_t(source.Size)
 	destination.blocks = C.uint64_t(source.Blocks)
 	destination.access_time_ns = C.int64_t(source.AccessTime.UnixNano())
 	destination.change_time_ns = C.int64_t(source.ChangeTime.UnixNano())
 	destination.modify_time_ns = C.int64_t(source.ModifyTime.UnixNano())
 	destination.birth_time_ns = C.int64_t(source.BirthTime.UnixNano())
+}
+
+func bridgeItemType(source fsapi.ItemType) C.uint32_t {
+	switch source {
+	case fsapi.TypeFile:
+		return C.PASSFS_ITEM_FILE
+	case fsapi.TypeDirectory:
+		return C.PASSFS_ITEM_DIRECTORY
+	case fsapi.TypeSymlink:
+		return C.PASSFS_ITEM_SYMLINK
+	default:
+		return C.PASSFS_ITEM_UNKNOWN
+	}
 }
 
 func requestedAttributes(source *C.passfs_set_attributes) fsapi.SetAttributes {
@@ -217,6 +249,27 @@ func passfs_bridge_open_file_system(
 	return C.uint64_t(identifier)
 }
 
+//export passfs_bridge_configure_file_system
+func passfs_bridge_configure_file_system(
+	identifier C.uint64_t,
+	maximumFileSize C.int64_t,
+	unlockDuration C.int64_t,
+	errorMessage **C.char,
+) C.int {
+	fileSystem, ok := bridgeFileSystem(uint64(identifier))
+	if !ok {
+		return C.int(syscall.EBADF)
+	}
+	if err := fileSystem.volume.Configure(
+		int64(maximumFileSize),
+		time.Duration(unlockDuration),
+	); err != nil {
+		storeBridgeError(errorMessage, err)
+		return C.int(syscall.EINVAL)
+	}
+	return 0
+}
+
 //export passfs_bridge_close_file_system
 func passfs_bridge_close_file_system(identifier C.uint64_t) C.int {
 	id := uint64(identifier)
@@ -238,6 +291,7 @@ func passfs_bridge_close_file_system(identifier C.uint64_t) C.int {
 	for _, handle := range handles {
 		_ = handle.Close(context.Background())
 	}
+	_ = fileSystem.volume.FlushAccessTimes()
 	fileSystem.volume.Lock()
 	return 0
 }
@@ -260,9 +314,42 @@ func passfs_bridge_lookup(
 }
 
 type bridgeDirectoryEntry struct {
-	Name  string         `json:"name"`
-	Type  fsapi.ItemType `json:"type"`
-	Inode uint64         `json:"inode"`
+	Name       string               `json:"name"`
+	Attributes bridgeJSONAttributes `json:"attributes"`
+}
+
+type bridgeJSONAttributes struct {
+	ItemType              uint32 `json:"itemType"`
+	Mode                  uint32 `json:"mode"`
+	UID                   uint32 `json:"uid"`
+	GID                   uint32 `json:"gid"`
+	LinkCount             uint32 `json:"linkCount"`
+	Inode                 uint64 `json:"inode"`
+	ParentInode           uint64 `json:"parentInode"`
+	Size                  uint64 `json:"size"`
+	Blocks                uint64 `json:"blocks"`
+	AccessTimeNanoseconds int64  `json:"accessTimeNanoseconds"`
+	ChangeTimeNanoseconds int64  `json:"changeTimeNanoseconds"`
+	ModifyTimeNanoseconds int64  `json:"modifyTimeNanoseconds"`
+	BirthTimeNanoseconds  int64  `json:"birthTimeNanoseconds"`
+}
+
+func encodeBridgeAttributes(source fsapi.Attributes) bridgeJSONAttributes {
+	return bridgeJSONAttributes{
+		ItemType:              uint32(bridgeItemType(source.Type)),
+		Mode:                  source.Mode,
+		UID:                   source.UID,
+		GID:                   source.GID,
+		LinkCount:             source.LinkCount,
+		Inode:                 source.Inode,
+		ParentInode:           source.ParentInode,
+		Size:                  source.Size,
+		Blocks:                source.Blocks,
+		AccessTimeNanoseconds: source.AccessTime.UnixNano(),
+		ChangeTimeNanoseconds: source.ChangeTime.UnixNano(),
+		ModifyTimeNanoseconds: source.ModifyTime.UnixNano(),
+		BirthTimeNanoseconds:  source.BirthTime.UnixNano(),
+	}
 }
 
 //export passfs_bridge_read_directory
@@ -289,9 +376,8 @@ func passfs_bridge_read_directory(
 	encodedEntries := make([]bridgeDirectoryEntry, 0, len(entries))
 	for _, entry := range entries {
 		encodedEntries = append(encodedEntries, bridgeDirectoryEntry{
-			Name:  entry.Name,
-			Type:  entry.Type,
-			Inode: entry.Inode,
+			Name:       entry.Name,
+			Attributes: encodeBridgeAttributes(entry.Attributes),
 		})
 	}
 	encoded, err := json.Marshal(encodedEntries)

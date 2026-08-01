@@ -8,20 +8,31 @@ final class PassFSItem: FSItem {
 
     private let lock = NSLock()
     private(set) var path: String
+    private var parentInodeValue: UInt64
     private var openHandle: PassFSBridgeHandle?
     private var openModes: FSVolume.OpenModes = []
 
     init(path: String, attributes: BridgeAttributes) {
         self.path = path
         inode = attributes.inode
+        parentInodeValue = attributes.parentInode
         itemType = fsItemType(attributes.itemType)
         super.init()
     }
 
-    func move(to path: String) {
+    func move(to path: String, parentInode: UInt64? = nil) {
         lock.lock()
         self.path = path
+        if let parentInode {
+            parentInodeValue = parentInode
+        }
         lock.unlock()
+    }
+
+    func parentInode() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return parentInodeValue
     }
 
     func currentPath() -> String {

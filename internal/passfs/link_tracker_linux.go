@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -37,6 +38,12 @@ func (reference *linuxProtectedLinkReference) currentPath() (string, bool, error
 	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", reference.fd))
 	if err != nil {
 		return "", false, err
+	}
+	// procfs appends this marker after an unlinked O_PATH entry. Overlayfs can
+	// transiently retain a non-zero link count, so Fstat alone is not enough to
+	// distinguish a live moved link from a deleted one.
+	if strings.HasSuffix(path, " (deleted)") {
+		return "", false, nil
 	}
 	return filepath.Clean(path), true, nil
 }
