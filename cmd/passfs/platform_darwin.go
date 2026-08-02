@@ -70,16 +70,23 @@ func passFSAppPathForExecutable(executable string) (string, error) {
 
 func passFSContentsPathForExecutable(executable string) (string, error) {
 	directory := filepath.Dir(executable)
-	for range 8 {
+	var appContents string
+	for {
 		if filepath.Base(directory) == "Contents" &&
 			filepath.Ext(filepath.Dir(directory)) == ".app" {
-			return filepath.Clean(directory), nil
+			// The CLI is embedded in PassFSControlService.app, which is itself
+			// embedded in PassFS.app. Keep walking so callers resolve resources
+			// and assess Gatekeeper against the outer host application.
+			appContents = filepath.Clean(directory)
 		}
 		parent := filepath.Dir(directory)
 		if parent == directory {
 			break
 		}
 		directory = parent
+	}
+	if appContents != "" {
+		return appContents, nil
 	}
 	return "", errors.New("PassFS.app bundle could not be located")
 }
