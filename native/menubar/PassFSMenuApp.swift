@@ -9,8 +9,6 @@ import SwiftUI
 
 private let passFSAppGroupIdentifier =
     "3943PK2P39.com.menxit.passfs.shared"
-private let passFSControlAgentPlistName =
-    "com.menxit.passfs.control-agent.plist"
 
 @main
 struct PassFSMenuApp: App {
@@ -544,20 +542,10 @@ private enum PassFSBuildInfo {
         key: "CFBundleShortVersionString"
     )
     static let applicationBuild = value(in: .main, key: "CFBundleVersion")
-    static let backendVersion: String = {
-        let bundle = Bundle(
-            url: Bundle.main.bundleURL
-                .appendingPathComponent("Contents")
-                .appendingPathComponent("Helpers")
-                .appendingPathComponent("PassFSCLI.bundle")
-        )
-        return bundle?.object(
-            forInfoDictionaryKey: "PassFSBackendVersion"
-        ) as? String ?? value(
-            in: bundle,
-            key: "CFBundleShortVersionString"
-        )
-    }()
+    static let backendVersion = value(
+        in: .main,
+        key: "PassFSBackendVersion"
+    )
 
     private static func value(in bundle: Bundle?, key: String) -> String {
         bundle?.object(forInfoDictionaryKey: key) as? String ?? "—"
@@ -1934,7 +1922,6 @@ private final class PassFSModel: ObservableObject {
     private static let managerScanInterval = Duration.milliseconds(2_500)
 
     init() {
-        PassFSCommands.registerControlAgentIfNeeded()
         let installed = Bundle.main.bundleURL.pathExtension == "app"
         if installed && SMAppService.mainApp.status == .notRegistered {
             try? SMAppService.mainApp.register()
@@ -2566,6 +2553,9 @@ private enum PassFSCommands {
         Bundle.main.bundleURL
             .appendingPathComponent("Contents")
             .appendingPathComponent("Helpers")
+            .appendingPathComponent("PassFSControlService.app")
+            .appendingPathComponent("Contents")
+            .appendingPathComponent("Helpers")
             .appendingPathComponent("PassFSCLI.bundle")
             .appendingPathComponent("Contents")
             .appendingPathComponent("MacOS")
@@ -2576,39 +2566,13 @@ private enum PassFSCommands {
         FileManager.default.fileExists(
             atPath: Bundle.main.bundleURL
                 .appendingPathComponent("Contents")
-                .appendingPathComponent("Library")
-                .appendingPathComponent("LaunchAgents")
-                .appendingPathComponent(passFSControlAgentPlistName)
+                .appendingPathComponent("Helpers")
+                .appendingPathComponent("PassFSControlService.app")
+                .appendingPathComponent("Contents")
+                .appendingPathComponent("MacOS")
+                .appendingPathComponent("passfs-control-service")
                 .path
         )
-    }
-
-    static func registerControlAgentIfNeeded() {
-        guard usesControlAgent else { return }
-        let service = SMAppService.agent(
-            plistName: passFSControlAgentPlistName
-        )
-        let defaultsKey = "PassFSRegisteredControlAgentBuild"
-        let build = Bundle.main.object(
-            forInfoDictionaryKey: "CFBundleVersion"
-        ) as? String ?? "unknown"
-        do {
-            if service.status == .enabled,
-               UserDefaults.standard.string(forKey: defaultsKey) != build {
-                try service.unregister()
-            }
-            if service.status == .notRegistered {
-                try service.register()
-            }
-            if service.status == .enabled {
-                UserDefaults.standard.set(build, forKey: defaultsKey)
-            }
-        } catch {
-            Logger(
-                subsystem: "com.menxit.passfs",
-                category: "ControlAgent"
-            ).error("Unable to register control agent: \(error.localizedDescription, privacy: .public)")
-        }
     }
 
     static func run(_ arguments: [String]) throws -> String {
@@ -2655,39 +2619,6 @@ private enum PassFSCommands {
     private static func runThroughControlAgent(
         _ arguments: [String]
     ) throws -> String {
-        let service = SMAppService.agent(
-            plistName: passFSControlAgentPlistName
-        )
-        if service.status == .notRegistered {
-            do {
-                try service.register()
-            } catch {
-                throw PassFSCommandError(
-                    detail: "Could not register the PassFS control agent: \(error.localizedDescription)"
-                )
-            }
-        }
-        switch service.status {
-        case .enabled:
-            break
-        case .requiresApproval:
-            throw PassFSCommandError(
-                detail: "Allow PassFS under System Settings > General > Login Items, then try again."
-            )
-        case .notFound:
-            throw PassFSCommandError(
-                detail: "The PassFS control agent is missing from the application bundle."
-            )
-        case .notRegistered:
-            throw PassFSCommandError(
-                detail: "The PassFS control agent is not registered."
-            )
-        @unknown default:
-            throw PassFSCommandError(
-                detail: "The PassFS control agent has an unknown status."
-            )
-        }
-
         guard let container = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: passFSAppGroupIdentifier
         ) else {
@@ -2928,8 +2859,11 @@ private enum PassFSCommands {
             }
             usleep(50_000)
         } while Date() < deadline
+        let reason = String(cString: strerror(lastError))
         throw PassFSCommandError(
-            detail: "Could not connect to the PassFS control agent: \(String(cString: strerror(lastError)))"
+            detail: "Could not connect to the PassFS control agent: " +
+                "\(reason). Allow PassFS under System Settings > General > " +
+                "Login Items; if it is missing, reinstall the PassFS package."
         )
     }
 

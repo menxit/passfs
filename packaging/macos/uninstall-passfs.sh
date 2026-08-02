@@ -158,9 +158,14 @@ for candidate in \
 done
 
 cli_binary=""
+control_service=""
 extension_bundle=""
 if [ -n "$app_bundle" ]; then
-	cli_binary="$app_bundle/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli"
+	control_service="$app_bundle/Contents/Helpers/PassFSControlService.app/Contents/MacOS/passfs-control-service"
+	cli_binary="$app_bundle/Contents/Helpers/PassFSControlService.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli"
+	if [ ! -x "$cli_binary" ]; then
+		cli_binary="$app_bundle/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli"
+	fi
 	extension_bundle="$app_bundle/Contents/Extensions/PassFSFileSystem.appex"
 fi
 
@@ -168,6 +173,11 @@ if [ -x "$cli_binary" ] && [ -f "$config_path" ]; then
 	run_as_user "$cli_binary" unmount --config "$config_path" \
 		>/dev/null 2>&1 ||
 		warn "the filesystem could not be cleanly unmounted"
+fi
+
+if [ -x "$control_service" ]; then
+	run_as_user "$control_service" unregister >/dev/null 2>&1 ||
+		warn "the control agent could not be unregistered from Login Items"
 fi
 
 launch_agent="$user_home/Library/LaunchAgents/$launch_agent_label.plist"
@@ -299,7 +309,8 @@ if [ "$remaining" = false ]; then
 		if [ -L "$cli_link" ]; then
 			link_target=$(/usr/bin/readlink "$cli_link" 2>/dev/null || true)
 			case "$link_target" in
-			*/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli)
+			*/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli | \
+			*/PassFS.app/Contents/Helpers/PassFSControlService.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli)
 				case "$cli_link" in
 				/usr/local/*)
 					trash_name="usr-local-passfs-cli-link"

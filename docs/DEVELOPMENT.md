@@ -71,12 +71,15 @@ registration. Native types must not leak into `internal/passfs`.
 
 The macOS menu app and FSKit extension are sandboxed. Except for locations the
 user explicitly chooses in the backup open/save panels, the menu app never reads
-the user's repositories, secrets, or `~/.passfs` directly. It registers the
-embedded `com.menxit.passfs.control-agent` with `SMAppService` and requests a
-narrow allowlist of typed operations through a Unix socket in the PassFS App
-Group. Executable names and CLI flags never cross that boundary. Full scans and
-mutations have independent single-operation slots, and the server bounds the
-number and size of concurrent clients.
+the user's repositories, secrets, or `~/.passfs` directly. App Sandbox does not
+allow the menu app to create a LaunchAgent job. The signed package therefore
+invokes the embedded, non-sandboxed `PassFSControlService` registrar to register
+`com.menxit.passfs.control-agent` with `SMAppService`; the registrar exposes only
+register, unregister, and status commands and performs no filesystem or network
+work. The menu app requests a narrow allowlist of typed operations through a
+Unix socket in the PassFS App Group. Executable names and CLI flags never cross
+that boundary. Full scans and mutations have independent single-operation
+slots, and the server bounds the number and size of concurrent clients.
 While the manager is visible, known findings are revalidated every 2.5 seconds
 so deletions and removed secret values disappear promptly. A complete directory
 traversal runs at most every 15 seconds to discover new files without creating

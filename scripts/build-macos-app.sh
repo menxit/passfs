@@ -55,8 +55,10 @@ output_parent=$(
 output="$output_parent/$(basename "$output")"
 build_directory=$(mktemp -d "$output_parent/.passfs-macos-build.XXXXXX")
 staged_app="$build_directory/PassFS.app"
-cli_bundle="$staged_app/Contents/Helpers/PassFSCLI.bundle"
+control_service="$staged_app/Contents/Helpers/PassFSControlService.app"
+cli_bundle="$control_service/Contents/Helpers/PassFSCLI.bundle"
 cli_binary="$cli_bundle/Contents/MacOS/passfs-cli"
+control_service_binary="$control_service/Contents/MacOS/passfs-control-service"
 previous_app="$build_directory/PreviousPassFS.app"
 profile_plist="$build_directory/profile.plist"
 profile_certificate="$build_directory/profile-certificate.der"
@@ -87,22 +89,27 @@ sed "s/__TEAM_IDENTIFIER__/$team_identifier/g" \
 	"$project_root/packaging/macos/passfs-helper.entitlements.in" >"$helper_entitlements"
 plutil -lint \
 	"$project_root/packaging/macos/Info.plist" \
+	"$project_root/packaging/macos/PassFSControlService-Info.plist" \
 	"$project_root/packaging/macos/com.menxit.passfs.control-agent.plist" \
 	"$entitlements" \
 	"$helper_entitlements" >/dev/null
 
 mkdir -p \
 	"$staged_app/Contents/Helpers" \
-	"$staged_app/Contents/Library/LaunchAgents" \
 	"$staged_app/Contents/MacOS" \
 	"$staged_app/Contents/Extensions" \
 	"$staged_app/Contents/Resources" \
+	"$control_service/Contents/Helpers" \
+	"$control_service/Contents/Library/LaunchAgents" \
+	"$control_service/Contents/MacOS" \
 	"$cli_bundle/Contents/MacOS" \
 	"$binary_directory"
 cp "$project_root/packaging/macos/Info.plist" \
 	"$staged_app/Contents/Info.plist"
 cp "$project_root/packaging/macos/PassFSCLI-Info.plist" \
 	"$cli_bundle/Contents/Info.plist"
+cp "$project_root/packaging/macos/PassFSControlService-Info.plist" \
+	"$control_service/Contents/Info.plist"
 cp "$project_root/packaging/macos/PassFS.icns" \
 	"$staged_app/Contents/Resources/PassFS.icns"
 cp \
@@ -112,7 +119,7 @@ cp \
 cp "$project_root/packaging/macos/uninstall-passfs.sh" \
 	"$staged_app/Contents/Resources/uninstall-passfs.sh"
 cp "$project_root/packaging/macos/com.menxit.passfs.control-agent.plist" \
-	"$staged_app/Contents/Library/LaunchAgents/"
+	"$control_service/Contents/Library/LaunchAgents/"
 chmod 0755 "$staged_app/Contents/Resources/uninstall-passfs.sh"
 for localization in "$project_root"/native/menubar/Resources/*.lproj; do
 	cp -R "$localization" "$staged_app/Contents/Resources/"
@@ -145,6 +152,12 @@ plist_version=${release_version%%-*}
 /usr/libexec/PlistBuddy \
 	-c "Add :PassFSBackendVersion string $release_version" \
 	"$cli_bundle/Contents/Info.plist"
+/usr/libexec/PlistBuddy \
+	-c "Set :CFBundleShortVersionString $plist_version" \
+	"$control_service/Contents/Info.plist"
+/usr/libexec/PlistBuddy \
+	-c "Set :CFBundleVersion $build_number" \
+	"$control_service/Contents/Info.plist"
 binary_count=0
 for architecture in $architectures; do
 	case "$architecture" in
@@ -191,6 +204,13 @@ for architecture in $architectures; do
 		-framework SwiftUI \
 		-o "$binary_directory/passfs-ui-$architecture" \
 		"$project_root/native/menubar/PassFSMenuApp.swift"
+	xcrun swiftc \
+		-O \
+		-target "$compiler_architecture-apple-macos13.0" \
+		-framework Foundation \
+		-framework ServiceManagement \
+		-o "$binary_directory/passfs-control-service-$architecture" \
+		"$project_root/native/macos/PassFSControlService.swift"
 done
 
 if [ "$binary_count" -eq 1 ]; then
@@ -198,20 +218,27 @@ if [ "$binary_count" -eq 1 ]; then
 		"$binary_directory/passfs-cli-final"
 	cp "$binary_directory"/passfs-ui-* \
 		"$binary_directory/passfs-ui-final"
+	cp "$binary_directory"/passfs-control-service-* \
+		"$binary_directory/passfs-control-service-final"
 else
 	lipo -create "$binary_directory"/passfs-cli-* \
 		-output "$binary_directory/passfs-cli-final"
 	lipo -create "$binary_directory"/passfs-ui-* \
 		-output "$binary_directory/passfs-ui-final"
+	lipo -create "$binary_directory"/passfs-control-service-* \
+		-output "$binary_directory/passfs-control-service-final"
 fi
 chmod 0755 \
 	"$binary_directory/passfs-cli-final" \
-	"$binary_directory/passfs-ui-final"
+	"$binary_directory/passfs-ui-final" \
+	"$binary_directory/passfs-control-service-final"
 
 cp "$binary_directory/passfs-cli-final" \
 	"$cli_binary"
 cp "$binary_directory/passfs-ui-final" \
 	"$staged_app/Contents/MacOS/PassFS"
+cp "$binary_directory/passfs-control-service-final" \
+	"$control_service_binary"
 
 PASSFS_VERSION="$release_version" \
 PASSFS_BUILD_NUMBER="$build_number" \
@@ -229,6 +256,14 @@ codesign \
 	--entitlements "$helper_entitlements" \
 	--sign "$signing_identity" \
 	"$cli_bundle"
+
+codesign \
+	--force \
+	--identifier "com.menxit.passfs.control-service" \
+	--options runtime \
+	--timestamp \
+	--sign "$signing_identity" \
+	"$control_service"
 
 codesign \
 	--force \

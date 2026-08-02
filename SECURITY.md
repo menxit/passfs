@@ -43,6 +43,7 @@ is not written to the App Group container or PassFS logs.
 | --- | --- | --- | --- |
 | Menu app | App Sandbox | Its container, the PassFS App Group, and locations explicitly selected in backup panels | Typed control-agent requests |
 | FSKit extension | App Sandbox | The selected vault resource and App Group authorization socket | FSKit operations and passphrase request protocol |
+| Control-service registrar | Not sandboxed; installer-only | No application data | Register, unregister, and inspect the embedded LaunchAgent with `SMAppService` |
 | Control agent / CLI | Not sandboxed | Files available to the current user | Closed operation allowlist over a mode-0600 Unix socket |
 | FUSE service | Not sandboxed | Files available to the current user | Local filesystem adapter |
 

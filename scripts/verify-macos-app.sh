@@ -12,9 +12,10 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 app=$1
-helper="$app/Contents/Helpers/PassFSCLI.bundle"
+control_service="$app/Contents/Helpers/PassFSControlService.app"
+helper="$control_service/Contents/Helpers/PassFSCLI.bundle"
 extension="$app/Contents/Extensions/PassFSFileSystem.appex"
-agent_plist="$app/Contents/Library/LaunchAgents/com.menxit.passfs.control-agent.plist"
+agent_plist="$control_service/Contents/Library/LaunchAgents/com.menxit.passfs.control-agent.plist"
 temporary=$(
 	/usr/bin/mktemp -d "${TMPDIR:-/tmp}/passfs-app-verification.XXXXXX"
 )
@@ -30,7 +31,8 @@ fail()
 	exit 1
 }
 
-for required in "$app" "$helper" "$extension" "$agent_plist"; do
+for required in \
+	"$app" "$control_service" "$helper" "$extension" "$agent_plist"; do
 	[ -e "$required" ] || fail "missing $required"
 done
 
@@ -85,23 +87,28 @@ reject_entitlement()
 }
 
 app_identifier=$(signature_value "$app" Identifier)
+control_service_identifier=$(signature_value "$control_service" Identifier)
 helper_identifier=$(signature_value "$helper" Identifier)
 extension_identifier=$(signature_value "$extension" Identifier)
 team_identifier=$(signature_value "$app" TeamIdentifier)
 
 [ "$app_identifier" = "com.menxit.passfs" ] ||
 	fail "app identifier is $app_identifier"
+[ "$control_service_identifier" = "com.menxit.passfs.control-service" ] ||
+	fail "control service identifier is $control_service_identifier"
 [ "$helper_identifier" = "com.menxit.passfs" ] ||
 	fail "helper identifier is $helper_identifier"
 [ "$extension_identifier" = "com.menxit.passfs.filesystem" ] ||
 	fail "extension identifier is $extension_identifier"
 [ "$team_identifier" != "not set" ] || fail "app has no Developer ID team"
+[ "$(signature_value "$control_service" TeamIdentifier)" = "$team_identifier" ] ||
+	fail "control service is signed by a different team"
 [ "$(signature_value "$helper" TeamIdentifier)" = "$team_identifier" ] ||
 	fail "helper is signed by a different team"
 [ "$(signature_value "$extension" TeamIdentifier)" = "$team_identifier" ] ||
 	fail "extension is signed by a different team"
 
-for target in "$app" "$helper" "$extension"; do
+for target in "$app" "$control_service" "$helper" "$extension"; do
 	details=$(/usr/bin/codesign -d --verbose=4 "$target" 2>&1) ||
 		fail "cannot inspect hardened runtime for $target"
 	case "$details" in
@@ -167,5 +174,10 @@ require_plist_value \
 require_plist_value "ProgramArguments:1" "__app-agent"
 require_plist_value "RunAtLoad" "true"
 require_plist_value "KeepAlive" "true"
+
+[ -x "$control_service/Contents/MacOS/passfs-control-service" ] ||
+	fail "control service executable is missing"
+[ ! -e "$app/Contents/Library/LaunchAgents/com.menxit.passfs.control-agent.plist" ] ||
+	fail "sandboxed app must not own the control-agent registration plist"
 
 echo "Verified signed PassFS app security boundaries: $app"

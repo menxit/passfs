@@ -10,6 +10,7 @@ app_entitlements="$project_root/packaging/macos/passfs.entitlements.in"
 helper_entitlements="$project_root/packaging/macos/passfs-helper.entitlements.in"
 extension_entitlements="$project_root/native/fskit/PassFSFileSystem/PassFSFileSystem.entitlements"
 agent_plist="$project_root/packaging/macos/com.menxit.passfs.control-agent.plist"
+control_service="$project_root/native/macos/PassFSControlService.swift"
 menu_app="$project_root/native/menubar/PassFSMenuApp.swift"
 build_app="$project_root/scripts/build-macos-app.sh"
 verify_app="$project_root/scripts/verify-macos-app.sh"
@@ -45,7 +46,12 @@ reject_text "$extension_entitlements" "com.apple.security.network.client"
 require_text "$agent_plist" "com.menxit.passfs.control-agent"
 require_text "$agent_plist" "Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli"
 require_text "$agent_plist" "__app-agent"
-require_text "$menu_app" "SMAppService.agent"
+require_text "$control_service" "SMAppService.agent"
+require_text "$control_service" "try service.register()"
+require_text "$control_service" "try service.unregister()"
+reject_text "$menu_app" "SMAppService.agent"
+reject_text "$menu_app" "registerControlAgentIfNeeded"
+require_text "$menu_app" "PassFSControlService.app"
 require_text "$menu_app" "containerURL("
 require_text "$menu_app" 'case uiSnapshot = "ui-snapshot"'
 require_text "$menu_app" 'case backupCreate = "backup-create"'
@@ -54,7 +60,9 @@ reject_text "$menu_app" "let arguments: [String]"
 reject_text "$menu_app" "homeDirectoryForCurrentUser"
 reject_text "$menu_app" "MDItemCreate"
 reject_text "$menu_app" "O_EVTONLY"
+reject_text "$menu_app" "The PassFS control agent is missing from the application bundle."
 require_text "$build_app" 'verify-macos-app.sh'
+require_text "$build_app" 'PassFSControlService.app'
 require_text "$verify_app" 'codesign --verify --deep --strict'
 require_text "$verify_app" 'com.apple.security.app-sandbox'
 require_text "$verify_app" 'com.apple.security.network.client'

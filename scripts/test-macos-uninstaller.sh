@@ -19,6 +19,7 @@ for expected in \
 	"com.menxit.passfs.pkg" \
 	"com.menxit.passfs.filesystem" \
 	"com.menxit.passfs.control-agent" \
+	"PassFSControlService.app" \
 	"3943PK2P39.com.menxit.passfs.shared" \
 	"/usr/local/bin/passfs" \
 	"Library/Containers" \

@@ -7,11 +7,18 @@ script_directory=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 . "$script_directory/common.sh"
 passfs_load_console_user || exit 0
 
+control_service=/Applications/PassFS.app/Contents/Helpers/PassFSControlService.app/Contents/MacOS/passfs-control-service
+cli=/Applications/PassFS.app/Contents/Helpers/PassFSControlService.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli
+
+if [ ! -x "$control_service" ] ||
+	! passfs_run_as_user "$control_service" register; then
+	echo "PassFS could not register its control agent." >&2
+	exit 1
+fi
+
 if [ -f "$passfs_user_home/.passfs/config.json" ] ||
 	[ -f "$passfs_user_home/.config/passfs/config.json" ]; then
-	/bin/launchctl asuser "$passfs_user_id" \
-		/usr/bin/sudo -H -u "$passfs_console_user" \
-		/Applications/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli \
+	passfs_run_as_user "$cli" \
 		reload --no-open \
 		>/dev/null 2>&1 || true
 fi

@@ -8,7 +8,13 @@ script_directory=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 # shellcheck source=common.sh
 . "$script_directory/common.sh"
 passfs_load_console_user || exit 0
-installed_cli=/Applications/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli
+installed_control_service=/Applications/PassFS.app/Contents/Helpers/PassFSControlService.app/Contents/MacOS/passfs-control-service
+installed_cli=/Applications/PassFS.app/Contents/Helpers/PassFSControlService.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli
+legacy_cli=/Applications/PassFS.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli
+
+if [ ! -x "$installed_cli" ] && [ -x "$legacy_cli" ]; then
+	installed_cli=$legacy_cli
+fi
 
 if [ ! -x "$installed_cli" ]; then
 	exit 0
@@ -26,6 +32,18 @@ if [ -f "$config" ]; then
 			echo "PassFS could not stop the existing protected filesystem; the upgrade was not applied." >&2
 			exit 1
 		fi
+	fi
+fi
+
+# The sandboxed menu app cannot create launchd jobs. The package owns the
+# control-agent lifecycle through a tiny, non-sandboxed registrar embedded in
+# the signed app. Unregister before replacing its executable so Service
+# Management never retains a checksum for the previous build.
+if [ -x "$installed_control_service" ]; then
+	if ! passfs_run_as_user \
+		"$installed_control_service" unregister >/dev/null 2>&1; then
+		echo "PassFS could not unregister the existing control agent; the upgrade was not applied." >&2
+		exit 1
 	fi
 fi
 

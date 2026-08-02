@@ -59,7 +59,7 @@ if [ -e "$command_path" ] || [ -L "$command_path" ]; then
 	mv "$command_path" "$previous_command"
 	had_command=true
 fi
-if ! ln -s "$destination_app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli" \
+if ! ln -s "$destination_app/Contents/Helpers/PassFSControlService.app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/passfs-cli" \
 	"$command_path"; then
 	if [ "$had_command" = true ]; then
 		mv "$previous_command" "$command_path"
@@ -68,6 +68,12 @@ if ! ln -s "$destination_app/Contents/Helpers/PassFSCLI.bundle/Contents/MacOS/pa
 	if [ "$had_app" = true ]; then
 		mv "$previous_app" "$destination_app"
 	fi
+	exit 1
+fi
+
+control_service="$destination_app/Contents/Helpers/PassFSControlService.app/Contents/MacOS/passfs-control-service"
+if [ ! -x "$control_service" ] || ! "$control_service" register; then
+	echo "PassFS could not register its control agent" >&2
 	exit 1
 fi
 

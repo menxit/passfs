@@ -31,11 +31,14 @@ profile, and the notarization key in encrypted maintainer storage. Never commit
 them to the repository.
 
 The app, embedded CLI/control agent, and FSKit extension also share the macOS
-App Group `3943PK2P39.com.menxit.passfs.shared`. Its Team-ID-prefixed form is
-validated from the Developer ID signature and does not require a separately
-registered App Group profile. The app build must keep App Sandbox on the UI and
-extension, off the control agent, and must not add network access to the FSKit
-extension. `make check` verifies these packaging invariants.
+App Group `3943PK2P39.com.menxit.passfs.shared`. A minimal embedded registrar,
+invoked only by the installer and uninstaller, owns the `SMAppService`
+registration because App Sandbox forbids the menu app from creating a
+LaunchAgent job. Its Team-ID-prefixed form is validated from the Developer ID
+signature and does not require a separately registered App Group profile. The
+app build must keep App Sandbox on the UI and extension, off the control agent
+and registrar, and must not add network access to the FSKit extension. The
+`make check` target verifies these packaging invariants.
 Every signed app build also runs `scripts/verify-macos-app.sh` on the final
 bundle. Unlike the source-template checks, it reads identifiers, Team IDs,
 hardened-runtime flags, and entitlements from the actual nested signatures.
